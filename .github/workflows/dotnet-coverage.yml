@@ -19,6 +19,11 @@ on:
         required: false
         type: string
         default: blacksmith-4vcpu-ubuntu-2404
+      test-filter:
+        description: Optional dotnet test --filter expression (e.g. to exclude infra-dependent integration tests)
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -48,6 +53,7 @@ jobs:
           --no-restore
           --collect:"XPlat Code Coverage"
           --results-directory ./TestResults
+          ${{ inputs.test-filter != '' && format('--filter "{0}"', inputs.test-filter) || '' }}
 
       - name: Generate coverage report
         if: always()
