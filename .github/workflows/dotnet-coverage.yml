@@ -41,8 +41,18 @@ permissions:
 jobs:
   coverage:
     runs-on: ${{ inputs.runs-on }}
+    # runs-on is caller-controlled, so pin bash — the run: steps use bash syntax
+    # (arrays, $HOME, GITHUB_PATH) that would break under a Windows runner's default shell.
+    defaults:
+      run:
+        shell: bash
     env:
       GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Inputs bound to env (not expanded inline in run: scripts) so they can't be
+      # interpreted as shell code — closes the zizmor template-injection finding.
+      SOLUTION: ${{ inputs.solution }}
+      CONFIGURATION: ${{ inputs.configuration }}
+      TEST_FILTER: ${{ inputs.test-filter }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -53,10 +63,15 @@ jobs:
           dotnet-version: ${{ inputs.dotnet-version }}
 
       - name: Restore
-        run: dotnet restore "${{ inputs.solution }}"
+        run: dotnet restore "$SOLUTION"
 
       - name: Install dotnet-coverage
-        run: dotnet tool install --global dotnet-coverage
+        # `dotnet tool install --global` drops the tool in ~/.dotnet/tools, which is
+        # NOT on PATH by default on GitHub-hosted / Blacksmith runners — add it so the
+        # next step can invoke dotnet-coverage.
+        run: |
+          dotnet tool install --global dotnet-coverage
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
 
       - name: Test with coverage
         # Microsoft's dotnet-coverage engine, NOT coverlet's "XPlat Code Coverage"
@@ -64,14 +79,13 @@ jobs:
         # throws InvalidProgramException at run time — tests fail ONLY under
         # instrumentation. The Microsoft engine instruments differently and does not
         # hit this. See fixportal-simulator-backend PR #151 and deploy-and-ci-traps.md.
-        run: >
-          dotnet-coverage collect
-          --output ./TestResults/coverage.cobertura.xml
-          --output-format cobertura
-          dotnet test "${{ inputs.solution }}"
-          --configuration ${{ inputs.configuration }}
-          --no-restore
-          ${{ inputs.test-filter != '' && format('--filter "{0}"', inputs.test-filter) || '' }}
+        run: |
+          filter=()
+          if [ -n "$TEST_FILTER" ]; then filter=(--filter "$TEST_FILTER"); fi
+          dotnet-coverage collect \
+            --output ./TestResults/coverage.cobertura.xml \
+            --output-format cobertura \
+            dotnet test "$SOLUTION" --configuration "$CONFIGURATION" --no-restore "${filter[@]}"
 
       - name: Generate coverage report
         if: always()
