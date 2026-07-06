@@ -1,0 +1,69 @@
+name: dotnet-coverage
+
+on:
+  workflow_call:
+    inputs:
+      solution:
+        description: Path to the .slnx/.sln to restore and test
+        required: true
+        type: string
+      dotnet-version:
+        required: false
+        type: string
+        default: 10.0.x
+      configuration:
+        required: false
+        type: string
+        default: Release
+      runs-on:
+        required: false
+        type: string
+        default: blacksmith-4vcpu-ubuntu-2404
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  coverage:
+    runs-on: ${{ inputs.runs-on }}
+    env:
+      GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Restore
+        run: dotnet restore "${{ inputs.solution }}"
+
+      - name: Test with coverage
+        run: >
+          dotnet test "${{ inputs.solution }}"
+          --configuration ${{ inputs.configuration }}
+          --no-restore
+          --collect:"XPlat Code Coverage"
+          --results-directory ./TestResults
+
+      - name: Generate coverage report
+        if: always()
+        uses: danielpalme/ReportGenerator-GitHub-Action@5
+        with:
+          reports: '**/coverage.cobertura.xml'
+          targetdir: artifacts/coverage-report
+          reporttypes: Html;MarkdownSummaryGithub;Cobertura
+
+      - name: Add coverage summary
+        if: always()
+        run: cat artifacts/coverage-report/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: artifacts/coverage-report
