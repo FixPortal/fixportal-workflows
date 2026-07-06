@@ -41,6 +41,11 @@ permissions:
 jobs:
   coverage:
     runs-on: ${{ inputs.runs-on }}
+    # runs-on is caller-controlled, so pin bash — the run: steps use bash syntax
+    # (arrays, $HOME, GITHUB_PATH) that would break under a Windows runner's default shell.
+    defaults:
+      run:
+        shell: bash
     env:
       GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Inputs bound to env (not expanded inline in run: scripts) so they can't be
