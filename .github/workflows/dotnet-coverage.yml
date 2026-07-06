@@ -24,6 +24,15 @@ on:
         required: false
         type: string
         default: ''
+      assembly-filters:
+        description: >-
+          ReportGenerator assembly filter. dotnet-coverage instruments every loaded
+          module, so scope the report to the caller's own assemblies. Default targets
+          the FixPortal.* estate convention and excludes test assemblies; override for
+          differently-named assemblies.
+        required: false
+        type: string
+        default: '+FixPortal.*;-*.Tests'
 
 permissions:
   contents: read
@@ -46,13 +55,22 @@ jobs:
       - name: Restore
         run: dotnet restore "${{ inputs.solution }}"
 
+      - name: Install dotnet-coverage
+        run: dotnet tool install --global dotnet-coverage
+
       - name: Test with coverage
+        # Microsoft's dotnet-coverage engine, NOT coverlet's "XPlat Code Coverage"
+        # collector. coverlet emits invalid IL on .NET 10 for some methods, so the JIT
+        # throws InvalidProgramException at run time — tests fail ONLY under
+        # instrumentation. The Microsoft engine instruments differently and does not
+        # hit this. See fixportal-simulator-backend PR #151 and deploy-and-ci-traps.md.
         run: >
+          dotnet-coverage collect
+          --output ./TestResults/coverage.cobertura.xml
+          --output-format cobertura
           dotnet test "${{ inputs.solution }}"
           --configuration ${{ inputs.configuration }}
           --no-restore
-          --collect:"XPlat Code Coverage"
-          --results-directory ./TestResults
           ${{ inputs.test-filter != '' && format('--filter "{0}"', inputs.test-filter) || '' }}
 
       - name: Generate coverage report
@@ -62,6 +80,7 @@ jobs:
           reports: '**/coverage.cobertura.xml'
           targetdir: artifacts/coverage-report
           reporttypes: Html;MarkdownSummaryGithub;Cobertura
+          assemblyfilters: ${{ inputs.assembly-filters }}
 
       - name: Add coverage summary
         if: always()
