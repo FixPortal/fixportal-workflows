@@ -33,6 +33,22 @@ on:
         required: false
         type: string
         default: '+FixPortal.*;-*.Tests'
+      dotnet-coverage-version:
+        description: >-
+          Pinned dotnet-coverage global-tool version. Pinned (not floating latest) so a
+          new upstream release cannot silently change coverage output or fail the estate.
+          Bump deliberately after validating a new release.
+        required: false
+        type: string
+        default: 18.9.0
+      artifact-name:
+        description: >-
+          Name of the uploaded coverage-report artifact. Override when a caller invokes
+          this workflow more than once in a single run (matrix / multiple calling jobs),
+          since upload-artifact fails on a duplicate name within a run.
+        required: false
+        type: string
+        default: coverage-report
 
 permissions:
   contents: read
@@ -47,12 +63,17 @@ jobs:
       run:
         shell: bash
     env:
+      # Consumed by the caller's own nuget.config during `dotnet restore` — the caller
+      # maps a private GitHub Packages source (FixPortal.*) with
+      # ClearTextPassword=%GITHUB_PACKAGES_TOKEN%, so this env var is what authenticates
+      # that feed. It is NOT dead weight; `packages: read` above is required with it.
       GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Inputs bound to env (not expanded inline in run: scripts) so they can't be
       # interpreted as shell code — closes the zizmor template-injection finding.
       SOLUTION: ${{ inputs.solution }}
       CONFIGURATION: ${{ inputs.configuration }}
       TEST_FILTER: ${{ inputs.test-filter }}
+      DOTNET_COVERAGE_VERSION: ${{ inputs.dotnet-coverage-version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -62,15 +83,27 @@ jobs:
         with:
           dotnet-version: ${{ inputs.dotnet-version }}
 
+      # Cache the NuGet package directory so every caller's restore doesn't re-download
+      # the full graph each run. Keyed on the caller's project/props files; a miss just
+      # restores fresh, so a stale or absent key is never a failure.
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets', '**/packages.lock.json') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
       - name: Restore
         run: dotnet restore "$SOLUTION"
 
       - name: Install dotnet-coverage
         # `dotnet tool install --global` drops the tool in ~/.dotnet/tools, which is
         # NOT on PATH by default on GitHub-hosted / Blacksmith runners — add it so the
-        # next step can invoke dotnet-coverage.
+        # next step can invoke dotnet-coverage. Version pinned via input so a new
+        # upstream release can't silently change output or red the estate.
         run: |
-          dotnet tool install --global dotnet-coverage
+          dotnet tool install --global dotnet-coverage --version "$DOTNET_COVERAGE_VERSION"
           echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
 
       - name: Test with coverage
@@ -88,8 +121,12 @@ jobs:
             dotnet test "$SOLUTION" --configuration "$CONFIGURATION" --no-restore "${filter[@]}"
 
       - name: Generate coverage report
-        if: always()
-        uses: danielpalme/ReportGenerator-GitHub-Action@5
+        # Only run when a coverage file was actually produced — on a Restore/test failure
+        # the file is absent and ReportGenerator would error, stacking a second red step
+        # over the real failure. Third-party action pinned to a full commit SHA (not the
+        # mutable @5 tag) so a re-pointed tag can't run new code with the job token in scope.
+        if: always() && hashFiles('**/coverage.cobertura.xml') != ''
+        uses: danielpalme/ReportGenerator-GitHub-Action@c31aa4ed4f12f147061186cf2a029f307b5c3636 # v5.5.9
         with:
           reports: '**/coverage.cobertura.xml'
           targetdir: artifacts/coverage-report
@@ -98,11 +135,16 @@ jobs:
 
       - name: Add coverage summary
         if: always()
-        run: cat artifacts/coverage-report/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
+        # Guard on the file so a pre-report failure doesn't add a third red step via a
+        # cat on a summary that was never generated.
+        run: |
+          if [ -f artifacts/coverage-report/SummaryGithub.md ]; then
+            cat artifacts/coverage-report/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload coverage report
-        if: always()
+        if: always() && hashFiles('**/coverage.cobertura.xml') != ''
         uses: actions/upload-artifact@v7
         with:
-          name: coverage-report
+          name: ${{ inputs.artifact-name }}
           path: artifacts/coverage-report
