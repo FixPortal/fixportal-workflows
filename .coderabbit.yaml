@@ -1,0 +1,34 @@
+reviews:
+  profile: assertive
+  poem: false
+  high_level_summary: true
+  review_status: true
+  collapse_walkthrough: true
+  request_changes_workflow: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    # Pause automatic incremental reviews after 2 reviewed commits (default 5).
+    # CodeRabbit meters reviews per DEVELOPER IDENTITY across every repo, in a rolling
+    # 7-day window degrading from 30 reviews/7d, and every push spends one. This
+    # enforces push-batching mechanically instead of relying on remembering to batch.
+    auto_pause_after_reviewed_commits: 2
+    # Do NOT add ignore_title_keywords ("chore:" matches this estate's Dependabot
+    # titles) or ignore_usernames for dependabot[bot]/renovate[bot] — an action bump
+    # here propagates to every consuming repo, so it is supply chain twice over.
+
+  instructions: |
+    Review as a senior engineer. Prioritise correctness and security.
+
+    This repo's PRODUCT is its reusable GitHub Actions workflows: other repositories
+    call them by ref. A change here is a RELEASE to every consumer, not this repo's own
+    CI. Review it as a public interface change — call out anything that alters inputs,
+    outputs, secrets handling, or default behaviour for existing callers.
+
+    Pay particular attention to:
+    - overly broad `permissions:` (least privilege per job)
+    - untrusted input reaching `run:` blocks (script injection via ${{ }})
+    - third-party actions not pinned to a full commit SHA
+    - secrets exposure through logs, env, or `persist-credentials`
+    - concurrency settings that could cancel an in-flight deploy in a consuming repo
