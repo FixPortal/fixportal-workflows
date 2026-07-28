@@ -7,24 +7,40 @@ reviews:
   request_changes_workflow: true
 
   auto_review:
-    # OFF deliberately. The PR gate in .claude/review-policy.json decides which reviewers a PR
-    # needs, and CodeRabbit is reserved for HIGH-tier changes. It meters reviews per DEVELOPER
-    # IDENTITY across every repo in a rolling 7-day window, degrading from 30/7d, so it is the
-    # scarce reviewer and must be spent deliberately. Leaving automatic review on reviews every
-    # PR regardless of tier, which makes the tier evaluation pointless. HIGH-tier PRs get an
-    # on-demand "@coderabbitai review", which still works with automatic review disabled.
+    # Reviews are LABEL-TRIGGERED, not automatic. When `enabled` is false a positive label
+    # match still triggers a review, so `labels: ["review-high"]` is the TRIGGER, not an
+    # exclusion filter.
     #
-    # auto_pause_after_reviewed_commits is deliberately absent: it governs AUTOMATIC re-review
-    # only, so with automatic review off it would be dead config that reads as load-bearing.
+    # WHY: with auto-review on, every PR was reviewed on open regardless of tier, so the tier
+    # evaluation in .claude/review-policy.json trimmed only the EXTRA requests an agent made,
+    # never the baseline one — and that baseline was the whole budget. CodeRabbit meters
+    # reviews per DEVELOPER IDENTITY across every repo in a rolling 7-day window, degrading
+    # from 30/7d. Worse, the two ways a PR can end up unreviewed (nobody asked; CodeRabbit was
+    # throttled) looked identical. With the trigger explicit, "no review on a HIGH PR" is
+    # unambiguously a gate failure.
+    #
+    # The label is applied by ~/.claude/hooks/pr-review-gate.sh at PR-create time when the tier
+    # is HIGH — a hook applies it rather than an instruction, because an instruction can be
+    # skipped. `enabled: false` ON ITS OWN IS NOT EQUIVALENT: it leaves that label inert, no
+    # CodeRabbit check registers at all, and pr-review-watch.sh reads a persistently absent
+    # check as "not installed" and stops gating on it, letting a HIGH PR through unreviewed.
     enabled: false
+    labels: ["review-high"]
     drafts: false
-    # REVERSED 2026-07-29. This block previously said "do NOT ignore dependabot[bot]", on the
-    # grounds that dependency changes were classed HIGH and Gitar skipped bot authors, so
-    # silencing CodeRabbit too would leave them unreviewed. Zero AI review of dependency bumps is
-    # now the intended state: the estate raises enough of them that reviewing each one exhausts
-    # the allowance and starves the changes that need it. Gitar's bot review is switched off as
-    # well, and dependency manifests are no longer classed HIGH in the review policy. CI plus
-    # Dependabot's own advisory data is what gates a bump.
+    # Still load-bearing under label triggering: once a PR carries the label, every later push
+    # re-reviews it and spends from the same pool. CodeRabbit ships 5; its own docs suggest 1-2.
+    auto_pause_after_reviewed_commits: 2
+    # Dependency PRs are out of AI code review on BOTH vendors as of 2026-07-29 — Gitar's bot
+    # review is switched off as well. The estate raises enough of them that reviewing each bump
+    # exhausts the allowance and starves the changes that need it; CI plus Dependabot's own
+    # advisory data is what gates a bump. CodeRabbit already declines bot authors ("Review
+    # skipped: bot user not eligible for review"), so this states the intent rather than leaving
+    # it incidental to a vendor behaviour that can change.
+    #
+    # ignore_title_keywords is deliberately ABSENT. It listed "chore:", which matches this
+    # estate's Dependabot titles verbatim ("chore: Bump X from 1.0 to 1.1"), so it skipped PRs
+    # silently and by accident. What gets skipped is decided by PATH via review-policy.json and
+    # by AUTHOR here — never by a title, which can lie about what a PR touches.
     ignore_usernames:
       - "dependabot[bot]"
       - "renovate[bot]"
