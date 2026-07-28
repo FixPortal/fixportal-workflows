@@ -1,0 +1,27 @@
+{
+  "$comment": [
+    "PR review risk tiering. Read by ~/.claude/hooks/pr-review-policy.sh.",
+    "Any file matching 'high' => HIGH (Gitar + CodeRabbit). All files matching 'low' => LOW.",
+    "Everything else => NORMAL (Gitar only). No match anywhere => NORMAL, deliberately.",
+    "",
+    "This repo's PRODUCT is its reusable workflows - other repos call them by ref. A change",
+    "under .github/workflows/ is not this repo's CI, it is a release to every consumer,",
+    "which is why it is HIGH here even more emphatically than elsewhere.",
+    "There is essentially nothing else in the repo, so almost every PR is HIGH by design."
+  ],
+
+  "version": 1,
+
+  "high": [
+    ".claude/review-policy.json",
+    ".coderabbit.yaml",
+    ".gitignore",
+    ".github/workflows/**"
+  ],
+
+  "low": [
+    "docs/**",
+    "*.md",
+    ".vscode/**"
+  ]
+}
