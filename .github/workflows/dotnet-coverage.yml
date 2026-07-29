@@ -79,7 +79,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: ${{ inputs.dotnet-version }}
 
@@ -87,7 +87,7 @@ jobs:
       # the full graph each run. Keyed on the caller's project/props files; a miss just
       # restores fresh, so a stale or absent key is never a failure.
       - name: Cache NuGet packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets', '**/packages.lock.json') }}
@@ -126,7 +126,7 @@ jobs:
         # over the real failure. Third-party action pinned to a full commit SHA (not the
         # mutable @5 tag) so a re-pointed tag can't run new code with the job token in scope.
         if: always() && hashFiles('**/coverage.cobertura.xml') != ''
-        uses: danielpalme/ReportGenerator-GitHub-Action@c31aa4ed4f12f147061186cf2a029f307b5c3636 # v5.5.9
+        uses: danielpalme/ReportGenerator-GitHub-Action@d3ebf1f760f7d8ab92cc44d9bcfee7ad73722a31 # v5.5.11
         with:
           reports: '**/coverage.cobertura.xml'
           targetdir: artifacts/coverage-report
