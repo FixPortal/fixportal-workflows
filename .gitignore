@@ -1,3 +1,7 @@
 # Knowledge-graph tooling artifacts (graphify / understand-anything)
 graphify-out/
 .understand-anything/
+
+# Claude Code: ignore machine-local runtime state and review worktrees while retaining policy.
+.claude/*
+!.claude/review-policy.json
