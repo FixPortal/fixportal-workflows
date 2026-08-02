@@ -1,0 +1,52 @@
+name: Review policy guard
+
+# The review control plane must not be able to delete itself.
+#
+# .claude/review-policy.json decides which reviewers a PR needs, and a repo with NO
+# policy file tiers every PR NORMAL. So one .gitignore line re-excluding .claude/
+# silently downgrades review for the whole repo — and the PR making that change would
+# be the last one reviewed properly.
+#
+# That used to be guarded by tiering .gitignore HIGH in every repo, which works but
+# bills a CodeRabbit review — metered per developer across the whole estate — for every
+# trivial ignore edit, because the policy hook tiers by path glob and cannot tell
+# "re-excludes .claude/" from "ignores a scratch directory".
+#
+# This asserts the invariant directly instead: deterministic, free, and impossible to
+# overlook the way a reviewer can. .gitignore is NORMAL wherever this workflow exists.
+# Do not remove it without putting .gitignore back in the policy's high list.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-policy-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Review policy intact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Policy file must be tracked and unignored
+        run: |
+          if ! git ls-files --error-unmatch .claude/review-policy.json >/dev/null 2>&1; then
+            echo "::error file=.claude/review-policy.json::Review policy is untracked, so every PR in this repo would tier NORMAL. Restore and commit it."
+            exit 1
+          fi
+          # --no-index is load-bearing: without it, check-ignore consults the index and
+          # never reports a TRACKED file as ignored, so this would pass unconditionally
+          # and guard nothing.
+          if git check-ignore --no-index -q .claude/review-policy.json; then
+            echo "::error file=.gitignore::.gitignore now excludes .claude/review-policy.json, which silently drops every PR in this repo to NORMAL. Restore the '!.claude/review-policy.json' negation."
+            exit 1
+          fi
+          echo "Review policy is tracked and unignored."
