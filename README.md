@@ -1,7 +1,7 @@
+# fixportal-workflows
+
 ![CI](https://github.com/FixPortal/fixportal-workflows/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/github/license/FixPortal/fixportal-workflows)
-
-# fixportal-workflows
 
 > Shared reusable GitHub Actions workflows for the FixPortal estate, consumed by
 > other repositories via `uses:` refs. A change under `.github/workflows/` is a
@@ -71,7 +71,6 @@ tier; the guard fails the run instead. Do not remove it without putting
 | `upload-artifact` fails on a duplicate name | The workflow was called more than once in one run — set a distinct `artifact-name` per call |
 | Report shows third-party or test assemblies | `assembly-filters` left at the FixPortal default — override it for differently-named assemblies |
 | Tests fail only under coverage with `InvalidProgramException` | A caller reintroduced coverlet's XPlat collector — this workflow uses Microsoft's `dotnet-coverage` engine precisely because coverlet emits invalid IL on .NET 10 |
-| Coverage job's actionlint step flags the caller's workflows | The caller's own `.github/workflows` fails actionlint — the step lints the calling repo's checkout, by design |
 
 ## Contributing
 
