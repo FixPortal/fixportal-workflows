@@ -43,7 +43,7 @@ jobs:
       - name: Assert every job in this workflow is gated
         env:
           GATE_EXEMPT: ''
-        run: bash .github/scripts/assert-gate-coverage.sh .github/workflows/ci.yml
+        run: python3 .github/scripts/assert_gate_coverage.py .github/workflows/ci.yml
 
   # Required status check. Deliberately a pure aggregator of needs.*.result: it decides
   # what can merge, so it has no checkout, no parser and no network of its own.
