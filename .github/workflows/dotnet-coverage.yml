@@ -79,6 +79,15 @@ jobs:
         with:
           persist-credentials: false
 
+      # NOTE for consumers: this step runs in the CALLER's checkout, so it lints the
+      # calling repo's .github/workflows on every coverage run (house rule: actionlint
+      # is the first validation step of every job). A caller whose workflows fail
+      # actionlint will see this step fail before restore begins.
+      - name: Lint workflows (actionlint)
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2
+        with:
+          shellcheck: true
+
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: ${{ inputs.dotnet-version }}
