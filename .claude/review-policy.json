@@ -15,7 +15,8 @@
   "high": [
     ".claude/review-policy.json",
     ".coderabbit.yaml",
-    ".github/workflows/**"
+    ".github/workflows/**",
+    ".github/dependabot.yml"
   ],
 
   "low": [
