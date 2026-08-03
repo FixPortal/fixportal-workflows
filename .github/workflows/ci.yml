@@ -28,3 +28,42 @@ jobs:
         with:
           files: '.github/workflows/*.yml,tests/*.yml'
           shellcheck: true
+
+  gate-coverage:
+    name: Gate coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Assert every job in this workflow is gated
+        env:
+          GATE_EXEMPT: ''
+        run: bash .github/scripts/assert-gate-coverage.sh .github/workflows/ci.yml
+
+  # Required status check. Deliberately a pure aggregator of needs.*.result: it decides
+  # what can merge, so it has no checkout, no parser and no network of its own.
+  #
+  # `if: always()` is load-bearing. Without it the job is SKIPPED when an upstream job
+  # fails, a skipped job emits no check run at all, and a required context that never
+  # reports leaves the pull request permanently unmergeable.
+  #
+  # `skipped` counts as a pass, which is what lets job-level `if:` conditions and path
+  # filtering work; `failure` and `cancelled` do not.
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs: [workflows, gate-coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Fail if any upstream job did not succeed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "Upstream results: ${{ join(needs.*.result, ', ') }}"
+          exit 1
