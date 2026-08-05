@@ -5,3 +5,5 @@ graphify-out/
 # Claude Code: ignore machine-local runtime state and review worktrees while retaining policy.
 .claude/*
 !.claude/review-policy.json
+
+.semgrep/
