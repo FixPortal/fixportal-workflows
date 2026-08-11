@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # Deliberately narrow: all-branch pushes fire a second full run on every PR commit.
+  # Concurrency does not safely solve that because push and PR refs differ.
+  # Regression signal: two runs with one head SHA, one push and one pull_request.
   push:
-    branches: ['**']
+    branches: [main]
     tags: ['v*']
   pull_request:
     branches: [main]
