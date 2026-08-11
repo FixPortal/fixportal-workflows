@@ -16,9 +16,10 @@ name: Review policy guard
 # overlook the way a reviewer can. .gitignore is NORMAL wherever this workflow exists.
 # Do not remove it without putting .gitignore back in the policy's high list.
 
+# Deliberately narrow: pull_request already covers branch commits.
 on:
   push:
-    branches: ['**']
+    branches: [main]
     tags: ['v*']
   pull_request:
     branches: [main]
