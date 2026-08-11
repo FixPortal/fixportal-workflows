@@ -57,6 +57,7 @@ permissions:
 jobs:
   coverage:
     runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
     # runs-on is caller-controlled, so pin bash — the run: steps use bash syntax
     # (arrays, $HOME, GITHUB_PATH) that would break under a Windows runner's default shell.
     defaults:
@@ -118,7 +119,7 @@ jobs:
           dotnet-coverage collect \
             --output ./TestResults/coverage.cobertura.xml \
             --output-format cobertura \
-            dotnet test "$SOLUTION" --configuration "$CONFIGURATION" --no-restore "${filter[@]}"
+            dotnet test "$SOLUTION" --configuration "$CONFIGURATION" --no-restore --blame-hang-timeout 30s --blame-hang-dump-type none "${filter[@]}"
 
       - name: Generate coverage report
         # Only run when a coverage file was actually produced — on a Restore/test failure
