@@ -37,11 +37,10 @@ cd fixportal-workflows
 
 ## Before you open a PR
 
-Validate every workflow and the representative caller the same way CI does —
-with actionlint:
+Validate every workflow the same way CI does — with actionlint:
 
 ```bash
-actionlint .github/workflows/*.yml tests/*.yml
+actionlint .github/workflows/*.yml
 ```
 
 CI runs exactly this via the `Reusable workflow contract` job, so a locally
@@ -59,5 +58,5 @@ clean run means a green check.
 - One focused change per PR.
 - The interface-contract rule above honoured, with any consumer-visible change
   called out explicitly in the PR description.
-- `tests/representative-caller.yml` updated when the `dotnet-coverage.yml`
-  contract changes, so the usage example stays true.
+- A reusable workflow added or changed comes with a representative caller under
+  `tests/`, so the usage example stays true.
