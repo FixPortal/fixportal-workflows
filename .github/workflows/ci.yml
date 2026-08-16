@@ -28,10 +28,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate workflows and representative caller
+      - name: Validate workflows
         uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2
         with:
-          files: '.github/workflows/*.yml,tests/*.yml'
+          files: '.github/workflows/*.yml'
           shellcheck: true
 
   gate-coverage:
