@@ -1,6 +1,7 @@
 name: Review policy guard
 
-# The review control plane must not be able to delete itself.
+# The review control plane must not be able to delete itself, and workflow changes must
+# meet the hygiene bar mechanically rather than by a reviewer noticing.
 #
 # .claude/review-policy.json decides which reviewers a PR needs, and a repo with NO
 # policy file tiers every PR NORMAL. So one .gitignore line re-excluding .claude/
@@ -12,18 +13,31 @@ name: Review policy guard
 # trivial ignore edit, because the policy hook tiers by path glob and cannot tell
 # "re-excludes .claude/" from "ignores a scratch directory".
 #
-# This asserts the invariant directly instead: deterministic, free, and impossible to
-# overlook the way a reviewer can. .gitignore is NORMAL wherever this workflow exists.
-# Do not remove it without putting .gitignore back in the policy's high list.
+# `.github/workflows/**` left the policy's high list on 2026-08-19 for the same reason,
+# and is asserted here instead. Measured over 100 HIGH-tier PRs in the 30 days to that
+# date: config-only diffs were 27 of them and produced FOUR actionable CodeRabbit
+# comments between them, while code-bearing diffs produced 174. In the same sample 45 of
+# 100 HIGH PRs got no CodeRabbit verdict at all — throttled out, CodeRabbit's own notice
+# reporting 73 reviews in 7 days against a 30/7d threshold. So the glob was not buying
+# review of workflow changes; it was crowding out review of code.
+#
+# What a reviewer was nominally catching on a workflow diff is checked below instead:
+# unpinned actions, pull_request_target, and a blanket write-all token. actionlint covers
+# syntax in the main CI workflow.
+#
+# THIS FILE DELETING ITSELF is covered by branch rules, not by review: "Review policy
+# intact" is a REQUIRED status check across the estate, so removing this workflow means
+# the check never reports and the PR cannot merge.
+#
+# Do not restore `.github/workflows/**` or `.gitignore` to the policy's high list without
+# first removing the corresponding assertion here.
 
 # Deliberately narrow: pull_request already covers branch commits.
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -34,24 +48,140 @@ concurrency:
 
 jobs:
   guard:
+    # NAME IS LOAD-BEARING. "Review policy intact" is a required status check on main in
+    # nearly every estate repo. Renaming the job silently detaches that requirement:
+    # the rule waits for a context that no longer reports, and the old name never
+    # arrives. Change the name only alongside a deliberate ruleset update everywhere.
     name: Review policy intact
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - name: Policy file must be tracked and unignored
+      - name: Policy file must be tracked, unignored, and usable
         run: |
-          if ! git ls-files --error-unmatch .claude/review-policy.json >/dev/null 2>&1; then
-            echo "::error file=.claude/review-policy.json::Review policy is untracked, so every PR in this repo would tier NORMAL. Restore and commit it."
+          set -euo pipefail
+          policy=.claude/review-policy.json
+
+          if ! git ls-files --error-unmatch "$policy" >/dev/null 2>&1; then
+            echo "::error file=$policy::Review policy is untracked, so every PR in this repo would tier NORMAL. Restore and commit it."
             exit 1
           fi
+
           # --no-index is load-bearing: without it, check-ignore consults the index and
           # never reports a TRACKED file as ignored, so this would pass unconditionally
           # and guard nothing.
-          if git check-ignore --no-index -q .claude/review-policy.json; then
-            echo "::error file=.gitignore::.gitignore now excludes .claude/review-policy.json, which silently drops every PR in this repo to NORMAL. Restore the '!.claude/review-policy.json' negation."
+          if git check-ignore --no-index -q "$policy"; then
+            echo "::error file=.gitignore::.gitignore now excludes $policy, which silently drops every PR in this repo to NORMAL. Restore the '!.claude/review-policy.json' negation."
             exit 1
           fi
-          echo "Review policy is tracked and unignored."
+
+          # Existence is not usability. An automated rollout once EMPTIED this file across
+          # 21 repos; every repo then had no policy and tiered every PR NORMAL, and the
+          # first version of this guard passed the whole time — an empty file is still
+          # tracked and still unignored. Content is checked here for that reason.
+          if [ ! -s "$policy" ]; then
+            echo "::error file=$policy::Review policy is EMPTY, so every PR in this repo tiers NORMAL. Restore it from history."
+            exit 1
+          fi
+          if ! jq -e . "$policy" >/dev/null 2>&1; then
+            echo "::error file=$policy::Review policy is not valid JSON, so the tiering hook cannot read it and every PR falls back to NORMAL."
+            exit 1
+          fi
+          if ! jq -e 'has("high") and (.high | type == "array")' "$policy" >/dev/null; then
+            echo "::error file=$policy::Review policy has no 'high' array. Nothing can tier HIGH, so the policy is inert."
+            exit 1
+          fi
+          # The review control plane must stay HIGH in every repo: this file decides which
+          # reviewers a PR needs, and .coderabbit.yaml can silence a reviewer outright.
+          for required in .claude/review-policy.json .coderabbit.yaml; do
+            if ! jq -e --arg r "$required" '.high | index($r)' "$policy" >/dev/null; then
+              echo "::error file=$policy::'$required' is missing from the high list. An edit to it would get the lighter review."
+              exit 1
+            fi
+          done
+
+          echo "Review policy is tracked, unignored, parseable, and tiers its own control plane HIGH."
+          jq -c '{version, high: (.high | length), low: (.low | length)}' "$policy"
+
+      - name: Workflows must pin third-party actions to a full commit SHA
+        run: |
+          set -euo pipefail
+
+          # A tag or branch ref is mutable: whoever controls the action can change what
+          # `@v4` points at after review. A 40-hex SHA cannot be moved. Local refs (./)
+          # are this repo's own files and carry no external supply chain.
+          #
+          # SCOPED TO THIRD-PARTY OWNERS DELIBERATELY. Measured 2026-08-19 across 28
+          # estate repos: 319 unpinned refs, of which every one sampled was `actions/*`.
+          # A hard gate on ALL owners would have failed 27 of 28 repos on their next PR.
+          # `actions/*` is GitHub's own namespace, and a mutable tag there means trusting
+          # GitHub — which every workflow already does by running on their runners. A
+          # third-party mutable tag means trusting that owner forever, with no re-review
+          # when they move it. Only the second is gated here.
+          #
+          # actions/* is reported and NOT failed. Flip it to a failure once a pinning
+          # sweep lands; until then a hard gate would just be reverted.
+          #
+          # Deliberately a grep, not a YAML parse: `uses:` is a single-line scalar in
+          # every valid workflow, and a parser here would need a dependency this job
+          # does not otherwise have.
+          bad=0
+          firstparty=0
+          while IFS= read -r line; do
+            file="${line%%:*}"
+            ref="$(printf '%s' "$line" | sed -E 's/.*uses:[[:space:]]*//; s/[[:space:]]*(#.*)?$//')"
+            case "$ref" in
+              ./*) continue ;;
+            esac
+            rev="${ref##*@}"
+            if [ "$rev" != "$ref" ] && printf '%s' "$rev" | grep -Eq '^[0-9a-f]{40}$'; then
+              continue
+            fi
+            case "$ref" in
+              actions/*)
+                echo "::notice file=$file::'$ref' is not SHA-pinned. First-party (GitHub) action, so not failed — pin it when convenient."
+                firstparty=$((firstparty + 1))
+                ;;
+              *)
+                echo "::error file=$file::Third-party action '$ref' is not pinned to a full 40-character commit SHA. A mutable tag can change after review."
+                bad=1
+                ;;
+            esac
+          done < <(grep -rEn '^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*[^[:space:]#]+' .github/workflows --include='*.yml' --include='*.yaml' || true)
+
+          [ "$bad" -eq 0 ] || exit 1
+          echo "Every third-party action is pinned to a full commit SHA ($firstparty first-party ref(s) unpinned, not gated)."
+
+      - name: Workflows must not use pull_request_target or a write-all token
+        run: |
+          set -euo pipefail
+          bad=0
+
+          # pull_request_target runs with a WRITE token and repo secrets in the context of
+          # the base repo, while checking out attacker-controlled head code if the workflow
+          # asks for it. It has legitimate uses, but none that should land without being
+          # argued for explicitly — so it is refused here rather than reviewed by glob.
+          if grep -rEn '^[[:space:]]*pull_request_target:' .github/workflows --include='*.yml' --include='*.yaml'; then
+            echo "::error::pull_request_target grants a write token and secrets to a workflow that can check out untrusted head code. Use pull_request, or remove this assertion deliberately with a written rationale."
+            bad=1
+          fi
+
+          # A blanket write token discards least privilege for every job in the file.
+          #
+          # `^[^#]*` is load-bearing, not tidiness. Without it this grep matched THIS
+          # FILE'S OWN COMMENT describing the rule, so the guard failed in every repo it
+          # was installed into — caught on the fixportal-venue pilot, 2026-08-19, before
+          # the estate sweep ran. Requiring no '#' before the keyword means a line that
+          # merely talks about the rule cannot trip it. The pull_request_target grep above
+          # is already safe for the same reason: it anchors to line-start plus whitespace,
+          # which a comment marker breaks.
+          if grep -rEn '^[^#]*permissions:[[:space:]]*write-all' .github/workflows --include='*.yml' --include='*.yaml'; then
+            echo "::error::A write-all token discards least privilege. Declare the specific permissions each job needs."
+            bad=1
+          fi
+
+          [ "$bad" -eq 0 ] || exit 1
+          echo "No pull_request_target trigger and no write-all token."
