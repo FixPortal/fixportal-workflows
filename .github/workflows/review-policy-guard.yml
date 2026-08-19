@@ -155,7 +155,12 @@ jobs:
           [ "$bad" -eq 0 ] || exit 1
           echo "Every third-party action is pinned to a full commit SHA ($firstparty first-party ref(s) unpinned, not gated)."
 
-      - name: Workflows must not use pull_request_target or a write-all token
+      # The step name and the error message below deliberately AVOID the literal trigger
+      # name. This step greps .github/workflows, it lives in .github/workflows, and the
+      # pattern now matches the token anywhere on a non-comment line — so spelling it out
+      # in a `name:` or an `echo` makes the guard fail itself in every repo. Comments are
+      # safe (the pattern excludes them) and carry the explanation instead.
+      - name: Workflows must not use the target-context trigger or a write-all token
         run: |
           set -euo pipefail
           bad=0
@@ -164,8 +169,14 @@ jobs:
           # the base repo, while checking out attacker-controlled head code if the workflow
           # asks for it. It has legitimate uses, but none that should land without being
           # argued for explicitly — so it is refused here rather than reviewed by glob.
-          if grep -rEn '^[[:space:]]*pull_request_target:' .github/workflows --include='*.yml' --include='*.yaml'; then
-            echo "::error::pull_request_target grants a write token and secrets to a workflow that can check out untrusted head code. Use pull_request, or remove this assertion deliberately with a written rationale."
+          #
+          # Matches the KEY form (`pull_request_target:` on its own line) and the LIST form
+          # (`on: [push, pull_request_target]`), which the key-anchored pattern missed
+          # entirely — a false negative on a perfectly ordinary way to write the trigger,
+          # not just on a determined evasion. `^[^#]*` keeps prose about the rule, including
+          # the comment you are reading, from tripping it.
+          if grep -rEn '^[^#]*pull_request_target([^a-zA-Z_]|$)' .github/workflows --include='*.yml' --include='*.yaml'; then
+            echo "::error::That trigger (see the matched line above) grants a write token and repo secrets to a workflow that can check out untrusted head code. Use the plain pull_request trigger, or remove this assertion deliberately with a written rationale."
             bad=1
           fi
 
@@ -178,10 +189,15 @@ jobs:
           # merely talks about the rule cannot trip it. The pull_request_target grep above
           # is already safe for the same reason: it anchors to line-start plus whitespace,
           # which a comment marker breaks.
-          if grep -rEn '^[^#]*permissions:[[:space:]]*write-all' .github/workflows --include='*.yml' --include='*.yaml'; then
+          # The optional quote matters: YAML accepts a double- or single-quoted write-all
+          # identically to the bare word, and the unquoted-only pattern read both as clean.
+          # `.?` rather than a quote character class, because embedding a single quote in a
+          # single-quoted shell argument needs the '"'"' splice, which is unreadable here
+          # and defeats the self-match test's pattern extraction.
+          if grep -rEn '^[^#]*permissions:[[:space:]]*.?write-all' .github/workflows --include='*.yml' --include='*.yaml'; then
             echo "::error::A write-all token discards least privilege. Declare the specific permissions each job needs."
             bad=1
           fi
 
           [ "$bad" -eq 0 ] || exit 1
-          echo "No pull_request_target trigger and no write-all token."
+          echo "No target-context trigger and no write-all token."
