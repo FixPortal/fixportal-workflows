@@ -4,10 +4,12 @@
     "Any file matching 'high' => HIGH (Gitar + CodeRabbit). All files matching 'low' => LOW.",
     "Everything else => NORMAL (Gitar only). No match anywhere => NORMAL, deliberately.",
     "",
-    "This repo's PRODUCT is its reusable workflows - other repos call them by ref. A change",
-    "under .github/workflows/ is not this repo's CI, it is a release to every consumer,",
-    "which is why it is HIGH here even more emphatically than elsewhere.",
-    "There is essentially nothing else in the repo, so almost every PR is HIGH by design.",
+    "This repo HOSTS reusable workflows - other repos would call them by ref, so a change",
+    "under .github/workflows/ is a release to every consumer. None are published right now",
+    "(dotnet-coverage.yml was removed when the estate moved to Microsoft.Testing.Platform),",
+    "but the two workflow files that remain produce this repo's required status checks, and",
+    "each runs the PR's OWN copy of itself - so the exact paths stay HIGH even though the",
+    "glob left the list (below), and the guard asserts they stay there.",
     "",
     "'.github/workflows/**' LEFT the high list on 2026-08-19 and is asserted in",
     "review-policy-guard.yml instead, on the same reasoning that removed .gitignore on",
@@ -21,7 +23,9 @@
     "",
     "Do NOT re-add it without first removing the corresponding assertions from the guard.",
     "Deleting the guard itself needs no reviewer: \"Review policy intact\" is a REQUIRED",
-    "status check, so removing the workflow means the check never reports and no PR merges."
+    "status check, so removing the workflow means the check never reports and no PR merges.",
+    "That requirement is out-of-repo ruleset state nothing here asserts - see the guard's",
+    "header comment."
   ],
 
   "version": 1,
@@ -29,6 +33,8 @@
   "high": [
     ".github/workflows/review-policy-guard.yml",
     ".github/scripts/assert_workflow_hygiene.py",
+    ".github/workflows/ci.yml",
+    ".github/scripts/assert_gate_coverage.py",
     ".claude/review-policy.json",
     ".coderabbit.yaml",
     ".github/dependabot.yml"

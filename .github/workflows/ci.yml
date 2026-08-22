@@ -31,7 +31,9 @@ jobs:
       - name: Validate workflows
         uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2
         with:
-          files: '.github/workflows/*.yml'
+          # Both extensions: the guard's hygiene scan covers *.yml and *.yaml, so a
+          # .yaml workflow would otherwise run and be guarded but never linted.
+          files: '.github/workflows/*.y*ml'
           shellcheck: true
 
   gate-coverage:
@@ -45,10 +47,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Assert every job in this workflow is gated
+      - name: Assert every job in every workflow is gated
         env:
+          # Job-level exemption, deliberately an explicit list. Both lists are
+          # reviewable because THIS file is in the review policy's HIGH tier, so the
+          # exemption and the job it exempts cannot arrive in one lightly-reviewed diff.
           GATE_EXEMPT: ''
-        run: python3 .github/scripts/assert_gate_coverage.py .github/workflows/ci.yml
+          # Per-file exemption. review-policy-guard.yml is covered by its own required
+          # context ("Review policy intact"); reusable workflow_call workflows belong
+          # here too -- their jobs run in the caller and must not be wired into ci-gate.
+          GATE_FILE_EXEMPT: '.github/workflows/review-policy-guard.yml'
+        run: python3 .github/scripts/assert_gate_coverage.py .github/workflows
 
   # Required status check. Deliberately a pure aggregator of needs.*.result: it decides
   # what can merge, so it has no checkout, no parser and no network of its own.

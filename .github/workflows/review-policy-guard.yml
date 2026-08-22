@@ -29,6 +29,13 @@ name: Review policy guard
 # intact" is a REQUIRED status check across the estate, so removing this workflow means
 # the check never reports and the PR cannot merge.
 #
+# That protection is OUT-OF-REPO state, admitted here because nothing in this repository
+# asserts it: the ruleset that makes the check required lives in the repo's GitHub
+# settings. Verified for this repo 2026-08-22 (`gh api repos/FixPortal/fixportal-workflows/
+# rules/branches/main` -- the ruleset requires both "CI Gate" and "Review policy intact"),
+# but a repo scaffolded with these workflows and WITHOUT the ruleset update runs both
+# jobs green while nothing blocks merge. Wiring the ruleset is part of adopting them.
+#
 # Do not restore `.github/workflows/**` or `.gitignore` to the policy's high list without
 # first removing the corresponding assertion here.
 
@@ -103,8 +110,13 @@ jobs:
           # the context green while asserting nothing. The header comment's self-protection
           # argument only ever covered DELETION -- a deleted workflow never reports, so the
           # context stays pending and blocks -- and said nothing about neutering.
+          #
+          # ci.yml and its checker are on the list for the same reason: "CI Gate" is the
+          # other required context, and it too runs the PR's own copy -- a PR that keeps the
+          # job name and drops `needs:` from ci-gate merges green under the lighter review.
           for required in .claude/review-policy.json .coderabbit.yaml \
-            .github/workflows/review-policy-guard.yml .github/scripts/assert_workflow_hygiene.py; do
+            .github/workflows/review-policy-guard.yml .github/scripts/assert_workflow_hygiene.py \
+            .github/workflows/ci.yml .github/scripts/assert_gate_coverage.py; do
             if ! jq -e --arg r "$required" '.high | index($r)' "$policy" >/dev/null; then
               echo "::error file=$policy::'$required' is missing from the high list. An edit to it would get the lighter review."
               exit 1
