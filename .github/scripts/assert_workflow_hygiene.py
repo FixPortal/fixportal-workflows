@@ -21,6 +21,12 @@ Parsing also removes the self-match hazard the greps carried. They needed a
 (that bit on the fixportal-venue pilot). A parser reads values, so prose about a
 rule cannot be mistaken for the rule.
 
+Composite actions under `.github/actions/*/action.yml` are scanned for pinning too:
+a workflow-side `uses: ./...` ref is this repository's own reviewed code and is
+skipped, but the composite action's own steps can name mutable third-party actions,
+making the local ref an unscanned indirection layer without this. The trigger and
+permissions assertions stay workflow-only -- they have no meaning in an action.
+
 Exit codes: 0 clean, 1 a hard violation, 2 the checker could not run.
 """
 
@@ -47,6 +53,7 @@ except ImportError:
     sys.exit(2)
 
 WORKFLOWS = Path(".github/workflows")
+ACTIONS = Path(".github/actions")
 SHA_LEN = 40
 DIGEST_LEN = 64
 
@@ -119,6 +126,19 @@ def action_refs(document):
     return refs
 
 
+def composite_refs(document):
+    """Every `uses:` value in a composite action's `runs.steps`."""
+    refs = []
+    runs = document.get("runs")
+    if isinstance(runs, dict):
+        steps = runs.get("steps")
+        if isinstance(steps, list):
+            for step in steps:
+                if isinstance(step, dict) and isinstance(step.get("uses"), str):
+                    refs.append(("composite step", step["uses"]))
+    return refs
+
+
 def is_pinned(ref):
     """True when the ref names an immutable revision.
 
@@ -140,6 +160,29 @@ def is_pinned(ref):
             char in "0123456789abcdef" for char in digest
         )
     return len(revision) == SHA_LEN and all(char in "0123456789abcdef" for char in revision)
+
+
+def report_pin(path, where, ref):
+    """Print the verdict for one `uses:` ref. Returns None when pinned, else
+    'notice' (unpinned first-party) or 'error' (unpinned third-party)."""
+    if is_pinned(ref):
+        return None
+    # actions/* is GitHub's own namespace, and a mutable tag there means
+    # trusting GitHub -- which every workflow already does by running on
+    # their runners. A third-party mutable tag means trusting that owner
+    # forever, with no re-review when they move it. Only the second is
+    # gated. Flip this to a failure once a pinning sweep lands.
+    if ref.startswith("actions/"):
+        print(
+            f"::notice file={path}::'{ref}' ({where}) is not SHA-pinned. First-party "
+            "(GitHub) action, so not failed -- pin it when convenient."
+        )
+        return "notice"
+    print(
+        f"::error file={path}::Third-party action '{ref}' ({where}) is not pinned to "
+        "an immutable revision. A mutable tag can change after review."
+    )
+    return "error"
 
 
 def main():
@@ -185,25 +228,35 @@ def main():
                 failed = True
 
         for job, ref in action_refs(document):
-            if is_pinned(ref):
-                continue
-            # actions/* is GitHub's own namespace, and a mutable tag there means
-            # trusting GitHub -- which every workflow already does by running on
-            # their runners. A third-party mutable tag means trusting that owner
-            # forever, with no re-review when they move it. Only the second is
-            # gated. Flip this to a failure once a pinning sweep lands.
-            if ref.startswith("actions/"):
-                print(
-                    f"::notice file={path}::'{ref}' (job '{job}') is not SHA-pinned. First-party "
-                    "(GitHub) action, so not failed -- pin it when convenient."
-                )
+            verdict = report_pin(path, f"job '{job}'", ref)
+            if verdict == "notice":
                 unpinned_first_party += 1
-            else:
-                print(
-                    f"::error file={path}::Third-party action '{ref}' (job '{job}') is not pinned to "
-                    "an immutable revision. A mutable tag can change after review."
-                )
+            elif verdict == "error":
                 failed = True
+
+    # Composite actions are an indirection layer over the pin gate: a workflow's
+    # `uses: ./...` ref is skipped as local code, so the action's own third-party
+    # refs would otherwise be scanned by nothing. The directory need not exist.
+    if ACTIONS.is_dir():
+        for path in sorted(
+            list(ACTIONS.glob("**/action.yml")) + list(ACTIONS.glob("**/action.yaml"))
+        ):
+            try:
+                document = load(path)
+            except yaml.YAMLError as error:
+                print(f"::error file={path}::Not parseable as YAML: {error}")
+                failed = True
+                continue
+            if not isinstance(document, dict):
+                print(f"::error file={path}::Action does not parse to a mapping.")
+                failed = True
+                continue
+            for where, ref in composite_refs(document):
+                verdict = report_pin(path, where, ref)
+                if verdict == "notice":
+                    unpinned_first_party += 1
+                elif verdict == "error":
+                    failed = True
 
     if failed:
         return 1
