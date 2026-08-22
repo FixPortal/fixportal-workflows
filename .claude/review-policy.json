@@ -27,6 +27,8 @@
   "version": 1,
 
   "high": [
+    ".github/workflows/review-policy-guard.yml",
+    ".github/scripts/assert_workflow_hygiene.py",
     ".claude/review-policy.json",
     ".coderabbit.yaml",
     ".github/dependabot.yml"
