@@ -114,9 +114,16 @@ jobs:
           # ci.yml and its checker are on the list for the same reason: "CI Gate" is the
           # other required context, and it too runs the PR's own copy -- a PR that keeps the
           # job name and drops `needs:` from ci-gate merges green under the lighter review.
+          #
+          # .github/actions/** is quoted on purpose: unquoted, bash glob-expands the
+          # pattern against the filesystem the moment the directory exists, and the
+          # assertion would then check for paths nobody tiered instead of the pattern.
+          # The hygiene checker scans composite actions there (a workflow's `./` ref is
+          # skipped as local code), so their edits must stay under the heavier review.
           for required in .claude/review-policy.json .coderabbit.yaml \
             .github/workflows/review-policy-guard.yml .github/scripts/assert_workflow_hygiene.py \
-            .github/workflows/ci.yml .github/scripts/assert_gate_coverage.py; do
+            .github/workflows/ci.yml .github/scripts/assert_gate_coverage.py \
+            ".github/actions/**"; do
             if ! jq -e --arg r "$required" '.high | index($r)' "$policy" >/dev/null; then
               echo "::error file=$policy::'$required' is missing from the high list. An edit to it would get the lighter review."
               exit 1
