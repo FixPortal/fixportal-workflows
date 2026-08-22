@@ -96,7 +96,15 @@ jobs:
           fi
           # The review control plane must stay HIGH in every repo: this file decides which
           # reviewers a PR needs, and .coderabbit.yaml can silence a reviewer outright.
-          for required in .claude/review-policy.json .coderabbit.yaml; do
+          #
+          # This guard and its checker are on the list for a reason found on 2026-08-22.
+          # The required "Review policy intact" context is produced by the PR's OWN copy of
+          # this workflow, so a PR that replaces the assertion steps with `run: true` reports
+          # the context green while asserting nothing. The header comment's self-protection
+          # argument only ever covered DELETION -- a deleted workflow never reports, so the
+          # context stays pending and blocks -- and said nothing about neutering.
+          for required in .claude/review-policy.json .coderabbit.yaml \
+            .github/workflows/review-policy-guard.yml .github/scripts/assert_workflow_hygiene.py; do
             if ! jq -e --arg r "$required" '.high | index($r)' "$policy" >/dev/null; then
               echo "::error file=$policy::'$required' is missing from the high list. An edit to it would get the lighter review."
               exit 1
@@ -106,98 +114,18 @@ jobs:
           echo "Review policy is tracked, unignored, parseable, and tiers its own control plane HIGH."
           jq -c '{version, high: (.high | length), low: (.low | length)}' "$policy"
 
-      - name: Workflows must pin third-party actions to a full commit SHA
-        run: |
-          set -euo pipefail
-
-          # A tag or branch ref is mutable: whoever controls the action can change what
-          # `@v4` points at after review. A 40-hex SHA cannot be moved. Local refs (./)
-          # are this repo's own files and carry no external supply chain.
-          #
-          # SCOPED TO THIRD-PARTY OWNERS DELIBERATELY. Measured 2026-08-19 across 28
-          # estate repos: 319 unpinned refs, of which every one sampled was `actions/*`.
-          # A hard gate on ALL owners would have failed 27 of 28 repos on their next PR.
-          # `actions/*` is GitHub's own namespace, and a mutable tag there means trusting
-          # GitHub — which every workflow already does by running on their runners. A
-          # third-party mutable tag means trusting that owner forever, with no re-review
-          # when they move it. Only the second is gated here.
-          #
-          # actions/* is reported and NOT failed. Flip it to a failure once a pinning
-          # sweep lands; until then a hard gate would just be reverted.
-          #
-          # Deliberately a grep, not a YAML parse: `uses:` is a single-line scalar in
-          # every valid workflow, and a parser here would need a dependency this job
-          # does not otherwise have.
-          bad=0
-          firstparty=0
-          while IFS= read -r line; do
-            file="${line%%:*}"
-            ref="$(printf '%s' "$line" | sed -E 's/.*uses:[[:space:]]*//; s/[[:space:]]*(#.*)?$//')"
-            case "$ref" in
-              ./*) continue ;;
-            esac
-            rev="${ref##*@}"
-            if [ "$rev" != "$ref" ] && printf '%s' "$rev" | grep -Eq '^[0-9a-f]{40}$'; then
-              continue
-            fi
-            case "$ref" in
-              actions/*)
-                echo "::notice file=$file::'$ref' is not SHA-pinned. First-party (GitHub) action, so not failed — pin it when convenient."
-                firstparty=$((firstparty + 1))
-                ;;
-              *)
-                echo "::error file=$file::Third-party action '$ref' is not pinned to a full 40-character commit SHA. A mutable tag can change after review."
-                bad=1
-                ;;
-            esac
-          done < <(grep -rEn '^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*[^[:space:]#]+' .github/workflows --include='*.yml' --include='*.yaml' || true)
-
-          [ "$bad" -eq 0 ] || exit 1
-          echo "Every third-party action is pinned to a full commit SHA ($firstparty first-party ref(s) unpinned, not gated)."
-
-      # The step name and the error message below deliberately AVOID the literal trigger
-      # name. This step greps .github/workflows, it lives in .github/workflows, and the
-      # pattern now matches the token anywhere on a non-comment line — so spelling it out
-      # in a `name:` or an `echo` makes the guard fail itself in every repo. Comments are
-      # safe (the pattern excludes them) and carry the explanation instead.
-      - name: Workflows must not use the target-context trigger or a write-all token
-        run: |
-          set -euo pipefail
-          bad=0
-
-          # pull_request_target runs with a WRITE token and repo secrets in the context of
-          # the base repo, while checking out attacker-controlled head code if the workflow
-          # asks for it. It has legitimate uses, but none that should land without being
-          # argued for explicitly — so it is refused here rather than reviewed by glob.
-          #
-          # Matches the KEY form (`pull_request_target:` on its own line) and the LIST form
-          # (`on: [push, pull_request_target]`), which the key-anchored pattern missed
-          # entirely — a false negative on a perfectly ordinary way to write the trigger,
-          # not just on a determined evasion. `^[^#]*` keeps prose about the rule, including
-          # the comment you are reading, from tripping it.
-          if grep -rEn '^[^#]*pull_request_target([^a-zA-Z_]|$)' .github/workflows --include='*.yml' --include='*.yaml'; then
-            echo "::error::That trigger (see the matched line above) grants a write token and repo secrets to a workflow that can check out untrusted head code. Use the plain pull_request trigger, or remove this assertion deliberately with a written rationale."
-            bad=1
-          fi
-
-          # A blanket write token discards least privilege for every job in the file.
-          #
-          # `^[^#]*` is load-bearing, not tidiness. Without it this grep matched THIS
-          # FILE'S OWN COMMENT describing the rule, so the guard failed in every repo it
-          # was installed into — caught on the fixportal-venue pilot, 2026-08-19, before
-          # the estate sweep ran. Requiring no '#' before the keyword means a line that
-          # merely talks about the rule cannot trip it. The pull_request_target grep above
-          # is already safe for the same reason: it anchors to line-start plus whitespace,
-          # which a comment marker breaks.
-          # The optional quote matters: YAML accepts a double- or single-quoted write-all
-          # identically to the bare word, and the unquoted-only pattern read both as clean.
-          # `.?` rather than a quote character class, because embedding a single quote in a
-          # single-quoted shell argument needs the '"'"' splice, which is unreadable here
-          # and defeats the self-match test's pattern extraction.
-          if grep -rEn '^[^#]*permissions:[[:space:]]*.?write-all' .github/workflows --include='*.yml' --include='*.yaml'; then
-            echo "::error::A write-all token discards least privilege. Declare the specific permissions each job needs."
-            bad=1
-          fi
-
-          [ "$bad" -eq 0 ] || exit 1
-          echo "No target-context trigger and no write-all token."
+      # Structural parse, NOT a grep. The three line-anchored greps this replaces were
+      # bypassable by ORDINARY block-style YAML -- a value may sit on the line after its
+      # key -- so `permissions:` followed by an indented `write-all`, and a `uses:` split
+      # the same way, both passed the guard green while resolving to exactly what the
+      # single-line spelling resolves to. Observed 2026-08-22; the script header carries
+      # the evidence. Parsing also removes the self-match hazard that forced the old
+      # `^[^#]*` prefixes: a parser reads values, so a comment describing a rule -- such
+      # as this one -- cannot be mistaken for a violation of it.
+      # Deliberately NO actions/setup-python step. That installs a clean interpreter from
+      # the tool cache, and PyYAML is not in it -- which failed this job on its first run
+      # (2026-08-22, "PyYAML is not available to this runner"). The runner image's SYSTEM
+      # python3 does carry PyYAML, which is what the sibling assert_gate_coverage.py has
+      # been relying on. Adding setup-python here shadows the interpreter that works.
+      - name: Workflows must be hygienic (no target-context trigger, no write-all, actions pinned)
+        run: python3 .github/scripts/assert_workflow_hygiene.py
