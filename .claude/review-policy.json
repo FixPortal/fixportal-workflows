@@ -35,6 +35,7 @@
     ".github/scripts/assert_workflow_hygiene.py",
     ".github/workflows/ci.yml",
     ".github/scripts/assert_gate_coverage.py",
+    ".github/actions/**",
     ".claude/review-policy.json",
     ".coderabbit.yaml",
     ".github/dependabot.yml"
