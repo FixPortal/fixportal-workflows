@@ -104,9 +104,11 @@ jobs:
           # while gating nothing. The checker that asserts the wiring, and this workflow
           # which asserts the policy, neuter the same way. All were tiering NORMAL.
           #
-          # This is three NAMED PATHS, not the '.github/workflows/**' glob that left the
+          # This is a NAMED-PATH list, not the '.github/workflows/**' glob that left the
           # policy on 2026-08-19 — the objection to the glob was its cost across routine
-          # workflow edits, and these three files change a few times a year. Adjust the
+          # workflow edits, and these files change a few times a year. Deliberately no
+          # count here: the list started at three and the hygiene checker took it to six,
+          # so a number goes stale and misleads whoever next adjusts it. Adjust the
           # ci.yml path if this repo's main workflow is named differently.
           for required in .claude/review-policy.json .coderabbit.yaml \
             .github/workflows/ci.yml .github/workflows/review-policy-guard.yml \

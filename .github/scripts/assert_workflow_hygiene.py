@@ -39,10 +39,17 @@ from pathlib import Path
 try:
     import yaml
 except ImportError:
-    sys.exit(
+    # Exit 2, not 1. `sys.exit("message")` prints the message and exits ONE, which this
+    # script reserves for a hard workflow violation -- so a runner image missing PyYAML
+    # reported as though the workflows themselves were bad, sending whoever read the
+    # check into the diff instead of the runner. main() already returns 2 for its other
+    # two "could not run" conditions; this is the third.
+    print(
         "python3 cannot import yaml. Provide PyYAML in the runner image rather than "
-        "installing it at CI time -- this script gates merges."
+        "installing it at CI time -- this script gates merges.",
+        file=sys.stderr,
     )
+    sys.exit(2)
 
 WORKFLOWS = Path(".github/workflows")
 SHA_LEN = 40
@@ -229,7 +236,21 @@ def check_ref(job, ref, origin, unpinned):
     owner = ref.split("@", 1)[0]
     third_party = not ref.startswith(("actions/", "./", "docker://"))
 
-    if TRUSTED_THIRD_PARTY_ACTIONS and third_party and owner not in TRUSTED_THIRD_PARTY_ACTIONS:
+    # The allowlist names ACTIONS by `owner/repo`, so it must only gate action refs.
+    # `action_refs` also yields container and service IMAGES, which reach here as bare
+    # names (`postgres@sha256:...`, `mcr.microsoft.com/mssql/server:2022-latest`) and
+    # therefore satisfy `third_party` too. Because the allowlist test runs BEFORE
+    # is_pinned, a correctly digest-pinned image was rejected for not appearing in an
+    # allowlist it could never legitimately be in. Registry hosts and digests are the
+    # tell: an action ref is exactly `owner/repo`, optionally `@ref`.
+    action_shaped = "/" in owner and "." not in owner.split("/", 1)[0] and ":" not in ref.split("@", 1)[0]
+
+    if (
+        TRUSTED_THIRD_PARTY_ACTIONS
+        and third_party
+        and action_shaped
+        and owner not in TRUSTED_THIRD_PARTY_ACTIONS
+    ):
         print(
             f"::error file={origin}::Third-party action '{ref}' ({job}) is not in "
             "TRUSTED_THIRD_PARTY_ACTIONS. Add it there with a written rationale, or "
