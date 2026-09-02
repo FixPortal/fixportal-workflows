@@ -29,13 +29,6 @@ name: Review policy guard
 # intact" is a REQUIRED status check across the estate, so removing this workflow means
 # the check never reports and the PR cannot merge.
 #
-# That protection is OUT-OF-REPO state, admitted here because nothing in this repository
-# asserts it: the ruleset that makes the check required lives in the repo's GitHub
-# settings. Verified for this repo 2026-08-22 (`gh api repos/FixPortal/fixportal-workflows/
-# rules/branches/main` -- the ruleset requires both "CI Gate" and "Review policy intact"),
-# but a repo scaffolded with these workflows and WITHOUT the ruleset update runs both
-# jobs green while nothing blocks merge. Wiring the ruleset is part of adopting them.
-#
 # Do not restore `.github/workflows/**` or `.gitignore` to the policy's high list without
 # first removing the corresponding assertion here.
 
@@ -104,26 +97,21 @@ jobs:
           # The review control plane must stay HIGH in every repo: this file decides which
           # reviewers a PR needs, and .coderabbit.yaml can silence a reviewer outright.
           #
-          # This guard and its checker are on the list for a reason found on 2026-08-22.
-          # The required "Review policy intact" context is produced by the PR's OWN copy of
-          # this workflow, so a PR that replaces the assertion steps with `run: true` reports
-          # the context green while asserting nothing. The header comment's self-protection
-          # argument only ever covered DELETION -- a deleted workflow never reports, so the
-          # context stays pending and blocks -- and said nothing about neutering.
+          # The MERGE BARRIER joined the list on 2026-08-23, after an adversarial-review
+          # sweep found the same hole in six estate repos at once. "CI Gate" is a required
+          # status check produced by the PR's OWN copy of ci.yml: a PR that keeps the job,
+          # its name and its needs: list, and only guts the aggregation step, reports green
+          # while gating nothing. The checker that asserts the wiring, and this workflow
+          # which asserts the policy, neuter the same way. All were tiering NORMAL.
           #
-          # ci.yml and its checker are on the list for the same reason: "CI Gate" is the
-          # other required context, and it too runs the PR's own copy -- a PR that keeps the
-          # job name and drops `needs:` from ci-gate merges green under the lighter review.
-          #
-          # .github/actions/** is quoted on purpose: unquoted, bash glob-expands the
-          # pattern against the filesystem the moment the directory exists, and the
-          # assertion would then check for paths nobody tiered instead of the pattern.
-          # The hygiene checker scans composite actions there (a workflow's `./` ref is
-          # skipped as local code), so their edits must stay under the heavier review.
+          # This is three NAMED PATHS, not the '.github/workflows/**' glob that left the
+          # policy on 2026-08-19 — the objection to the glob was its cost across routine
+          # workflow edits, and these three files change a few times a year. Adjust the
+          # ci.yml path if this repo's main workflow is named differently.
           for required in .claude/review-policy.json .coderabbit.yaml \
-            .github/workflows/review-policy-guard.yml .github/scripts/assert_workflow_hygiene.py \
-            .github/workflows/ci.yml .github/scripts/assert_gate_coverage.py \
-            ".github/actions/**"; do
+            .github/workflows/ci.yml .github/workflows/review-policy-guard.yml \
+            .github/scripts/assert_gate_coverage.py \
+            .github/scripts/assert_workflow_hygiene.py; do
             if ! jq -e --arg r "$required" '.high | index($r)' "$policy" >/dev/null; then
               echo "::error file=$policy::'$required' is missing from the high list. An edit to it would get the lighter review."
               exit 1
@@ -133,18 +121,23 @@ jobs:
           echo "Review policy is tracked, unignored, parseable, and tiers its own control plane HIGH."
           jq -c '{version, high: (.high | length), low: (.low | length)}' "$policy"
 
-      # Structural parse, NOT a grep. The three line-anchored greps this replaces were
-      # bypassable by ORDINARY block-style YAML -- a value may sit on the line after its
-      # key -- so `permissions:` followed by an indented `write-all`, and a `uses:` split
-      # the same way, both passed the guard green while resolving to exactly what the
-      # single-line spelling resolves to. Observed 2026-08-22; the script header carries
-      # the evidence. Parsing also removes the self-match hazard that forced the old
-      # `^[^#]*` prefixes: a parser reads values, so a comment describing a rule -- such
-      # as this one -- cannot be mistaken for a violation of it.
+      # PARSED, NOT GREPPED — replaced the two grep steps that used to live here
+      # (2026-08-24). Those greps had to exclude comment lines, because the pattern for
+      # each rule matched the comment EXPLAINING that rule: the first version failed the
+      # guard in every repo it was installed into, caught on the fixportal-venue pilot.
+      # They were also both too loose (prose tripped them) and too tight (a quoted value,
+      # a list-form trigger `on: [push, pull_request_target]`, or a digest-pinned image
+      # read wrongly). A parser has neither problem, and the checker's own source sitting
+      # in the repo cannot trip it — pinned by a test.
+      #
       # Deliberately NO actions/setup-python step. That installs a clean interpreter from
-      # the tool cache, and PyYAML is not in it -- which failed this job on its first run
+      # the tool cache, and PyYAML is not in it — which failed this job on its first run
       # (2026-08-22, "PyYAML is not available to this runner"). The runner image's SYSTEM
-      # python3 does carry PyYAML, which is what the sibling assert_gate_coverage.py has
-      # been relying on. Adding setup-python here shadows the interpreter that works.
+      # python3 does carry PyYAML. Adding setup-python here shadows the interpreter that
+      # works.
+      #
+      # Optional stricter mode: set TRUSTED_THIRD_PARTY_ACTIONS to a space-separated list
+      # of owner/repo entries to additionally require every third-party action to be named
+      # there. Off unless set — see the script's header for why it is not a default.
       - name: Workflows must be hygienic (no target-context trigger, no write-all, actions pinned)
         run: python3 .github/scripts/assert_workflow_hygiene.py
