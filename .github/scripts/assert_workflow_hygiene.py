@@ -241,9 +241,21 @@ def check_ref(job, ref, origin, unpinned):
     # names (`postgres@sha256:...`, `mcr.microsoft.com/mssql/server:2022-latest`) and
     # therefore satisfy `third_party` too. Because the allowlist test runs BEFORE
     # is_pinned, a correctly digest-pinned image was rejected for not appearing in an
-    # allowlist it could never legitimately be in. Registry hosts and digests are the
-    # tell: an action ref is exactly `owner/repo`, optionally `@ref`.
-    action_shaped = "/" in owner and "." not in owner.split("/", 1)[0] and ":" not in ref.split("@", 1)[0]
+    # allowlist it could never legitimately be in.
+    #
+    # Three tells, and the DIGEST is the load-bearing one. A registry host (dot in the
+    # first segment) and a port or tag colon both catch `mcr.microsoft.com/...`, but
+    # neither catches a Docker Hub org image like `bitnami/postgresql@sha256:...` --
+    # no dot, no colon, and `bitnami/postgresql` is exactly action-shaped. Only images
+    # pin with an `@sha256:` digest; an action pins to a bare 40-hex commit. So the
+    # digest settles the cases the other two miss.
+    revision = ref.split("@", 1)[1] if "@" in ref else ""
+    action_shaped = (
+        not revision.startswith("sha256:")
+        and "/" in owner
+        and "." not in owner.split("/", 1)[0]
+        and ":" not in owner
+    )
 
     if (
         TRUSTED_THIRD_PARTY_ACTIONS
