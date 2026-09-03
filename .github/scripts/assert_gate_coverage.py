@@ -281,9 +281,25 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job):
         )
 
 
+def parse_jobs(workflow_path):
+    """The job-name set for one file, read once so callers can validate exemptions
+    against it before (or across, in directory mode) running the full assertion."""
+    with open(workflow_path, encoding="utf-8") as handle:
+        lines = handle.readlines()
+    jobs, _, _ = read_gate_contract(lines, "")
+    return set(jobs)
+
+
 def check_file(workflow_path, gate_job, exempt, conditional_exempt):
     """Assert one file's full gate contract. Returns True when the file contains the
-    gate job (and every assertion ran), False when it has no gate job at all."""
+    gate job (and every assertion ran), False when it has no gate job at all.
+
+    Exemption-name validation is the CALLER's job, not this function's: in directory
+    mode a job named in GATE_EXEMPT exists in exactly one workflow, so validating it
+    against a single file's job set here reddened every OTHER workflow that also
+    contains the gate job with a false "names jobs that do not exist". Found by
+    CodeRabbit on fixportal-workflows#26.
+    """
 
     with open(workflow_path, encoding="utf-8") as handle:
         lines = handle.readlines()
@@ -293,15 +309,6 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt):
         sys.exit(f"{workflow_path}: no jobs found -- refusing to report coverage over nothing.")
     if gate_job not in jobs:
         return False
-
-    # A stale exemption is worse than a missing one: it reads as a deliberate decision
-    # while covering nothing, and it survives the rename that made it meaningless.
-    unknown = sorted((exempt | conditional_exempt) - set(jobs))
-    if unknown:
-        sys.exit(
-            f"{workflow_path}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT name jobs that do not "
-            f"exist: {', '.join(unknown)}"
-        )
 
     missing = sorted(set(jobs) - set(needs) - exempt - {gate_job})
     if missing:
@@ -346,6 +353,12 @@ def main(argv):
     conditional_exempt = split_env("GATE_CONDITIONAL_EXEMPT")
 
     if not Path(target).is_dir():
+        unknown = sorted((exempt | conditional_exempt) - parse_jobs(target))
+        if unknown:
+            sys.exit(
+                f"{target}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT name jobs that do not "
+                f"exist: {', '.join(unknown)}"
+            )
         check_file(target, gate_job, exempt, conditional_exempt)
         return
 
@@ -360,6 +373,21 @@ def main(argv):
     stale = sorted(file_exempt - set(files))
     if stale:
         sys.exit(f"GATE_FILE_EXEMPT names workflows that do not exist: {', '.join(stale)}")
+
+    # Validate GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT against the UNION of every
+    # file's jobs, not any one file -- a job named in either list exists in
+    # exactly one workflow, so checking it per-file reddened every other
+    # workflow that also has a gate job. Found by CodeRabbit on
+    # fixportal-workflows#26.
+    all_jobs = set()
+    for workflow_path in files:
+        all_jobs |= parse_jobs(workflow_path)
+    unknown = sorted((exempt | conditional_exempt) - all_jobs)
+    if unknown:
+        sys.exit(
+            f"{target}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT name jobs that do not "
+            f"exist in any workflow: {', '.join(unknown)}"
+        )
 
     gated = 0
     for workflow_path in files:
