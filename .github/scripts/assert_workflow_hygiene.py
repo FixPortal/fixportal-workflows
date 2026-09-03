@@ -355,8 +355,8 @@ def check_ref(job, ref, origin, unpinned):
             return False, unpinned + 1
         print(
             f"::error file={origin}::First-party action '{ref}' ({job}) is not on "
-            "the vN major tag. A branch ref or a bare action name is mutable and can "
-            "change after review."
+            "a vN release tag (major, or dotted minor/patch). A branch ref or a "
+            "bare action name is mutable and can change after review."
         )
         return True, unpinned
 
