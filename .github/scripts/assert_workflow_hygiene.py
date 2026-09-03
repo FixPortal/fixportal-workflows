@@ -33,6 +33,7 @@ resolve a reusable workflow in another repository, and pinning is checked by SHA
 """
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -59,6 +60,28 @@ DIGEST_LEN = 64
 # none should land without being argued for, so they are refused here rather than
 # reviewed by glob.
 PRIVILEGED_TRIGGERS = ("pull_request_target", "workflow_run")
+
+# OPTIONAL NO-CHECKOUT EXEMPTION, off unless the environment sets it.
+#
+# A workflow that never checks out or executes PR/head code is not the attack shape
+# PRIVILEGED_TRIGGERS refuses -- pull_request_target is dangerous specifically because it
+# combines a write token with attacker-controlled code, and a workflow that only reads the
+# API against the base ref (label operations, a status comment) never does that. Setting
+# PRIVILEGED_TRIGGER_NO_CHECKOUT to a space- or comma-separated list of workflow FILENAMES
+# (matched by name, e.g. "review-tier.yml") exempts those files' PRIVILEGED_TRIGGERS use --
+# but the exemption is enforced, not merely granted: any exempted workflow that also uses
+# `actions/checkout` fails regardless, because that combination is exactly the dangerous
+# shape again.
+#
+# Deliberately opt-in and file-scoped rather than a blanket disable, so a new workflow
+# cannot inherit the exemption by accident, and the CI-guard copy of this script can still
+# stay byte-identical to the shipped asset -- the repo-specific exemption list lives in the
+# WORKFLOW that sets the environment variable, never hardcoded in this file.
+PRIVILEGED_TRIGGER_NO_CHECKOUT = frozenset(
+    entry
+    for entry in os.environ.get("PRIVILEGED_TRIGGER_NO_CHECKOUT", "").replace(",", " ").split()
+    if entry
+)
 
 # OPTIONAL STRICTER MODE, off unless the environment sets it.
 #
@@ -228,6 +251,46 @@ def composite_step_refs(document):
     return refs
 
 
+def workflow_checks_out_code(document):
+    """True when this workflow fetches head/PR code, directly or through a local
+    composite action -- the property PRIVILEGED_TRIGGER_NO_CHECKOUT's exemption
+    requires be absent.
+
+    Checks direct `actions/checkout` `uses:` refs at job/step level, and follows a
+    LOCAL (`./`) composite action one level in to check its own `uses:` refs too --
+    a workflow that never calls actions/checkout itself but delegates to a composite
+    action that does is exactly as dangerous, and the direct check alone missed it.
+
+    KNOWN GAP, stated so a pass is not mistaken for more than it is: a `run:` step
+    that fetches code by shelling out (`git clone`, `curl` a tarball, `gh pr checkout`)
+    is not detected. That cannot be closed soundly by a regex over arbitrary shell --
+    the same reasoning `permission_blocks` above states for the write-all scope gap.
+    A workflow relying on that path to defeat the exemption is not caught here; treat
+    PRIVILEGED_TRIGGER_NO_CHECKOUT as reviewed-by-argument (the written rationale each
+    exempted workflow must carry), not as a fully mechanical guarantee.
+    """
+    for _, ref in action_refs(document):
+        owner = ref.split("@", 1)[0]
+        if owner == "actions/checkout":
+            return True
+        if ref.startswith("./") and not is_reusable_workflow_ref(ref):
+            manifest = local_manifest(ref)
+            if manifest is None:
+                continue
+            try:
+                inner = load(manifest)
+            except yaml.YAMLError:
+                continue
+            if not isinstance(inner, dict):
+                continue
+            if any(
+                inner_ref.split("@", 1)[0] == "actions/checkout"
+                for inner_ref in composite_step_refs(inner)
+            ):
+                return True
+    return False
+
+
 def check_ref(job, ref, origin, unpinned):
     """One pin check, shared by workflow refs and composite-action refs.
 
@@ -257,11 +320,16 @@ def check_ref(job, ref, origin, unpinned):
         and ":" not in owner
     )
 
+    # An action may live in a subdirectory (`owner/repo/subdir/action@<sha>`), but the
+    # allowlist names REPOSITORIES. Comparing the full `owner` value against it means a
+    # subdirectory action from an already-trusted repo never matches its own entry.
+    repository = "/".join(owner.split("/")[:2])
+
     if (
         TRUSTED_THIRD_PARTY_ACTIONS
         and third_party
         and action_shaped
-        and owner not in TRUSTED_THIRD_PARTY_ACTIONS
+        and repository not in TRUSTED_THIRD_PARTY_ACTIONS
     ):
         print(
             f"::error file={origin}::Third-party action '{ref}' ({job}) is not in "
@@ -273,18 +341,24 @@ def check_ref(job, ref, origin, unpinned):
     if is_pinned(ref):
         return False, unpinned
 
-    # actions/* is GitHub's own namespace, and a mutable tag there means trusting
-    # GitHub -- which every workflow already does by running on their runners. A
-    # third-party mutable tag means trusting that owner forever, with no re-review
-    # when they move it. Only the second is gated. Measured 2026-08-19 across 28
-    # estate repos: 319 unpinned refs, every one sampled `actions/*` -- a hard gate on
-    # all owners would have failed 27 of 28 repos on their next PR.
+    # actions/* is GitHub's own namespace, and the house standard is the INVERSE of
+    # the third-party rule: first-party actions take the major tag, and audit-ci
+    # grades a SHA-pinned first-party action as drift. "Take the major tag" is
+    # enforced here, not assumed -- a branch ref (actions/checkout@main) or a bare
+    # action name is just as mutable as an unpinned third-party tag and can change
+    # after review.
     if ref.startswith("actions/"):
+        revision = ref.rsplit("@", 1)[1] if "@" in ref else ""
+        if re.fullmatch(r"v\d+(\.\d+)*", revision):
+            # Conformant -- a vN release tag (major or dotted minor/patch). Counted
+            # only so the summary shows the split.
+            return False, unpinned + 1
         print(
-            f"::notice file={origin}::'{ref}' ({job}) is not SHA-pinned. First-party "
-            "(GitHub) action, so not failed -- pin it when convenient."
+            f"::error file={origin}::First-party action '{ref}' ({job}) is not on "
+            "the vN major tag. A branch ref or a bare action name is mutable and can "
+            "change after review."
         )
-        return False, unpinned + 1
+        return True, unpinned
 
     print(
         f"::error file={origin}::Third-party action or image '{ref}' ({job}) is not "
@@ -299,7 +373,7 @@ def main():
         return 2
 
     failed = False
-    unpinned_first_party = 0
+    first_party_tag = 0
     scanned = 0
 
     paths = sorted(
@@ -328,15 +402,35 @@ def main():
             failed = True
             events = []
 
+        exempted = path.name in PRIVILEGED_TRIGGER_NO_CHECKOUT
+        uses_checkout = workflow_checks_out_code(document)
         for event in events:
             if event in PRIVILEGED_TRIGGERS:
+                if exempted and not uses_checkout:
+                    print(
+                        f"::notice file={path}::Target-context trigger exempted via "
+                        "PRIVILEGED_TRIGGER_NO_CHECKOUT -- this workflow never checks out "
+                        "head code."
+                    )
+                    continue
+                if exempted and uses_checkout:
+                    print(
+                        f"::error file={path}::This workflow is named in "
+                        "PRIVILEGED_TRIGGER_NO_CHECKOUT but also uses actions/checkout -- "
+                        "that combination is exactly the dangerous shape the exemption "
+                        "requires absence of. Remove the checkout, or remove the exemption "
+                        "and restructure onto plain pull_request."
+                    )
+                    failed = True
+                    continue
                 print(
                     f"::error file={path}::This workflow uses a target-context trigger "
                     "(see the refused event list in this script), which runs in the base "
                     "repository's context with its secrets and a write-scoped token while "
                     "able to reach untrusted head code. Restructure so untrusted code runs "
-                    "under the plain pull_request trigger, or remove this assertion "
-                    "deliberately with a written rationale."
+                    "under the plain pull_request trigger, or name this file in "
+                    "PRIVILEGED_TRIGGER_NO_CHECKOUT if it genuinely never checks out head "
+                    "code, with a written rationale in the workflow itself."
                 )
                 failed = True
 
@@ -362,7 +456,7 @@ def main():
                 failed = True
 
         for job, ref in action_refs(document):
-            bad, unpinned_first_party = check_ref(job, ref, path, unpinned_first_party)
+            bad, first_party_tag = check_ref(job, ref, path, first_party_tag)
             failed = failed or bad
 
             if not ref.startswith("./"):
@@ -402,8 +496,8 @@ def main():
             # actions IT calls are not -- and they are invisible to a scan that stops
             # at .github/workflows.
             for inner_ref in composite_step_refs(inner):
-                bad, unpinned_first_party = check_ref(
-                    f"{job} -> {ref}", inner_ref, manifest, unpinned_first_party
+                bad, first_party_tag = check_ref(
+                    f"{job} -> {ref}", inner_ref, manifest, first_party_tag
                 )
                 failed = failed or bad
 
@@ -419,10 +513,16 @@ def main():
         if TRUSTED_THIRD_PARTY_ACTIONS
         else ""
     )
+    mode += (
+        f", {len(PRIVILEGED_TRIGGER_NO_CHECKOUT)} workflow(s) exempted from the "
+        "target-context trigger refusal"
+        if PRIVILEGED_TRIGGER_NO_CHECKOUT
+        else ""
+    )
     print(
         f"Workflow hygiene: {scanned} workflow(s) scanned -- no target-context trigger, "
         f"no write-all token, every third-party action and container image pinned "
-        f"({unpinned_first_party} first-party ref(s) unpinned, not gated){mode}."
+        f"({first_party_tag} first-party ref(s) on a vN release tag, conformant){mode}."
     )
     return 0
 
