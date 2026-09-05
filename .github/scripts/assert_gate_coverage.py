@@ -42,38 +42,23 @@ from pathlib import Path
 
 
 ID = r"[A-Za-z_][A-Za-z0-9_-]*"
-# A job key may be quoted -- `"security-scan":` is valid Actions syntax. The previous
-# unquoted-only pattern silently dropped such a job from the `jobs` dict, so it could
-# never appear in `set(jobs) - set(needs)` and the gate reported full coverage over a
-# quality job it was not gating. That is a fail-OPEN result, the one outcome this
-# script exists to prevent, so anything unclassifiable at job indentation now exits.
-JOB = re.compile(rf"""^\ \ (?:'({ID})'|"({ID})"|({ID}))\s*:\s*(?:\#.*)?$""", re.VERBOSE)
-NEEDS = re.compile(r"^    needs\s*:\s*(.*?)\s*$")
-# Block sequence items may sit at the key's own indentation (4) or be indented under it
-# (6), and may be quoted. Both forms are valid YAML; accepting only unquoted 6-space
-# items dropped entries, which ENLARGES `missing` and reddens a valid workflow.
-BLOCK_NEED = re.compile(rf"""^\s{{4,}}-\s*(?:'({ID})'|"({ID})"|({ID}))\s*(?:\#.*)?$""", re.VERBOSE)
 COMMENT_OR_BLANK = re.compile(r"^\s*(?:\#.*)?$")
-# Job-level only: `if:` at job-body indentation (4). Step-level `if:` sits at 6+ and
-# is out of scope -- a skipped step fails its job's own assertions, it does not make
-# the gate report green over a missing check. The key may be quoted (`'if':`,
-# `"if":`) -- that is valid YAML and must not slip past the check.
-JOB_IF = re.compile(r"""^    (?:'if'|"if"|if)\s*:""")
-# Same key, capturing its value, for the gate's own `if:`.
-JOB_IF_VALUE = re.compile(r"""^    (?:'if'|"if"|if)\s*:\s*(.*?)\s*$""")
 # A reference to an upstream job's outcome, in either the `needs.*.result` wildcard
 # form or the per-job `needs.build.result` form. Requiring the literal wildcard would
-# red a workflow that aggregates job by job, which is equally correct.
-NEEDS_RESULT = re.compile(r"needs\.[A-Za-z0-9_*-]+\.result")
-# A STEP-level `if:`, i.e. deeper than the four-space job-level one JOB_IF_VALUE matches,
-# in either the plain form (`        if: ...`) or as a list item's first key
-# (`      - if: ...`). Used to insist the gate's aggregation lives on a condition.
-# Group 1 is everything before the key, so its length is the key's own COLUMN. A block
-# scalar's continuation must out-indent THAT, not the line: measuring the line put the bar
-# at the `- ` of a dash-form step, so the sibling `run:` and its body were swallowed into
-# the condition (see step_conditions).
-STEP_IF_VALUE = re.compile(r"""^(\s{5,}(?:-\s+)?)(?:'if'|"if"|if)\s*:\s*(.*?)\s*$""")
-# A step `if:` may open a YAML block scalar and carry its condition on the following,
+# red a workflow that aggregates job by job, which is equally correct. The job id is
+# CAPTURED rather than merely matched, because "some dependency is referenced" is not
+# the assertion that matters: a gate declaring `needs: [build, lint]` whose condition
+# names only `build` reports success while `lint` fails.
+NEEDS_RESULT = re.compile(r"needs\.([A-Za-z0-9_*-]+)\.result")
+# A `run:` command that ends the shell non-zero. `exit 0`, `true`, or no exit at all
+# leaves the step incapable of failing whatever its condition says.
+NONZERO_EXIT = re.compile(r"^(?:exit\s+0*[1-9][0-9]*|false)\b")
+# Where one shell command ends and the next begins. Matching NONZERO_EXIT only at the
+# start of a line rejected the ordinary one-liner `if [ -n "$x" ]; then exit 1; fi`,
+# which is a false RED on a correct gate.
+COMMAND_BOUNDARY = re.compile(r"(?:;|&&|\|\||\bthen\b|\belse\b|\bdo\b|\{)")
+BACKSLASH = "\\"
+# An `if:` may open a YAML block scalar and carry its condition on the following,
 # more-indented lines. Those lines are part of the condition and must be searched too, or
 # a perfectly good gate written as `if: >` reads as having no condition at all.
 #
@@ -84,16 +69,86 @@ STEP_IF_VALUE = re.compile(r"""^(\s{5,}(?:-\s+)?)(?:'if'|"if"|if)\s*:\s*(.*?)\s*
 # conditioned on" failure. Rare shape, but the failure direction is a false RED on
 # correct configuration.
 BLOCK_SCALAR = re.compile(r"^[|>](?:[0-9][+-]?|[+-][0-9]?)?$")
-# Any OTHER step-body key that opens a block scalar (`run: |`, `run: >-`, ...). Its
-# payload is arbitrary text -- a heredoc/echo line shaped like `if: contains(...)`
-# inside a `run:` body is not a real YAML key, but STEP_IF_VALUE cannot tell the
-# difference by itself. Used to skip such spans wholesale before they reach
-# STEP_IF_VALUE. Group 1 is the key's own indent prefix, same convention as
-# STEP_IF_VALUE, so the span ends the same way: content must out-indent it.
-# The key may be quoted, exactly as STEP_IF_VALUE above admits 'if' and "if". Bare-only
-OTHER_BLOCK_KEY = re.compile(
-    r"""^(\s{5,}(?:-\s+)?)(?:'[A-Za-z_][A-Za-z0-9_-]*'|"[A-Za-z_][A-Za-z0-9_-]*"|[A-Za-z_][A-Za-z0-9_-]*)\s*:\s*[|>](?:[0-9][+-]?|[+-][0-9]?)?\s*$"""
-)
+
+
+# INDENTATION IS DERIVED, NEVER ASSUMED.
+#
+# YAML fixes no indentation step. `jobs:` children at three spaces and job bodies at
+# six are both valid Actions syntax, and the hard-coded four-space job body these
+# expressions used to carry was a fail-OPEN defect: a job whose `if:` sat at six
+# spaces was not seen, so the job read as UNCONDITIONAL -- and because the gate counts
+# `skipped` as a pass, a conditional quality job that skipped was accepted as a check
+# that ran. Every pattern below therefore takes the indentation it must match, which
+# mapping_indent() reads off the document.
+def job_key_pattern(indent):
+    """A job key at exactly `indent`, quoted or bare, capturing the job id.
+
+    A job key may be quoted -- `"security-scan":` is valid Actions syntax. The previous
+    unquoted-only pattern silently dropped such a job from the `jobs` dict, so it could
+    never appear in `set(jobs) - set(needs)` and the gate reported full coverage over a
+    quality job it was not gating. That is a fail-OPEN result, the one outcome this
+    script exists to prevent, so anything unclassifiable at job indentation now exits.
+    """
+    return re.compile(rf"""^ {{{indent}}}(?:'({ID})'|"({ID})"|({ID}))\s*:\s*(?:\#.*)?$""")
+
+
+def key_pattern(indent, key):
+    """One mapping key at exactly `indent`, quoted or bare, capturing its value.
+
+    Quoting is admitted for EVERY key read through here rather than a chosen few.
+    `'needs': [build, lint]` is valid YAML that the bare-only expression read as an
+    empty dependency list, producing a false RED on a correct workflow; `'if':` is the
+    fail-OPEN direction of the identical omission, since a job whose condition is not
+    seen reads as unconditional.
+    """
+    return re.compile(rf"""^ {{{indent}}}(?:'{key}'|"{key}"|{key})\s*:\s*(.*?)\s*$""")
+
+
+def block_need_pattern(indent):
+    """A `needs:` block sequence item.
+
+    Items may sit at the key's own indentation or be indented under it, and may be
+    quoted. Both forms are valid YAML; accepting only the unquoted deeper form dropped
+    entries, which ENLARGES `missing` and reddens a valid workflow.
+    """
+    return re.compile(rf"""^\s{{{indent},}}-\s*(?:'({ID})'|"({ID})"|({ID}))\s*(?:\#.*)?$""")
+
+
+def step_key_pattern(indent, key):
+    """A STEP-level key -- deeper than the job body -- in either the plain form
+    (`        if: ...`) or as a list item's first key (`      - if: ...`).
+
+    Group 1 is everything before the key, so its length is the key's own COLUMN. A
+    block scalar's continuation must out-indent THAT, not the line: measuring the line
+    put the bar at the `- ` of a dash-form step, so the sibling `run:` and its body
+    were swallowed into the condition (see step_conditions).
+    """
+    return re.compile(
+        rf"""^(\s{{{indent},}}(?:-\s+)?)(?:'{key}'|"{key}"|{key})\s*:\s*(.*?)\s*$"""
+    )
+
+
+def other_block_key_pattern(indent):
+    """Any OTHER step-body key that opens a block scalar (`run: |`, `run: >-`, ...).
+
+    Its payload is arbitrary text -- a heredoc/echo line shaped like
+    `if: contains(...)` inside a `run:` body is not a real YAML key, but
+    step_key_pattern(indent, "if") cannot tell the difference by itself. Used to skip
+    such spans wholesale before they reach it. Group 1 is the key's own indent prefix,
+    same convention as step_key_pattern, so the span ends the same way: content must
+    out-indent it.
+
+    A QUOTED key (`'run': |`) and a TRAILING COMMENT (`run: | # build log`) are both
+    admitted, because either spelling is valid YAML that this expression previously
+    failed to recognise -- and failing to recognise the OPENER means the payload IS
+    scanned. An inert `run:` body line then supplies the `needs.*.result` condition
+    this script looks for, so the real aggregation `if:` can be deleted with the
+    checker still green. Fail-OPEN, on the one assertion that decides what can merge.
+    """
+    return re.compile(
+        rf"""^(\s{{{indent},}}(?:-\s+)?)(?:'{ID}'|"{ID}"|{ID})\s*:\s*"""
+        r"""[|>](?:[0-9][+-]?|[+-][0-9]?)?\s*(?:\#.*)?$"""
+    )
 
 
 def _first_group(match):
@@ -119,6 +174,30 @@ def parse_need_ids(value):
     return ids
 
 
+def mapping_indent(lines, start, end):
+    """The indentation of a mapping's first child, i.e. the indent all its keys share.
+
+    Read rather than assumed: see the note above job_key_pattern. Returns None when the
+    range holds nothing but comments and blanks.
+    """
+    for i in range(start, end):
+        line = lines[i].rstrip("\r\n")
+        if COMMENT_OR_BLANK.match(line):
+            continue
+        return len(line) - len(line.lstrip(" "))
+    return None
+
+
+def job_body_indent(lines, jobs, job_id, job_indent):
+    """The indentation of one job's own keys, or None when the job has no body."""
+    start = jobs[job_id]
+    end = min((i for i in sorted(jobs.values()) if i > start), default=len(lines))
+    indent = mapping_indent(lines, start + 1, end)
+    if indent is None or indent <= job_indent:
+        return None
+    return indent
+
+
 def read_gate_contract(lines, gate_job):
     try:
         # `jobs: # comment` is valid and used to fail the equality outright, returning no
@@ -129,17 +208,27 @@ def read_gate_contract(lines, gate_job):
     except StopIteration:
         return {}, [], set()
 
-    jobs = {}
+    jobs_end = len(lines)
     for i in range(jobs_start + 1, len(lines)):
         line = lines[i].rstrip("\r\n")
         if line.strip() and not line.startswith((" ", "#")):
+            jobs_end = i
             break
+
+    job_indent = mapping_indent(lines, jobs_start + 1, jobs_end)
+    if job_indent is None or job_indent == 0:
+        return {}, [], set()
+    job_key = job_key_pattern(job_indent)
+
+    jobs = {}
+    for i in range(jobs_start + 1, jobs_end):
+        line = lines[i].rstrip("\r\n")
         if COMMENT_OR_BLANK.match(line):
             continue
         indent = len(line) - len(line.lstrip(" "))
-        if indent != 2:
+        if indent != job_indent:
             continue
-        match = JOB.match(line)
+        match = job_key.match(line)
         if not match:
             # Fail closed. An unrecognised construct at job indentation (an anchor, a
             # merge key, a multi-line key) means this parser does not understand the
@@ -155,19 +244,29 @@ def read_gate_contract(lines, gate_job):
     if gate_job not in jobs:
         return jobs, [], set()
 
+    body_indent = job_body_indent(lines, jobs, gate_job, job_indent)
+    if body_indent is None:
+        return jobs, [], conditional_jobs(lines, jobs, job_indent)
+    needs_key = key_pattern(body_indent, "needs")
+    block_need = block_need_pattern(body_indent)
+
     gate_start = jobs[gate_job] + 1
     gate_end = min((i for i in jobs.values() if i >= gate_start), default=len(lines))
     for i in range(gate_start, gate_end):
-        match = NEEDS.match(lines[i].rstrip("\r\n"))
+        match = needs_key.match(lines[i].rstrip("\r\n"))
         if not match:
             continue
         if strip_comment(match.group(1)).strip():
-            return jobs, parse_need_ids(match.group(1)), conditional_jobs(lines, jobs)
+            return (
+                jobs,
+                parse_need_ids(match.group(1)),
+                conditional_jobs(lines, jobs, job_indent),
+            )
 
         needs = []
         for line in lines[i + 1 : gate_end]:
             line = line.rstrip("\r\n")
-            item = BLOCK_NEED.match(line)
+            item = block_need.match(line)
             if item:
                 needs.append(_first_group(item))
                 continue
@@ -176,20 +275,30 @@ def read_gate_contract(lines, gate_job):
             # truncate `needs`.
             if COMMENT_OR_BLANK.match(line):
                 continue
-            if len(line) - len(line.lstrip(" ")) <= 4:
+            if len(line) - len(line.lstrip(" ")) <= body_indent:
                 break
-        return jobs, needs, conditional_jobs(lines, jobs)
+        return jobs, needs, conditional_jobs(lines, jobs, job_indent)
 
-    return jobs, [], set()
+    return jobs, [], conditional_jobs(lines, jobs, job_indent)
 
 
-def conditional_jobs(lines, jobs):
-    """The ids of jobs carrying a job-level `if:` condition."""
+def conditional_jobs(lines, jobs, job_indent):
+    """The ids of jobs carrying a job-level `if:` condition.
+
+    Job-level only. A step-level `if:` sits deeper and is out of scope -- a skipped
+    step fails its job's own assertions, it does not make the gate report green over a
+    missing check. Each job's own body indentation is read rather than assumed, so a
+    valid deeper `if:` cannot disappear and leave the job looking unconditional.
+    """
     starts = sorted(jobs.values())
     conditional = set()
     for job_id, start in jobs.items():
         end = min((i for i in starts if i > start), default=len(lines))
-        if any(JOB_IF.match(lines[i].rstrip("\r\n")) for i in range(start + 1, end)):
+        indent = job_body_indent(lines, jobs, job_id, job_indent)
+        if indent is None:
+            continue
+        job_if = key_pattern(indent, "if")
+        if any(job_if.match(lines[i].rstrip("\r\n")) for i in range(start + 1, end)):
             conditional.add(job_id)
     return conditional
 
@@ -216,11 +325,179 @@ def normalise_condition(value):
     return value.replace(" ", "")
 
 
-def step_conditions(block):
+def continuation_lines(block, index, indent):
+    """The block-scalar body opened on `block[index]`, plus the index after it.
+
+    Continuation belongs to the KEY's column, not the line's: a `- if: >` step opens at
+    the key while the line starts at the dash two columns to its left. Lines are
+    returned stripped but with comments intact, because a `run:` body's `#` is shell,
+    not YAML; callers that read YAML values strip comments themselves.
+    """
+    body = []
+    following_index = index + 1
+    while following_index < len(block):
+        following = block[following_index]
+        if COMMENT_OR_BLANK.match(following):
+            following_index += 1
+            continue
+        if len(following) - len(following.lstrip()) <= indent:
+            break
+        body.append(following.strip())
+        following_index += 1
+    return body, following_index
+
+
+def step_span(block, index, key_indent):
+    """The (start, end) line range of the step containing the key at `index`.
+
+    Steps are a YAML sequence, so the step begins at the nearest `- ` at or above the
+    key whose dash sits left of it, and ends before the next line at or left of that
+    dash. Returns None when the key is not inside a sequence item at all.
+    """
+    start = None
+    for i in range(index, -1, -1):
+        line = block[i]
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if stripped.startswith("- ") and indent < key_indent:
+            start = i
+            break
+        if i != index and not COMMENT_OR_BLANK.match(line) and indent < key_indent:
+            # A shallower key that is not a sequence item: this is not a step list.
+            return None
+    if start is None:
+        return None
+
+    dash_indent = len(block[start]) - len(block[start].lstrip())
+    end = len(block)
+    for i in range(start + 1, len(block)):
+        line = block[i]
+        if COMMENT_OR_BLANK.match(line):
+            continue
+        if len(line) - len(line.lstrip()) <= dash_indent:
+            end = i
+            break
+    return start, end
+
+
+def mask_quoted(line):
+    """`line` with the contents of every quoted span blanked out.
+
+    A SCANNER, not a regex. A `"[^"]*"` alternation ends a double-quoted span at the
+    first quote it meets, and an ESCAPED quote is not the end of one:
+    `echo "then \\" ; exit 1"` is a single inert string, but blanking only as far as
+    the escaped quote left `; exit 1"` looking like a real command, which
+    ends_non_zero would then have accepted. That is the fail-OPEN direction, so it is
+    worth the extra ten lines. POSIX single quotes have no escapes at all, so only the
+    double-quoted arm consumes a backslash.
+
+    An unterminated quote blanks the rest of the line. That is broken shell either
+    way, and refusing to find an exit there errs toward rejecting the step rather than
+    passing it.
+    """
+    out = []
+    quote = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote == '"' and char == BACKSLASH and index + 1 < len(line):
+            out.append("  ")
+            index += 2
+            continue
+        if quote is None and char in "'\"":
+            quote = char
+            out.append(" ")
+        elif quote == char:
+            quote = None
+            out.append(" ")
+        elif quote is not None:
+            out.append(" ")
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def ends_non_zero(line):
+    """True when `line` runs `exit <non-zero>` or `false` AS A COMMAND.
+
+    Quoted spans are blanked (see mask_quoted, escaped quotes included) and an
+    unquoted `#` comment dropped BEFORE the boundary split, and that ordering is the
+    whole point. Searching the raw line would accept inert text -- `echo 'then exit
+    1'`, or a commented-out `# exit 1` -- which is the fail-OPEN direction this
+    assertion exists to close. Anchoring only at the start of a line is the opposite
+    error: it rejects `if [ -n "$x" ]; then exit 1; fi`, a false RED on a correct
+    gate.
+
+    Splitting a de-quoted, de-commented line on command separators is the narrow
+    middle, and it is deliberately NOT shell parsing -- see the ceiling stated in
+    step_can_fail.
+    """
+    blanked = mask_quoted(line)
+    comment = blanked.find("#")
+    if comment != -1:
+        blanked = blanked[:comment]
+    return any(
+        NONZERO_EXIT.match(segment.strip())
+        for segment in COMMAND_BOUNDARY.split(blanked)
+    )
+
+
+def step_can_fail(block, span, key_indent):
+    """(ok, reason) for the step spanning `span`: can it actually fail its job?
+
+    A condition proves only that the aggregation step is REACHED. `continue-on-error:
+    true`, or a body whose `exit 1` has been replaced by `true`, leaves the condition
+    untouched while the required context stays green -- the same fail-OPEN outcome the
+    condition check exists to prevent, and equally invisible in a diff that keeps the
+    job, its name and its needs: list intact.
+
+    CEILING, stated rather than implied: the `run:` body is read as COMMANDS, not
+    executed, so an `exit 1` that is never reached at run time -- inside
+    `if false; then exit 1; fi`, or after an early `exit 0` -- still counts. Closing
+    that would mean evaluating arbitrary shell, which is unbounded; it is the same
+    reasoning assert_workflow_hygiene's checkout scan states for its own shell gap.
+    What is refused here is the shapes a neutering diff actually takes: delete the
+    exit, swap in `true`, or add continue-on-error. Inert TEXT is not accepted --
+    see ends_non_zero.
+    """
+    start, end = span
+    # Keys are matched at the step's OWN column, so a `continue-on-error: true` line
+    # sitting inside the `run:` payload -- shell text, not a YAML key -- is not read as
+    # one. Same distinction other_block_key_pattern draws, for the same reason.
+    tolerant_key = step_key_pattern(key_indent, "continue-on-error")
+    for i in range(start, end):
+        match = tolerant_key.match(block[i])
+        if not match or len(match.group(1)) != key_indent:
+            continue
+        if normalise_condition(match.group(2)) not in ("false", ""):
+            return False, "carries `continue-on-error`, so it cannot fail the job"
+
+    run_key = step_key_pattern(key_indent, "run")
+    for i in range(start, end):
+        match = run_key.match(block[i])
+        if not match or len(match.group(1)) != key_indent:
+            continue
+        value = strip_comment(match.group(2)).strip()
+        if value and not BLOCK_SCALAR.match(value):
+            body = [value]
+        else:
+            body, _ = continuation_lines(block, i, key_indent)
+        if any(ends_non_zero(line) for line in body):
+            return True, ""
+        return False, "its `run:` body has no non-zero exit, so it cannot fail the job"
+    return False, "has no `run:` body, so it cannot fail the job"
+
+
+def step_conditions(block, indent):
     """Every step-level `if:` condition in a job body, block scalars included.
 
+    Yields (condition, line index). The index is the caller's handle on the step the
+    condition belongs to, which is what step_span/step_can_fail need to answer the
+    separate question of whether that step can fail.
+
     A preceding step's own block scalar (`run: |`, `run: >-`, ...) is skipped
-    wholesale before its lines ever reach STEP_IF_VALUE: its payload is arbitrary
+    wholesale before its lines ever reach the `if:` pattern: its payload is arbitrary
     text, and a heredoc/echo line shaped like `if: contains(needs.*.result, ...)`
     is not a real YAML key. Without this, deleting the actual step-level `if:`
     while a diagnostic `run:` body still echoed a `needs.*.result`-shaped string
@@ -228,6 +505,8 @@ def step_conditions(block):
     fail-OPEN shape assert_gate_semantics's own docstring already documents for a
     different line. Found by CodeRabbit on fixportal-quickfixn#68.
     """
+    step_if_value = step_key_pattern(indent, "if")
+    other_block_key = other_block_key_pattern(indent)
     index = 0
     skip_until_indent = None
     while index < len(block):
@@ -242,11 +521,11 @@ def step_conditions(block):
             # may itself be a real `if:` (or another block-scalar opener) and must be
             # examined normally rather than skipped.
 
-        match = STEP_IF_VALUE.match(line)
+        match = step_if_value.match(line)
         if match:
             value = strip_comment(match.group(2)).strip()
             if value and not BLOCK_SCALAR.match(value):
-                yield value
+                yield value, index
                 index += 1
                 continue
             # An empty value or a block-scalar indicator: the condition is on the
@@ -254,35 +533,44 @@ def step_conditions(block):
             # line's. Measuring the line put the bar at the dash of a `- if: >-` step,
             # so the sibling `run:` at the key's column and its whole body were
             # absorbed into the condition.
-            indent = len(match.group(1))
-            continuation = []
-            following_index = index + 1
-            while following_index < len(block):
-                following = block[following_index]
-                if COMMENT_OR_BLANK.match(following):
-                    following_index += 1
-                    continue
-                if len(following) - len(following.lstrip()) <= indent:
-                    break
-                continuation.append(strip_comment(following).strip())
-                following_index += 1
-            yield " ".join(continuation)
+            body, following_index = continuation_lines(block, index, len(match.group(1)))
+            yield " ".join(strip_comment(entry).strip() for entry in body), index
             index = following_index
             continue
 
-        other_block = OTHER_BLOCK_KEY.match(line)
+        other_block = other_block_key.match(line)
         if other_block:
             skip_until_indent = len(other_block.group(1))
         index += 1
 
 
-def assert_gate_semantics(workflow_path, lines, jobs, gate_job):
+def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
     block = job_block(lines, jobs, gate_job)
+    gate_line = lines[jobs[gate_job]]
+    job_indent = len(gate_line) - len(gate_line.lstrip(" "))
+    body_indent = job_body_indent(lines, jobs, gate_job, job_indent)
+    if body_indent is None:
+        sys.exit(f"{workflow_path}: '{gate_job}' has an empty body -- it asserts nothing.")
+    job_if_value = key_pattern(body_indent, "if")
 
-    condition = next(
-        (JOB_IF_VALUE.match(line).group(1) for line in block if JOB_IF_VALUE.match(line)),
-        None,
-    )
+    condition = None
+    for i, line in enumerate(block):
+        match = job_if_value.match(line)
+        if not match:
+            continue
+        value = strip_comment(match.group(1)).strip()
+        if value and not BLOCK_SCALAR.match(value):
+            condition = value
+        else:
+            # `if: >` carrying `always()` on the following more-indented lines is the
+            # same condition as the inline spelling, and valid YAML. Reading only the
+            # header captured `>`, which normalises to itself and never equals
+            # `always()` -- a false RED on a correct gate. The step-level scan has read
+            # continuations all along; this is the job level catching up.
+            body, _ = continuation_lines(block, i, body_indent)
+            condition = " ".join(strip_comment(entry).strip() for entry in body)
+        break
+
     if condition is None or normalise_condition(condition) != "always()":
         found = "no job-level 'if:'" if condition is None else f"'if: {condition}'"
         sys.exit(
@@ -306,13 +594,62 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job):
     # neuter the function exists to catch, so the check was blind to its own subject.
     # Demonstrated 2026-09-02 on a fixture with the condition removed: exit 0, reported
     # as "aggregates its needs". Found by Gitar on fixportal-initiator#225.
-    if not any(NEEDS_RESULT.search(condition) for condition in step_conditions(block)):
+    referenced = set()
+    failing = []
+    for condition, index in step_conditions(block, body_indent + 1):
+        ids = NEEDS_RESULT.findall(condition)
+        if not ids:
+            continue
+        referenced.update(ids)
+        failing.append((condition, index))
+
+    if not referenced:
         sys.exit(
             f"{workflow_path}: '{gate_job}' has no step whose `if:` references a "
             "`needs.<job>.result`.\n"
             "The gate aggregates nothing and reports success unconditionally. A "
             "`needs.*.result` appearing only in a `run:` body -- an echo of the upstream "
             "results, say -- gates nothing."
+        )
+
+    # EVERY declared dependency, not merely one of them. Accepting the first
+    # `needs.<job>.result` it saw meant a gate declaring `needs: [build, lint]` whose
+    # condition named only `build` passed this assertion while a lone `lint` failure
+    # left the required context green -- the exact fail-OPEN shape the assertion
+    # exists to refuse, reached by deleting half a condition rather than all of it.
+    # The parser already had the full needs: set and simply was not consulting it.
+    if "*" not in referenced:
+        uncovered = sorted(set(needs) - referenced)
+        if uncovered:
+            sys.exit(
+                f"{workflow_path}: '{gate_job}' step conditions reference "
+                f"{', '.join(sorted(referenced))} but not {', '.join(uncovered)}.\n"
+                "A dependency whose result is never referenced can fail while the gate "
+                "still reports success. Use `needs.*.result`, or reference every job in "
+                f"the '{gate_job}' needs: list."
+            )
+
+    # A condition proves the step is REACHED, not that reaching it costs anything. See
+    # step_can_fail: continue-on-error, or a body with no non-zero exit, keeps the
+    # condition intact and the required context green.
+    reason = "could not be located as a step in the job body"
+    step_if_value = step_key_pattern(body_indent + 1, "if")
+    for condition, index in failing:
+        match = step_if_value.match(block[index])
+        span = step_span(block, index, len(match.group(1)))
+        if span is None:
+            continue
+        ok, reason = step_can_fail(block, span, len(match.group(1)))
+        if ok:
+            break
+    else:
+        sys.exit(
+            f"{workflow_path}: '{gate_job}' aggregates on `if: {failing[0][0]}` but that "
+            f"step {reason}.\n"
+            "A condition that is reached and then does nothing leaves the required "
+            "context green over a failed dependency, exactly as a missing condition "
+            "does. Give the step a `run:` body that exits non-zero, and do not mark it "
+            "continue-on-error."
         )
 
 
@@ -367,7 +704,7 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             "GATE_CONDITIONAL_EXEMPT with a written rationale in the workflow."
         )
 
-    assert_gate_semantics(workflow_path, lines, jobs, gate_job)
+    assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs)
 
     print(
         f"{workflow_path}: all {len(jobs)} job(s) accounted for by '{gate_job}', "
