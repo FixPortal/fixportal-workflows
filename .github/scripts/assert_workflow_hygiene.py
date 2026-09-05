@@ -491,6 +491,13 @@ def check_local_action(job, ref, origin, unpinned, visited):
     referenced by two workflows be scanned twice: every pin error inside it was
     printed twice and the first-party conformance total in the summary counted it
     twice. The pass/fail verdict was unaffected; the report was not.
+
+    THE FLIP SIDE, worth knowing when reading the output: only the FIRST workflow to
+    reach a given composite prints diagnostics for it. A later workflow that also uses
+    it emits nothing, and that silence means "already scanned", not "not scanned". The
+    exit code is unaffected either way, because a failure found on the first visit has
+    already set the caller's `failed` flag. Raised by Gitar on
+    fixportal-agents-skills#131.
     """
     key = local_key(ref)
     if key in visited:
@@ -511,7 +518,17 @@ def check_local_action(job, ref, origin, unpinned, visited):
         print(f"::error file={manifest}::Not parseable as YAML: {error}")
         return True, unpinned
     if not isinstance(inner, dict):
-        return False, unpinned
+        # Reported, not skipped. Returning clean here made a manifest that parses to a
+        # string, a list or nothing pass the gate in silence, while the workflow-side
+        # loop calls the identical shape an error -- so the two paths disagreed and a
+        # malformed action.yml failed at RUN time instead of at review time. Found by
+        # CodeRabbit on fixportal-agents-skills#131.
+        print(
+            f"::error file={manifest}::Local action '{ref}' ({job}) has a manifest whose "
+            "top level is not a mapping, so it declares no runs: and cannot resolve at "
+            "run time."
+        )
+        return True, unpinned
 
     for inner_ref in composite_step_refs(inner):
         bad, unpinned = check_ref(f"{job} -> {ref}", inner_ref, manifest, unpinned)

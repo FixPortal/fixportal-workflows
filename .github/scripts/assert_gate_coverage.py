@@ -594,9 +594,17 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
     # neuter the function exists to catch, so the check was blind to its own subject.
     # Demonstrated 2026-09-02 on a fixture with the condition removed: exit 0, reported
     # as "aggregates its needs". Found by Gitar on fixportal-initiator#225.
+    # ONE binding, used by both the scan below and the failure-capability check further
+    # down. They were computed independently as `body_indent + 1` in two places, and they
+    # must be equal: the second re-matches a line the first already matched, so a future
+    # edit to one alone would make that re-match return None and raise AttributeError
+    # instead of printing this script's own diagnostic. A crash is a worse signal than a
+    # clean fail-closed exit. Found by CodeRabbit on fixportal-agents-skills#131.
+    step_indent = body_indent + 1
+
     referenced = set()
     failing = []
-    for condition, index in step_conditions(block, body_indent + 1):
+    for condition, index in step_conditions(block, step_indent):
         ids = NEEDS_RESULT.findall(condition)
         if not ids:
             continue
@@ -633,9 +641,15 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
     # step_can_fail: continue-on-error, or a body with no non-zero exit, keeps the
     # condition intact and the required context green.
     reason = "could not be located as a step in the job body"
-    step_if_value = step_key_pattern(body_indent + 1, "if")
+    step_if_value = step_key_pattern(step_indent, "if")
     for condition, index in failing:
         match = step_if_value.match(block[index])
+        # Guarded rather than assumed. `index` came from a line this very pattern
+        # matched, so None is unreachable while the two uses share step_indent above --
+        # which is exactly the invariant a future edit could break, and the failure would
+        # be an AttributeError rather than this script's own message.
+        if match is None:
+            continue
         span = step_span(block, index, len(match.group(1)))
         if span is None:
             continue
