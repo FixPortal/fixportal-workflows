@@ -122,9 +122,38 @@ def step_key_pattern(indent, key):
     block scalar's continuation must out-indent THAT, not the line: measuring the line
     put the bar at the `- ` of a dash-form step, so the sibling `run:` and its body
     were swallowed into the condition (see step_conditions).
+
+    THE FLUSH SEQUENCE FORM IS THE REASON FOR THE FIRST ALTERNATIVE. YAML lets a
+    sequence sit at its key's own column:
+
+        steps:
+        - if: ${{ needs.build.result != 'success' }}
+          run: |
+            exit 1
+
+    Here the dash is at the JOB BODY column, one less than `indent`, so
+    `\\s{indent,}` never reaches it and the first key after the dash is invisible.
+    Only the first key is affected -- later keys are indented past it -- which is
+    what makes this easy to test wrongly: a fixture whose step opens `- name:` and
+    carries `if:` on a later line passes either way. Measured 2026-09-05 on two
+    files differing only in that indentation: flush exited 1 with "has no step whose
+    `if:` references a needs.<job>.result", indented exited 0. Both directions are
+    false REDs rather than fail-open -- the sibling shape (`- run: |` first, `if:`
+    second) reports "that step has no `run:` body" -- but a repository writing its
+    gate in this perfectly ordinary form gets a permanently red required check.
+    Found by CodeRabbit on fixportal-claude-skills#102, after an earlier pass on
+    fixportal-agents-skills#131 had wrongly refuted the same claim against a fixture
+    that did not carry the key in the affected position.
     """
+    # indent - 2, not indent - 1: `-\s+` contributes at least two characters, so this
+    # bound is exactly the one that still guarantees the KEY lands at column >= indent,
+    # which is the property every caller relies on. One column tighter and the form
+    # this alternative exists to admit is rejected whenever the caller passes the key's
+    # own column rather than the step column.
+    dash = max(indent - 2, 0)
     return re.compile(
-        rf"""^(\s{{{indent},}}(?:-\s+)?)(?:'{key}'|"{key}"|{key})\s*:\s*(.*?)\s*$"""
+        rf"""^(\s{{{dash},}}-\s+|\s{{{indent},}}(?:-\s+)?)"""
+        rf"""(?:'{key}'|"{key}"|{key})\s*:\s*(.*?)\s*$"""
     )
 
 
@@ -144,9 +173,20 @@ def other_block_key_pattern(indent):
     scanned. An inert `run:` body line then supplies the `needs.*.result` condition
     this script looks for, so the real aggregation `if:` can be deleted with the
     checker still green. Fail-OPEN, on the one assertion that decides what can merge.
+
+    The flush sequence form takes the same first alternative as step_key_pattern, and
+    for a sharper reason: failing to recognise a block-scalar OPENER means its payload
+    IS scanned, so a `- run: |` written flush left its body open to supplying the
+    `needs.*.result` this script looks for.
     """
+    # indent - 2, not indent - 1: `-\s+` contributes at least two characters, so this
+    # bound is exactly the one that still guarantees the KEY lands at column >= indent,
+    # which is the property every caller relies on. One column tighter and the form
+    # this alternative exists to admit is rejected whenever the caller passes the key's
+    # own column rather than the step column.
+    dash = max(indent - 2, 0)
     return re.compile(
-        rf"""^(\s{{{indent},}}(?:-\s+)?)(?:'{ID}'|"{ID}"|{ID})\s*:\s*"""
+        rf"""^(\s{{{dash},}}-\s+|\s{{{indent},}}(?:-\s+)?)(?:'{ID}'|"{ID}"|{ID})\s*:\s*"""
         r"""[|>](?:[0-9][+-]?|[+-][0-9]?)?\s*(?:\#.*)?$"""
     )
 
@@ -641,8 +681,15 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
     # step_can_fail: continue-on-error, or a body with no non-zero exit, keeps the
     # condition intact and the required context green.
     reason = "could not be located as a step in the job body"
+    # `reason` describes the LAST candidate examined, so the message has to name that
+    # same candidate. It used to print failing[0][0] unconditionally: with two or more
+    # step conditions referencing needs.<job>.result, the two halves of the diagnostic
+    # pointed at different steps and sent the reader to the wrong one. Found by
+    # CodeRabbit on fixportal-claude-skills#102.
+    reported = failing[0][0]
     step_if_value = step_key_pattern(step_indent, "if")
     for condition, index in failing:
+        reported = condition
         match = step_if_value.match(block[index])
         # Guarded rather than assumed. `index` came from a line this very pattern
         # matched, so None is unreachable while the two uses share step_indent above --
@@ -658,7 +705,7 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
             break
     else:
         sys.exit(
-            f"{workflow_path}: '{gate_job}' aggregates on `if: {failing[0][0]}` but that "
+            f"{workflow_path}: '{gate_job}' aggregates on `if: {reported}` but that "
             f"step {reason}.\n"
             "A condition that is reached and then does nothing leaves the required "
             "context green over a failed dependency, exactly as a missing condition "
@@ -747,7 +794,21 @@ def main(argv):
                 f"{target}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT name jobs that do not "
                 f"exist: {', '.join(unknown)}"
             )
-        check_file(target, gate_job, exempt, conditional_exempt)
+        # The return value is the WHOLE assertion when the gate job is absent:
+        # check_file reports every other breach by exiting, but answers "no gate job
+        # here" with False and leaves the decision to its caller. Directory mode acts
+        # on that (GATE_FILE_EXEMPT, or exit). File mode used to discard it and return,
+        # so a workflow with jobs and NO gate job exited 0 in silence -- rename or
+        # delete the gate job and the check that exists to notice said nothing.
+        # Fail-OPEN, on the assertion that decides what can merge. Found by CodeRabbit
+        # on fixportal-claude-skills#102.
+        if check_file(target, gate_job, exempt, conditional_exempt) is False:
+            sys.exit(
+                f"{target}: no '{gate_job}' job, so none of its jobs are merge-blocking. "
+                f"Give the file a '{gate_job}' job wired to aggregate its needs, or point "
+                "this check at the workflow directory and name the file in GATE_FILE_EXEMPT "
+                "if it is deliberately not gated."
+            )
         return
 
     files = sorted(
