@@ -249,12 +249,20 @@ def is_pinned(ref):
     surrounding quotes in the extracted value, so a correctly pinned
     `uses: "actions/checkout@<40-hex>"` failed the hex test and was reported unpinned;
     parsed values carry no quotes.
+
+    THE REVISION IS LOWERCASED BEFORE THE HEX TESTS. Git object names and OCI digests
+    are hex, and hex is case-insensitive: `@ABC...` and `@abc...` name the same commit.
+    The scheme was already matched case-insensitively while the digest and SHA tests
+    below accepted only lowercase, so an uppercase or mixed-case pin -- as immutable as
+    any other -- was reported unpinned. A false failure on a required gate, and the
+    kind that looks like a real finding. Found by CodeRabbit on
+    fixportal-claude-skills#102.
     """
     if ref.startswith("./"):
         return True  # Local: its manifest's own refs are validated separately.
     if "@" not in ref:
         return False
-    revision = ref.rsplit("@", 1)[1]
+    revision = ref.rsplit("@", 1)[1].lower()
     if ref.lower().startswith("docker://"):
         algorithm, _, digest = revision.partition(":")
         return algorithm == "sha256" and len(digest) == DIGEST_LEN and all(
