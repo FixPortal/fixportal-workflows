@@ -58,6 +58,66 @@ NONZERO_EXIT = re.compile(r"^(?:exit\s+0*[1-9][0-9]*|false)\b")
 # which is a false RED on a correct gate.
 COMMAND_BOUNDARY = re.compile(r"(?:;|&&|\|\||\bthen\b|\belse\b|\bdo\b|\{)")
 BACKSLASH = "\\"
+
+# The gate step's failing command, in the forms this checker will vouch for. Anything
+# else is REJECTED with a message naming these -- see ends_non_zero for why recognising
+# a small set beats parsing arbitrary shell here.
+#
+# `$` is admitted inside the echo/message arms only, so `echo "::error::$msg"` works;
+# the failing command itself takes no substitution, because a substituted exit code is
+# exactly the shape whose value cannot be read from the file.
+# A trailing redirection does not change whether the command fails. `exit 1 >&2` and
+# `false 2>/dev/null` were rejected outright, and the failure direction of a rejection
+# here is a PERMANENTLY RED required check on a correct gate, in every repo this asset is
+# installed into. (CodeRabbit, PR #135.)
+#
+# THE REDIRECT TARGET CANNOT CONTAIN A SEPARATOR. `\S+` swallowed one, so
+# `false >/tmp/gate;true` fullmatched and was accepted - and it exits ZERO. A gate body
+# that can succeed is the one thing this function must never vouch for.
+_REDIR = r"(?:\s*[12]?>>?\s*(?:&[12]|[^\s;|&]+))*"
+# The message arm carries its own redirection for the same reason: the house one-liner is
+# `echo "::error::..." >&2 && exit 1`, and an echo body that could swallow `>` or `&`
+# would either miss the separator that follows or run past it.
+_ECHO = rf"(?:echo|printf)\s+[^\n|&;<>]*{_REDIR}"
+_FAIL = rf"(?:exit\s+0*[1-9][0-9]*|false){_REDIR}"
+ACCEPTED_FAILING_FORMS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        # exit 1   (with any trailing redirection)
+        _FAIL,
+        # NO `||` / `&&` GUARD FORMS. An earlier round of this review asked for them as
+        # "ordinary spellings of the house one-liner" and I added them; the next round
+        # showed the widening was fail-OPEN, and it is right. `[ -z "$x" ] || exit 1`
+        # exits ZERO whenever its test passes, and the gate step's own `if:` has ALREADY
+        # established that an upstream job failed - so a second condition inside the body
+        # can only re-decide that, in the direction of letting a failed lane report green.
+        # A false RED here is an argument someone has to win; a false GREEN is a merge
+        # nobody notices.
+        #
+        # RESIDUAL, stated rather than quietly carried: the two `if <test>; then exit 1;
+        # fi` forms below have the same property - they exit 0 when their test fails. They
+        # predate this change, are the shipped house shape, and removing them would red
+        # every repo running it, so they stay. Narrowing them is a separate, estate-wide
+        # change with its own rollout. (CodeRabbit, PR #135.)
+        #
+        # echo "..." ; exit 1     (message then failure, either separator style)
+        rf"{_ECHO}\s*(?:;|&&)\s*exit\s+0*[1-9][0-9]*",
+        # if <test>; then <echo>; exit 1; fi   -- the house one-liner
+        rf"if\s+.+?;\s*then\s+(?:{_ECHO};\s*)?exit\s+0*[1-9][0-9]*;\s*fi",
+        # if <test>; then exit 1; fi   with the echo inside on its own already covered
+        r"if\s+.+?;\s*then\s+exit\s+0*[1-9][0-9]*;\s*fi",
+        # PowerShell. `shell: pwsh` gate steps are house style in the .NET repos and
+        # `throw 'upstream failed'` is how one fails, so rejecting it was a false RED
+        # on a correct gate - the direction that gets a working control deleted to make
+        # CI green. The trailing message is optional because mask_quoted has already
+        # blanked the string by the time these patterns run. Admitting `throw` costs
+        # nothing under bash either: it is not a builtin there, so the step still exits
+        # non-zero (127), which is exactly what this function is asserting.
+        # UNCONDITIONAL only. `if ($false) { throw "failed" }` was accepted and does not
+        # throw, so the step exits 0 - the same fail-open as the `||` forms above.
+        r"throw(?:\s+.*)?",
+    )
+)
 # An `if:` may open a YAML block scalar and carry its condition on the following,
 # more-indented lines. Those lines are part of the condition and must be searched too, or
 # a perfectly good gate written as `if: >` reads as having no condition at all.
@@ -80,6 +140,15 @@ BLOCK_SCALAR = re.compile(r"^[|>](?:[0-9][+-]?|[+-][0-9]?)?$")
 # `skipped` as a pass, a conditional quality job that skipped was accepted as a check
 # that ran. Every pattern below therefore takes the indentation it must match, which
 # mapping_indent() reads off the document.
+# The top-level `jobs:` key, in every form YAML allows for it: quoted either way, and
+# with whitespace before the colon. Exact string equality against "jobs:" rejected all
+# of those, and a file that parses as having no jobs is printed by directory mode as
+# "not a workflow, skipped" and counted GREEN -- so a whole workflow's jobs escaped
+# gate coverage on how its key was punctuated. Same fail-OPEN class as the quoted job
+# key below, one level up.
+JOBS_KEY = re.compile(r"""^(?:'jobs'|"jobs"|jobs)\s*:\s*$""")
+
+
 def job_key_pattern(indent):
     """A job key at exactly `indent`, quoted or bare, capturing the job id.
 
@@ -241,9 +310,10 @@ def job_body_indent(lines, jobs, job_id, job_indent):
 def read_gate_contract(lines, gate_job):
     try:
         # `jobs: # comment` is valid and used to fail the equality outright, returning no
-        # jobs at all.
+        # jobs at all. JOBS_KEY also admits the quoted forms and a space before the
+        # colon -- see its definition for why matching only "jobs:" was fail-open.
         jobs_start = next(
-            i for i, line in enumerate(lines) if strip_comment(line).rstrip() == "jobs:"
+            i for i, line in enumerate(lines) if JOBS_KEY.match(strip_comment(line).rstrip())
         )
     except StopIteration:
         return {}, [], set()
@@ -458,29 +528,40 @@ def mask_quoted(line):
     return "".join(out)
 
 
-def ends_non_zero(line):
-    """True when `line` runs `exit <non-zero>` or `false` AS A COMMAND.
+def ends_non_zero(body):
+    """True when the gate body is a RECOGNISED failing form.
 
-    Quoted spans are blanked (see mask_quoted, escaped quotes included) and an
-    unquoted `#` comment dropped BEFORE the boundary split, and that ordering is the
-    whole point. Searching the raw line would accept inert text -- `echo 'then exit
-    1'`, or a commented-out `# exit 1` -- which is the fail-OPEN direction this
-    assertion exists to close. Anchoring only at the start of a line is the opposite
-    error: it rejects `if [ -n "$x" ]; then exit 1; fi`, a false RED on a correct
-    gate.
+    This used to split a de-quoted, de-commented line on command separators and accept
+    any segment starting `exit <n>` or `false`. Four independent escapes were found in
+    that one heuristic, each producing a step that exits 0 while reading as failable:
 
-    Splitting a de-quoted, de-commented line on command separators is the narrow
-    middle, and it is deliberately NOT shell parsing -- see the ceiling stated in
-    step_can_fail.
+      * `echo "\\n exit 1 \\n"` and a backslash-continued `echo \\ / exit 1` -- quote
+        state was per physical line, so inert string content read as a command;
+      * `echo then exit 1` -- `then` is a COMMAND_BOUNDARY, so the argument split the
+        line and `exit 1` became a segment of its own;
+      * `exit 1 | true` -- no single `|` in the boundary alternation, and the pattern
+        matched on a prefix;
+      * `false || true` -- same shape, opposite operator.
+
+    Four escapes is a fact about the approach, not about the patches. So the checker no
+    longer parses arbitrary shell: it recognises a small set of verified forms and
+    rejects everything else with a message naming what it supports. A gate step is the
+    one place in a workflow where an exotic shell body buys nothing.
+
+    `body` is the joined run: body, with backslash continuations already folded.
     """
-    blanked = mask_quoted(line)
-    comment = blanked.find("#")
-    if comment != -1:
-        blanked = blanked[:comment]
-    return any(
-        NONZERO_EXIT.match(segment.strip())
-        for segment in COMMAND_BOUNDARY.split(blanked)
-    )
+    text = mask_quoted(body)
+    # Drop comments AFTER masking, so a `#` inside a string is not treated as one.
+    text = re.sub(r"#[^\n]*", "", text)
+    # Normalise whitespace per logical line, then test each against the accepted forms.
+    for logical in text.split("\n"):
+        segment = " ".join(logical.split())
+        if not segment:
+            continue
+        for form in ACCEPTED_FAILING_FORMS:
+            if form.fullmatch(segment):
+                return True
+    return False
 
 
 def step_can_fail(block, span, key_indent):
@@ -523,9 +604,23 @@ def step_can_fail(block, span, key_indent):
             body = [value]
         else:
             body, _ = continuation_lines(block, i, key_indent)
-        if any(ends_non_zero(line) for line in body):
+        # JOIN first, then fold backslash continuations, so quote state and continued
+        # commands are carried across line boundaries. Evaluating each physical line
+        # with its own quote state is what let `echo "\n exit 1 \n"` and a
+        # backslash-continued echo read as failable commands.
+        joined = "\n".join(body)
+        joined = re.sub(r"\\\n\s*", " ", joined)
+        if ends_non_zero(joined):
             return True, ""
-        return False, "its `run:` body has no non-zero exit, so it cannot fail the job"
+        return False, (
+            "its `run:` body is not a recognised failing form, so this checker will not "
+            "vouch for it. Use one of: `exit 1`; `false`; `echo \"...\"; exit 1`; "
+            "`if <test>; then echo \"...\"; exit 1; fi`; or, under `shell: pwsh`, an "
+            "unconditional `throw`. Each may carry a trailing redirection. A gate step "
+            "is not the place for shell this checker has to guess about, and a body "
+            "guarded by its own `||`/`&&` test is refused because it exits ZERO on the "
+            "other branch"
+        )
     return False, "has no `run:` body, so it cannot fail the job"
 
 
@@ -680,13 +775,15 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
     # A condition proves the step is REACHED, not that reaching it costs anything. See
     # step_can_fail: continue-on-error, or a body with no non-zero exit, keeps the
     # condition intact and the required context green.
+    # ACCUMULATE the dependencies covered by steps that can actually fail, rather than
+    # breaking on the first failable step. With a per-job gate -- the shape this script's
+    # own docstring blesses -- one step could be neutered while another stayed failable,
+    # and the `break` accepted the whole gate on that one survivor: the fail-open the
+    # coverage assertion above closes, reopened one assertion later.
     reason = "could not be located as a step in the job body"
-    # `reason` describes the LAST candidate examined, so the message has to name that
-    # same candidate. It used to print failing[0][0] unconditionally: with two or more
-    # step conditions referencing needs.<job>.result, the two halves of the diagnostic
-    # pointed at different steps and sent the reader to the wrong one. Found by
-    # CodeRabbit on fixportal-claude-skills#102.
     reported = failing[0][0]
+    covered = set()
+    wildcard_covered = False
     step_if_value = step_key_pattern(step_indent, "if")
     for condition, index in failing:
         reported = condition
@@ -701,9 +798,14 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
         if span is None:
             continue
         ok, reason = step_can_fail(block, span, len(match.group(1)))
-        if ok:
-            break
-    else:
+        if not ok:
+            continue
+        ids = set(NEEDS_RESULT.findall(condition))
+        if "*" in ids:
+            wildcard_covered = True
+        covered.update(ids - {"*"})
+
+    if not wildcard_covered and not covered:
         sys.exit(
             f"{workflow_path}: '{gate_job}' aggregates on `if: {reported}` but that "
             f"step {reason}.\n"
@@ -712,6 +814,18 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
             "does. Give the step a `run:` body that exits non-zero, and do not mark it "
             "continue-on-error."
         )
+
+    if not wildcard_covered:
+        unenforced = sorted(set(needs) - covered)
+        if unenforced:
+            sys.exit(
+                f"{workflow_path}: '{gate_job}' references "
+                f"{', '.join(sorted(covered))} from a step that can fail, but "
+                f"{', '.join(unenforced)} is referenced only by steps that cannot.\n"
+                "A dependency named in a condition whose step carries continue-on-error, "
+                "or whose body cannot exit non-zero, is not gated at all: it can fail "
+                "while the required context stays green."
+            )
 
 
 def parse_jobs(workflow_path):

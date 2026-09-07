@@ -334,6 +334,15 @@ def workflow_checks_out_code(document):
     A workflow relying on that path to defeat the exemption is not caught here; treat
     PRIVILEGED_TRIGGER_NO_CHECKOUT as reviewed-by-argument (the written rationale each
     exempted workflow must carry), not as a fully mechanical guarantee.
+
+    WHAT THE HUMAN REVIEW MUST COVER, because the gap is exactly here: an exempted
+    workflow combines a privileged trigger's write-scoped token with whatever code it
+    runs, so the rationale has to state that no `run:` step in it fetches head or PR
+    content by any means -- not merely that it calls no `actions/checkout`. Read every
+    `run:` body in the workflow and in every local action it delegates to, and look for
+    `git clone`/`git fetch` of a PR ref, `gh pr checkout`, and any `curl`/`wget` of a
+    tarball or archive URL. A rationale that only says "no checkout action" has not
+    discharged this.
     """
     return checks_out_code(document, set())
 
@@ -461,7 +470,17 @@ def check_ref(job, ref, origin, unpinned):
         # The sweep's reviewed SHA pin. Deliberately NOT counted as tag-conformant --
         # it is an exception, and a summary that folded it into the conformant total
         # would hide the very thing the exception exists to make explicit.
-        if Path(origin).name in SHA_PIN_EXEMPT_WORKFLOWS and is_pinned(ref):
+        # Anchored to the workflows directory, not the basename alone. `origin` is
+        # whatever file the reference was read from, and composites reached from a
+        # workflow are followed - so a composite action at any path in the repo named
+        # secret-sweep.yml inherited the reviewed exception. Nothing in the estate is
+        # shaped that way today (main() globs WORKFLOWS non-recursively), which is why
+        # this never bit; an exception that widens by filename is still the wrong shape
+        # for the one control it exists to narrow.
+        origin_path = Path(origin)
+        if (origin_path.parent == WORKFLOWS
+                and origin_path.name in SHA_PIN_EXEMPT_WORKFLOWS
+                and is_pinned(ref)):
             print(
                 f"::notice file={origin}::First-party action '{ref}' ({job}) is "
                 "SHA-pinned under the reviewed secret-sweep exception."
