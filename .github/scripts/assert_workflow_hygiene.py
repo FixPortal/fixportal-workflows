@@ -16,12 +16,10 @@ every repo it was installed into -- and they were simultaneously too loose (pros
 tripped them) and too tight (a quoted value, a list-form trigger, or a digest-pinned
 ref read as a violation, or as clean, wrongly).
 
-PyYAML is required and deliberately NOT installed at CI time: this script gates
-merges, so fetching an unpinned package from PyPI here would put an
-arbitrary-at-install-time dependency in the gating path. It ships in GitHub's ubuntu
-images. A runner without it is a runner-image problem and should be loud. Note that
-`actions/setup-python` installs a CLEAN interpreter from the tool cache which does
-NOT carry PyYAML -- do not add that step to this job.
+PyYAML must be available to the interpreter running this checker, either from the
+runner image or an explicitly pinned installation in an isolated environment.
+Do not fetch an unpinned dependency in the merge gate. `actions/setup-python`
+selects a separate interpreter; it does not inherit the runner's PyYAML.
 
 Exit codes: 0 clean, 1 a hard violation, 2 the checker could not run.
 
@@ -46,8 +44,8 @@ except ImportError:
     # check into the diff instead of the runner. main() already returns 2 for its other
     # two "could not run" conditions; this is the third.
     print(
-        "python3 cannot import yaml. Provide PyYAML in the runner image rather than "
-        "installing it at CI time -- this script gates merges.",
+        "python3 cannot import yaml. Provide PyYAML in the runner image or a pinned "
+        "isolated environment, and invoke this checker with that interpreter.",
         file=sys.stderr,
     )
     sys.exit(2)
@@ -256,7 +254,7 @@ def is_pinned(ref):
     below accepted only lowercase, so an uppercase or mixed-case pin -- as immutable as
     any other -- was reported unpinned. A false failure on a required gate, and the
     kind that looks like a real finding. Found by CodeRabbit on
-    fixportal-claude-skills#102.
+    the upstream review.
     """
     if ref.startswith("./"):
         return True  # Local: its manifest's own refs are validated separately.
@@ -283,7 +281,7 @@ def is_reusable_workflow_ref(ref):
     job-level `uses:` for pin checking, so the manifest lookup downstream has to tell
     the two apart or it demands action.yml from a reusable workflow that never has one.
     """
-    return ref.lower().endswith((".yml", ".yaml"))
+    return ref.lower().endswith((".yml", ".yaml")) and not Path(ref).is_dir()
 
 
 def local_manifest(ref):
@@ -524,7 +522,7 @@ def check_local_action(job, ref, origin, unpinned, visited):
     it emits nothing, and that silence means "already scanned", not "not scanned". The
     exit code is unaffected either way, because a failure found on the first visit has
     already set the caller's `failed` flag. Raised by Gitar on
-    fixportal-agents-skills#131.
+    the upstream review.
     """
     key = local_key(ref)
     if key in visited:
@@ -549,7 +547,7 @@ def check_local_action(job, ref, origin, unpinned, visited):
         # string, a list or nothing pass the gate in silence, while the workflow-side
         # loop calls the identical shape an error -- so the two paths disagreed and a
         # malformed action.yml failed at RUN time instead of at review time. Found by
-        # CodeRabbit on fixportal-agents-skills#131.
+        # CodeRabbit on the upstream review.
         print(
             f"::error file={manifest}::Local action '{ref}' ({job}) has a manifest whose "
             "top level is not a mapping, so it declares no runs: and cannot resolve at "
@@ -672,7 +670,7 @@ def main():
             # holding action.yml. Demanding a manifest from the first is a false
             # failure -- and because `Review policy intact` is a required check, it
             # makes every repo using a reusable deploy workflow unmergeable. The
-            # extension is the distinction GitHub itself draws, so it is what we test.
+            # extension alone is insufficient: an action directory may end in .yml.
             if is_reusable_workflow_ref(ref):
                 if not Path(ref).is_file():
                     print(

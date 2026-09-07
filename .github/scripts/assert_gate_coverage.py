@@ -210,8 +210,8 @@ def step_key_pattern(indent, key):
     false REDs rather than fail-open -- the sibling shape (`- run: |` first, `if:`
     second) reports "that step has no `run:` body" -- but a repository writing its
     gate in this perfectly ordinary form gets a permanently red required check.
-    Found by CodeRabbit on fixportal-claude-skills#102, after an earlier pass on
-    fixportal-agents-skills#131 had wrongly refuted the same claim against a fixture
+    Found by CodeRabbit on the upstream review, after an earlier pass on
+    the upstream review had wrongly refuted the same claim against a fixture
     that did not carry the key in the affected position.
     """
     # indent - 2, not indent - 1: `-\s+` contributes at least two characters, so this
@@ -638,7 +638,7 @@ def step_conditions(block, indent):
     while a diagnostic `run:` body still echoed a `needs.*.result`-shaped string
     let the gate keep reporting a condition that no longer existed -- the same
     fail-OPEN shape assert_gate_semantics's own docstring already documents for a
-    different line. Found by CodeRabbit on fixportal-quickfixn#68.
+    different line. Found by CodeRabbit on the upstream review.
     """
     step_if_value = step_key_pattern(indent, "if")
     other_block_key = other_block_key_pattern(indent)
@@ -728,13 +728,13 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
     # keeps this assertion green. That is precisely the "guts only the aggregation step"
     # neuter the function exists to catch, so the check was blind to its own subject.
     # Demonstrated 2026-09-02 on a fixture with the condition removed: exit 0, reported
-    # as "aggregates its needs". Found by Gitar on fixportal-initiator#225.
+    # as "aggregates its needs". Found by Gitar on the upstream review.
     # ONE binding, used by both the scan below and the failure-capability check further
     # down. They were computed independently as `body_indent + 1` in two places, and they
     # must be equal: the second re-matches a line the first already matched, so a future
     # edit to one alone would make that re-match return None and raise AttributeError
     # instead of printing this script's own diagnostic. A crash is a worse signal than a
-    # clean fail-closed exit. Found by CodeRabbit on fixportal-agents-skills#131.
+    # clean fail-closed exit. Found by CodeRabbit on the upstream review.
     step_indent = body_indent + 1
 
     referenced = set()
@@ -845,7 +845,7 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
     mode a job named in GATE_EXEMPT exists in exactly one workflow, so validating it
     against a single file's job set here reddened every OTHER workflow that also
     contains the gate job with a false "names jobs that do not exist". Found by
-    CodeRabbit on fixportal-workflows#26.
+    CodeRabbit on the upstream review.
     """
 
     with open(workflow_path, encoding="utf-8") as handle:
@@ -915,7 +915,7 @@ def main(argv):
         # so a workflow with jobs and NO gate job exited 0 in silence -- rename or
         # delete the gate job and the check that exists to notice said nothing.
         # Fail-OPEN, on the assertion that decides what can merge. Found by CodeRabbit
-        # on fixportal-claude-skills#102.
+        # on the upstream review.
         if check_file(target, gate_job, exempt, conditional_exempt) is False:
             sys.exit(
                 f"{target}: no '{gate_job}' job, so none of its jobs are merge-blocking. "
@@ -941,7 +941,7 @@ def main(argv):
     # file's jobs, not any one file -- a job named in either list exists in
     # exactly one workflow, so checking it per-file reddened every other
     # workflow that also has a gate job. Found by CodeRabbit on
-    # fixportal-workflows#26.
+    # the upstream review.
     all_jobs = set()
     for workflow_path in files:
         all_jobs |= parse_jobs(workflow_path)
