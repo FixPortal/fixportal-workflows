@@ -92,7 +92,11 @@ _REDIR = r"(?:\s*[12]?>>?\s*(?:&[12]|[^\s;|&]+))*"
 # The message arm carries its own redirection for the same reason: the house one-liner is
 # `echo "::error::..." >&2 && exit 1`, and an echo body that could swallow `>` or `&`
 # would either miss the separator that follows or run past it.
-_ECHO = rf"(?:echo|printf)\s+[^\n|&;<>]*{_REDIR}"
+# A LEADING redirection is as ordinary as a trailing one: `>&2 echo "upstream failed"` is
+# the same command as `echo "upstream failed" >&2`, and refusing the first form reddened a
+# gate whose body does fail. It cannot widen what the form VOUCHES for, because the failing
+# command itself is still required separately by _FAIL.
+_ECHO = rf"(?:{_REDIR}\s*)?(?:echo|printf)\s+[^\n|&;<>]*{_REDIR}"
 _NONZERO_STATUS = r"0*(?:[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])"
 _FAIL = rf"(?:exit\s+{_NONZERO_STATUS}|false){_REDIR}"
 ACCEPTED_FAILING_FORMS = tuple(
@@ -162,6 +166,20 @@ BLOCK_SCALAR = re.compile(r"^[|>](?:[0-9][+-]?|[+-][0-9]?)?$")
 # gate coverage on how its key was punctuated. Same fail-OPEN class as the quoted job
 # key below, one level up.
 JOBS_KEY = re.compile(r"""^(?:'jobs'|"jobs"|jobs)\s*:\s*$""")
+
+
+def is_block_scalar_header(raw):
+    """Whether a `run:` value is a BLOCK-SCALAR HEADER rather than an inline command.
+
+    Asked of the RAW value only. `BLOCK_SCALAR.match` applied to the DECODED command read
+    `run: ">&2 echo upstream failed; exit 1"` as a folded body, because decoding a quoted
+    scalar leaves a string that opens with `>`. A quoted scalar is by definition inline, so
+    it is excluded before the header test runs at all.
+    """
+    value = raw.strip()
+    if value[:1] in ("'", '"'):
+        return False
+    return bool(BLOCK_SCALAR.match(strip_inline_comment(value).strip()))
 
 
 def job_key_pattern(indent):
@@ -657,6 +675,16 @@ def static_truth(condition):
         return True
     if expression.lower() == "false":
         return False
+    # `always()` is unconditionally true in GitHub Actions, so it is a literal boolean here
+    # in every sense that matters. Leaving it UNKNOWN made failure_atoms keep it as a
+    # residual conjunct in the common `always() && contains(needs.*.result, 'failure')`,
+    # return None, and report a correct gate as referencing no `needs.<job>.result` at all
+    # -- a false RED on the shape the gate's own job-level condition uses.
+    #
+    # Only always(). success(), failure() and cancelled() depend on the run, so they stay
+    # UNKNOWN: folding those would be the fail-OPEN direction.
+    if re.fullmatch(r"always\(\s*\)", expression, re.IGNORECASE):
+        return True
     match = re.fullmatch(rf"\s*({_LITERAL})\s*(==|!=|<=|>=|<|>)\s*({_LITERAL})\s*", expression, re.IGNORECASE)
     if match:
         left = literal_value(match.group(1))
@@ -924,14 +952,23 @@ def step_can_fail(block, span, key_indent):
         value = decode_yaml_scalar(raw)
         if value == raw:
             value = decode_yaml_scalar(strip_inline_comment(raw).strip())
-        if value and not BLOCK_SCALAR.match(value):
+        # Block-scalar-ness is a property of the RAW header, never of the decoded command.
+        # Testing the decoded text read `run: ">&2 echo upstream failed; exit 1"` as a
+        # FOLDED body, because decoding leaves a string opening with `>`. That step then
+        # supplied no coverage and the gate went red over a command that does fail -- a
+        # false RED. (CodeRabbit, fixportal-claude-skills#106.)
+        if value and not is_block_scalar_header(raw):
             body = [value]
         else:
             body, _ = continuation_lines(block, i, key_indent)
         # A FOLDED body (`run: >`) joins its lines with spaces at run time, so the
         # command that actually executes is not any line in the file. Reading it
         # line-by-line would vouch for a command nobody wrote.
-        if value.startswith(">"):
+        #
+        # Read off the RAW header, not the decoded command, for the same reason as above:
+        # `run: ">&2 echo ...; exit 1"` decodes to a string opening with `>` and is not
+        # folded at all.
+        if is_block_scalar_header(raw) and raw.lstrip().startswith(">"):
             return False, "uses a folded `run:` body, whose executed command cannot be verified line-by-line"
         # JOIN first, then fold backslash continuations, so quote state and continued
         # commands are carried across line boundaries. Evaluating each physical line
