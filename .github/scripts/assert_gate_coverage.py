@@ -578,6 +578,63 @@ def strip_whitespace_outside_quotes(value):
     return "".join(out)
 
 
+# YAML's double-quoted escape table (single-character forms only -- \xNN/\uNNNN/\UNNNNNNNN
+# are handled separately below), from the spec's own list. json.loads recognises a strict
+# SUBSET of this: it accepts \n \t \r \" \/ \\ but rejects \0 \a \v \e \  \N \_ \L \P outright,
+# so a value using any of those round-tripped through decode_yaml_double_quoted's predecessor
+# came back unchanged, quotes and all. Two independent instances of that, found by CodeRabbit
+# on two different repos' upstream reviews: \  (escaped space) in a condition whose author
+# split it across a line-continuation, and \x28\x29 spelling out "()" in "always\x28\x29".
+_YAML_SINGLE_ESCAPES = {
+    "0": "\0", "a": "\a", "b": "\b", "t": "\t", "n": "\n", "v": "\v", "f": "\f", "r": "\r",
+    "e": "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\",
+    "N": "", "_": " ", "L": " ", "P": " ",
+}
+
+
+def decode_yaml_double_quoted(inner):
+    """Decode the escapes inside a double-quoted YAML scalar's already-unwrapped body.
+
+    Line-continuation escapes (a backslash at end-of-line, folding into the next) are
+    deliberately unhandled -- decode_yaml_scalar's own docstring scopes this to
+    SINGLE-LINE `run:`/`if:` values, which is what a workflow file's own condition ever
+    is. An unrecognised escape is left as the literal backslash-plus-character pair
+    rather than raising: this is a best-effort normalisation feeding a pattern match,
+    not a validator, and a value that fails to decode should read as itself, not vanish.
+    """
+    out = []
+    index = 0
+    length = len(inner)
+    while index < length:
+        char = inner[index]
+        if char == BACKSLASH and index + 1 < length:
+            next_char = inner[index + 1]
+            if next_char in _YAML_SINGLE_ESCAPES:
+                out.append(_YAML_SINGLE_ESCAPES[next_char])
+                index += 2
+                continue
+            width = {"x": 2, "u": 4, "U": 8}.get(next_char)
+            code_point = None
+            if width is not None and index + 2 + width <= length:
+                try:
+                    code_point = int(inner[index + 2 : index + 2 + width], 16)
+                except ValueError:
+                    code_point = None
+            if code_point is not None and code_point > 0x10FFFF:
+                code_point = None
+            if code_point is not None:
+                out.append(chr(code_point))
+                index += 2 + width
+            else:
+                out.append(char)
+                out.append(next_char)
+                index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def decode_yaml_scalar(value):
     """Decode the quoted single-line YAML scalars used for `run:` and `if:` values."""
     if len(value) < 2 or value[0] != value[-1] or value[0] not in "'\"":
@@ -585,10 +642,7 @@ def decode_yaml_scalar(value):
     if value[0] == "'":
         inner = value[1:-1]
         return value if "'" in inner.replace("''", "") else inner.replace("''", "'")
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return value
+    return decode_yaml_double_quoted(value[1:-1])
 
 
 def split_top_level(expression, operator):
