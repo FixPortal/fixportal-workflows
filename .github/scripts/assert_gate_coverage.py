@@ -519,7 +519,8 @@ def normalise_condition(value):
         value = value[1:-1].strip()
     if value.startswith("${{") and value.endswith("}}"):
         value = value[3:-2]
-    return value.replace(" ", "")
+    value = value.replace(" ", "")
+    return value.lower() if value.lower() in ("true", "false", "always()") else value
 
 
 def decode_yaml_scalar(value):
@@ -731,9 +732,9 @@ def failure_atoms(normalised):
         for part in split_top_level(normalised, "&&")
         if static_truth(part) is not True
     ]
-    if len(residual) != 1:
+    if not residual:
         return None
-    atoms = split_top_level(strip_outer_parentheses(residual[0]), "||")
+    atoms = split_top_level(strip_outer_parentheses("&&".join(residual)), "||")
     matches = []
     for atom in atoms:
         match = resolve_atom(strip_outer_parentheses(atom))
@@ -754,6 +755,9 @@ def resolve_atom(atom):
     checker cannot read. A refinement about a DIFFERENT job is refused -- it makes the step
     depend on that job's state too, so the atom no longer describes when the gate fails.
     """
+    # Index and property access name the same job. Normalize only that reference;
+    # arbitrary string contents must not turn into additional coverage atoms.
+    atom = re.sub(rf"\bneeds\[['\"]({ID})['\"]\]\.result", r"needs.\1.result", atom)
     direct = FAILURE_CONDITION_ATOM.fullmatch(atom)
     if direct is not None:
         return direct
@@ -940,7 +944,11 @@ def step_can_fail(block, span, key_indent):
         match = tolerant_key.match(block[i])
         if not match or len(match.group(1)) != key_indent:
             continue
-        if normalise_condition(match.group(2)) not in ("false", ""):
+        value = strip_comment(match.group(2)).strip()
+        if not value or is_block_scalar_header(value):
+            body, _ = continuation_lines(block, i, key_indent)
+            value = " ".join(strip_comment(line).strip() for line in body)
+        if normalise_condition(value) not in ("false", ""):
             return False, "carries `continue-on-error`, so it cannot fail the job"
 
     run_key = step_key_pattern(key_indent, "run")
