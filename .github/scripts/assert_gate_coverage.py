@@ -510,17 +510,72 @@ def normalise_condition(value):
     correctly NOT equal to `always()` -- a gate that runs only sometimes is the defect
     being caught, not a spelling variant of the fix.
     """
-    # Strip a WRAPPING quote pair only. `.strip("'\"")` peeled any leading or trailing
-    # quote, so `needs.build.result == 'failure'` lost its closing quote and stopped
-    # matching FAILURE_CONDITION_ATOM -- a correct per-job gate then read as gating
-    # nothing, which is a false RED on the house shape.
+    # Strip a WRAPPING quote pair only, decoding YAML's doubled-single-quote escape
+    # as it goes. `.strip("'\"")` peeled any leading or trailing quote, so
+    # `needs.build.result == 'failure'` lost its closing quote and stopped matching
+    # FAILURE_CONDITION_ATOM -- a correct per-job gate then read as gating nothing,
+    # which is a false RED on the house shape. A plain `value[1:-1]` fixed that but
+    # missed the escape: `if: 'needs.build.result != ''success'''` left
+    # `needs.build.result != ''success''` behind, which ALSO fails to match. Reusing
+    # decode_yaml_scalar (already relied on for `run:` values) decodes the escape
+    # too, and it is a no-op whenever the whole value isn't quote-wrapped, which is
+    # every ordinary `if:` -- see its own guard. Found by CodeRabbit on the upstream
+    # review.
     value = strip_comment(value).strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-        value = value[1:-1].strip()
+    decoded = decode_yaml_scalar(value)
+    if decoded != value:
+        value = decoded.strip()
     if value.startswith("${{") and value.endswith("}}"):
         value = value[3:-2]
-    value = value.replace(" ", "")
+    value = strip_whitespace_outside_quotes(value)
     return value.lower() if value.lower() in ("true", "false", "always()") else value
+
+
+def strip_whitespace_outside_quotes(value):
+    """Remove every space OUTSIDE a quoted span, leaving quoted content untouched.
+
+    A blanket `.replace(' ', '')` altered quoted literals too: `'not equal' ==
+    'notequal'` normalised to `'notequal'=='notequal'`, which static_truth then folds
+    to True as an identity comparison -- although GitHub compares the two DIFFERENT
+    strings and gets False. Folding a conjunct to True drops it from failure_atoms'
+    residual, crediting the atom beside it as real coverage for a step whose actual
+    compound condition is always false. Found by CodeRabbit on the upstream review.
+
+    A double-quoted literal can itself contain an escaped quote (`_LITERAL` matches
+    `\\"(?:\\\\.|[^\\"])*\\"`, same as split_top_level/strip_inline_comment), and this
+    loop originally had no escape handling: `"a\\" b"` closed the string at the
+    escaped quote, re-entered quote mode at the bare quote that follows, and stripped
+    the space that was actually inside the literal -- `"a\\"b"`, comparing against
+    `ab` instead of the intended `a" b`. Skipping two characters on a backslash
+    inside a double-quoted span, exactly as those sibling functions do, is what
+    keeps the escape from being read as a close. Found by Gitar on the upstream
+    review.
+    """
+    out = []
+    quote = None
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if quote == '"' and char == BACKSLASH and index + 1 < len(value):
+            out.append(char)
+            out.append(value[index + 1])
+            index += 2
+            continue
+        if quote is not None:
+            out.append(char)
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in "'\"":
+            quote = char
+            out.append(char)
+            index += 1
+            continue
+        if char != " ":
+            out.append(char)
+        index += 1
+    return "".join(out)
 
 
 def decode_yaml_scalar(value):

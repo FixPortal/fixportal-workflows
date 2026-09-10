@@ -26,8 +26,8 @@ Exit codes: 0 clean, 1 a hard violation, 2 the checker could not run.
 SCOPE, stated so a pass is not mistaken for more than it is: this scans
 .github/workflows/*.yml|*.yaml, and follows a local `./` ref into its
 action.yml/action.yaml to check the refs inside a composite action and the registry
-image a docker action pulls. It does not
-resolve a reusable workflow in another repository, and pinning is checked by SHAPE
+image a docker action pulls. It does not resolve a reusable workflow in another
+repository, and pinning is checked by SHAPE
 -- see TRUSTED_THIRD_PARTY_ACTIONS below for the stricter mode.
 """
 
