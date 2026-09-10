@@ -25,7 +25,8 @@ Exit codes: 0 clean, 1 a hard violation, 2 the checker could not run.
 
 SCOPE, stated so a pass is not mistaken for more than it is: this scans
 .github/workflows/*.yml|*.yaml, and follows a local `./` ref into its
-action.yml/action.yaml to check the refs inside a composite action. It does not
+action.yml/action.yaml to check the refs inside a composite action and the registry
+image a docker action pulls. It does not
 resolve a reusable workflow in another repository, and pinning is checked by SHAPE
 -- see TRUSTED_THIRD_PARTY_ACTIONS below for the stricter mode.
 """
@@ -314,6 +315,54 @@ def composite_step_refs(document):
     return refs
 
 
+def is_local_docker_build(image, action_dir):
+    """True when a docker action's `runs.image` builds from the action's own
+    directory rather than pulling a registry image.
+
+    GitHub's metadata syntax accepts exactly one filename for that local build --
+    `Dockerfile`, case-sensitive (a capital `D`, no capital `f`), at a path relative
+    to the action's own directory. Basename matching alone is not enough either:
+    `myregistry.example.com/Dockerfile` has no `://` and that exact basename too,
+    and would wrongly exempt a real registry pull from the pin check (a mutable,
+    unpinned tag reads as clean). Requiring the path to resolve to an actual file
+    under `action_dir` is what tells the two apart -- a registry host has no such
+    file checked out, and a genuine local build does. Both points raised by
+    CodeRabbit on the upstream review.
+    """
+    if "://" in image:
+        return False
+    if image.rsplit("/", 1)[-1] != "Dockerfile":
+        return False
+    return (action_dir / image).is_file()
+
+
+def local_action_refs(document, action_dir):
+    """Every ref a local action manifest causes to run: composite `uses:` steps,
+    plus the registry image of a DOCKER action.
+
+    composite_step_refs alone covers only `runs.using: composite`. A docker action
+    has no `uses:` steps, so its `runs.image` escaped the pin check entirely while
+    the run summary still claimed every container image pinned -- fail-open, the
+    summary vouching for coverage that did not exist. A registry image runs arbitrary
+    code in the runner's context exactly as a workflow's `container:` does, which is
+    why `action_refs` pin-checks those, and it is checked here through the same
+    check_ref.
+
+    A `Dockerfile` build -- resolved against `action_dir`, the directory holding the
+    action's own manifest -- is this repository's own reviewed code, like a
+    composite's steps, with no revision to pin, so it is not a ref. An image with a
+    URI scheme is a registry pull whatever its basename, so
+    `docker://untrusted/dockerfile` is checked like any other image.
+    """
+    refs = composite_step_refs(document)
+    runs = document.get("runs")
+    if isinstance(runs, dict) and runs.get("using") == "docker":
+        image = runs.get("image")
+        if isinstance(image, str) and not is_local_docker_build(image, action_dir):
+            refs.append(image)
+    return refs
+
+
 def workflow_checks_out_code(document):
     """True when this workflow fetches head/PR code, directly or through a local
     composite action -- the property PRIVILEGED_TRIGGER_NO_CHECKOUT's exemption
@@ -502,8 +551,9 @@ def check_ref(job, ref, origin, unpinned):
 
 
 def check_local_action(job, ref, origin, unpinned, visited):
-    """Pin-check one local composite action's own `uses:` refs, and recursively the
-    local composites IT calls. Returns (failed, unpinned).
+    """Pin-check one local action's own refs -- a composite's `uses:` steps, a
+    docker action's registry image -- and recursively the local composites IT calls.
+    Returns (failed, unpinned).
 
     A local composite is this repository's own reviewed code, but the actions it calls
     are not -- and they are invisible to a scan that stops at .github/workflows.
@@ -555,7 +605,7 @@ def check_local_action(job, ref, origin, unpinned, visited):
         )
         return True, unpinned
 
-    for inner_ref in composite_step_refs(inner):
+    for inner_ref in local_action_refs(inner, manifest.parent):
         bad, unpinned = check_ref(f"{job} -> {ref}", inner_ref, manifest, unpinned)
         failed = failed or bad
         if not inner_ref.startswith("./") or is_reusable_workflow_ref(inner_ref):
