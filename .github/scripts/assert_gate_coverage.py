@@ -113,18 +113,8 @@ ACCEPTED_FAILING_FORMS = tuple(
         # A false RED here is an argument someone has to win; a false GREEN is a merge
         # nobody notices.
         #
-        # RESIDUAL, stated rather than quietly carried: the two `if <test>; then exit 1;
-        # fi` forms below have the same property - they exit 0 when their test fails. They
-        # predate this change, are the shipped house shape, and removing them would red
-        # every repo running it, so they stay. Narrowing them is a separate, estate-wide
-        # change with its own rollout. (CodeRabbit, PR #135.)
-        #
         # echo "..." ; exit 1     (message then failure, either separator style)
         rf"{_ECHO}\s*(?:;|&&)\s*{_FAIL}",
-        # if <test>; then <echo>; exit 1; fi   -- the house one-liner
-        rf"if\s+.+?;\s*then\s+(?:{_ECHO};\s*)?{_FAIL};\s*fi",
-        # if <test>; then exit 1; fi   with the echo inside on its own already covered
-        rf"if\s+.+?;\s*then\s+{_FAIL};\s*fi",
         # PowerShell. `shell: pwsh` gate steps are house style in the .NET repos and
         # `throw 'upstream failed'` is how one fails, so rejecting it was a false RED
         # on a correct gate - the direction that gets a working control deleted to make
@@ -134,8 +124,39 @@ ACCEPTED_FAILING_FORMS = tuple(
         # non-zero (127), which is exactly what this function is asserting.
         # UNCONDITIONAL only. `if ($false) { throw "failed" }` was accepted and does not
         # throw, so the step exits 0 - the same fail-open as the `||` forms above.
-        r"throw(?:\s+.*)?",
+        # THE TAIL CANNOT CARRY A SEPARATOR. It used to be `.*`, and mask_quoted blanks
+        # the message, so `throw "upstream failed" || true` normalised to `throw || true`
+        # and fullmatched - but under bash `-e` does not fire on a command whose status
+        # `||` consumes, so the step exits 0. Excluding | & ; < > from the tail keeps the
+        # message arm and refuses every guarded form, exactly as the block above does.
+        r"throw(?:\s+[^|&;<>]*)?",
     )
+)
+# A MESSAGE line is the only thing a failing command may follow. It writes output
+# and cannot re-decide the step's exit status, so vouching for it as a prefix does
+# not vouch for a command that could make the step succeed. This is _ECHO with the
+# argument made optional: mask_quoted has already blanked any quoted text by the
+# time it runs, so `echo "Upstream results: ..."` reaches it as a bare `echo`.
+_MESSAGE = re.compile(rf"(?:{_REDIR}\s*)?(?:echo|printf)(?:\s+[^\n|&;<>]*)?{_REDIR}")
+# `set -euo pipefail` is the house prefix on run: blocks across this estate, and
+# refusing it was a false RED waiting for the first gate written in the house style --
+# the direction that gets a working control deleted to make CI green.
+#
+# NOT EVERY SHELL OPTION IS INERT, which is why this is an allowlist of four and not a
+# ban on the dangerous ones. `set -n` (noexec) and `set -t` (onecmd) STOP the shell
+# before the final command: `set -n` then `exit 1` reads the exit and never runs it, so
+# the step exits ZERO while the checker vouches for the `exit 1` it can see. Both were
+# accepted when this prefix was any word list. A blocklist of the forms known to be
+# unsafe today is the wrong shape for a control that vouches -- it is open by default
+# and one shell feature away from wrong -- so only `-e`, `-u`, `-x` and `-o` with
+# pipefail/errexit/nounset/xtrace are recognised, in the short, combined and long
+# spellings. Anything else, `set +e` and `set -o noexec` alike, is simply not a
+# shell-option line. Separators and expansions cannot appear in either arm, so
+# `set -e; exit 0` is not one either. (CodeRabbit, PR #176.)
+_SAFE_SHORT_OPTIONS = r"-[eux]+"
+_SAFE_LONG_OPTIONS = r"-[eux]*o\s+(?:pipefail|errexit|nounset|xtrace)"
+_SHELL_OPTION = re.compile(
+    rf"set(?:\s+(?:{_SAFE_LONG_OPTIONS}|{_SAFE_SHORT_OPTIONS}))+"
 )
 # An `if:` may open a YAML block scalar and carry its condition on the following,
 # more-indented lines. Those lines are part of the condition and must be searched too, or
@@ -991,7 +1012,7 @@ def mask_quoted(line):
 
 
 def ends_non_zero(body):
-    """True when the gate body is a RECOGNISED failing form.
+    """True when the gate body is a RECOGNISED failing form, as a WHOLE.
 
     This used to split a de-quoted, de-commented line on command separators and accept
     any segment starting `exit <n>` or `false`. Four independent escapes were found in
@@ -1010,20 +1031,41 @@ def ends_non_zero(body):
     rejects everything else with a message naming what it supports. A gate step is the
     one place in a workflow where an exotic shell body buys nothing.
 
+    The verdict is over the COMPLETE body, not the first matching line. Accepting any
+    matching segment validated `exit 0` followed by an unreachable `exit 1` -- the step
+    exits ZERO at run time on the first line while the checker vouches for the second.
+    So every line before the failing command must be a MESSAGE or a `set` SHELL-OPTION
+    line -- the two prefixes that cannot re-decide the exit status -- and the final line
+    must fullmatch an accepted form. Anything else is refused rather than parsed.
+
     `body` is the joined run: body, with backslash continuations already folded.
     """
+    # A COMMAND SUBEXPRESSION CAN EXIT THE STEP BEFORE THE FAILING COMMAND RUNS. Under
+    # `shell: pwsh`, `echo "$(exit 0)"` exits ZERO during expansion, and mask_quoted
+    # blanks the string to a bare `echo` that reads as an ordinary message line -- so a
+    # body of `echo "$(exit 0)"` then `throw` was vouched for while the step succeeds.
+    # This predates the message-prefix rule: the same body passed the any-line rule on
+    # its `throw` alone. What the subexpression does cannot be read from the file, which
+    # is the basis on which this function vouches at all, so it is refused rather than
+    # parsed. GitHub's own `${{ ... }}` is untouched -- it is not `$(`.
+    # (CodeRabbit, PR #176.)
+    if "$(" in body:
+        return False
     text = mask_quoted(body)
     # Drop comments AFTER masking, so a `#` inside a string is not treated as one.
     text = re.sub(r"(?m)(?<!\S)#[^\n]*", "", text)
-    # Normalise whitespace per logical line, then test each against the accepted forms.
-    for logical in text.split("\n"):
-        segment = " ".join(logical.split())
-        if not segment:
-            continue
-        for form in ACCEPTED_FAILING_FORMS:
-            if form.fullmatch(segment):
-                return True
-    return False
+    # Normalise whitespace per logical line and drop the empties.
+    segments = [
+        segment
+        for segment in (" ".join(logical.split()) for logical in text.split("\n"))
+        if segment
+    ]
+    if not segments:
+        return False
+    for segment in segments[:-1]:
+        if not (_MESSAGE.fullmatch(segment) or _SHELL_OPTION.fullmatch(segment)):
+            return False
+    return any(form.fullmatch(segments[-1]) for form in ACCEPTED_FAILING_FORMS)
 
 
 def step_can_fail(block, span, key_indent):
@@ -1097,12 +1139,15 @@ def step_can_fail(block, span, key_indent):
             return True, ""
         return False, (
             "its `run:` body is not a recognised failing form, so this checker will not "
-            "vouch for it. Use one of: `exit 1`; `false`; `echo \"...\"; exit 1`; "
-            "`if <test>; then echo \"...\"; exit 1; fi`; or, under `shell: pwsh`, an "
-            "unconditional `throw`. Each may carry a trailing redirection. A gate step "
-            "is not the place for shell this checker has to guess about, and a body "
-            "guarded by its own `||`/`&&` test is refused because it exits ZERO on the "
-            "other branch"
+            "vouch for it. Use one of: `exit 1`; `false`; `echo \"...\"; exit 1`; or, "
+            "under `shell: pwsh`, an unconditional `throw`. Each may carry a trailing "
+            "redirection, and may be preceded by message lines (`echo`/`printf`) and "
+            "`set` shell-option lines only. A command subexpression `$(...)` anywhere "
+            "in the body is refused: under pwsh it can exit the step before the failing "
+            "command runs. "
+            "A gate step is not the place for shell this checker has to guess about, "
+            "and a body guarded by its own `||`/`&&`/`if` test is refused because it "
+            "exits ZERO on the other branch"
         )
     return False, "has no `run:` body, so it cannot fail the job"
 
