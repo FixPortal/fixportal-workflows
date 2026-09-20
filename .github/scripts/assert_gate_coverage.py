@@ -98,7 +98,7 @@ _REDIR = r"(?:\s*[12]?>>?\s*(?:&[12]|[^\s;|&]+))*"
 # command itself is still required separately by _FAIL.
 _ECHO = rf"(?:{_REDIR}\s*)?(?:echo|printf)\s+[^\n|&;<>]*{_REDIR}"
 _NONZERO_STATUS = r"0*(?:[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])"
-_FAIL = rf"(?:exit\s+{_NONZERO_STATUS}|false){_REDIR}"
+_FAIL = rf"(?:exit\s+{_NONZERO_STATUS}|false){_REDIR}\s*;?"
 ACCEPTED_FAILING_FORMS = tuple(
     re.compile(pattern)
     for pattern in (
@@ -498,8 +498,8 @@ def conditional_jobs(lines, jobs, job_indent):
     """The ids of jobs carrying a job-level `if:` condition.
 
     Job-level only. A step-level `if:` sits deeper and is out of scope -- a skipped
-    step fails its job's own assertions, it does not make the gate report green over a
-    missing check. Each job's own body indentation is read rather than assumed, so a
+    step does not make the gate report green over a missing check, but it is outside this
+    job-level scan. Each job's own body indentation is read rather than assumed, so a
     valid deeper `if:` cannot disappear and leave the job looking unconditional.
     """
     starts = sorted(jobs.values())
@@ -515,11 +515,62 @@ def conditional_jobs(lines, jobs, job_indent):
     return conditional
 
 
+def tolerant_jobs(lines, jobs, job_indent):
+    """The ids of jobs carrying an effective job-level `continue-on-error`."""
+    starts = sorted(jobs.values())
+    tolerant = set()
+    for job_id, start in jobs.items():
+        end = min((i for i in starts if i > start), default=len(lines))
+        indent = job_body_indent(lines, jobs, job_id, job_indent)
+        if indent is None:
+            continue
+        tolerant_key = key_pattern(indent, "continue-on-error")
+        for i in range(start + 1, end):
+            match = tolerant_key.match(lines[i].rstrip("\r\n"))
+            if match and normalise_condition(strip_comment(match.group(1)).strip()) not in (
+                "false",
+                "",
+            ):
+                tolerant.add(job_id)
+                break
+    return tolerant
+
+
 def job_block(lines, jobs, job_id):
     """The lines of one job's body, from its key to the next job key."""
     start = jobs[job_id]
     end = min((i for i in sorted(jobs.values()) if i > start), default=len(lines))
     return [line.rstrip("\r\n") for line in lines[start + 1 : end]]
+
+
+def job_needs(lines, jobs, job_id, job_indent):
+    """The direct `needs:` ids for one job, including block-list form."""
+    start = jobs[job_id]
+    end = min((i for i in sorted(jobs.values()) if i > start), default=len(lines))
+    indent = job_body_indent(lines, jobs, job_id, job_indent)
+    if indent is None:
+        return set()
+    needs_key = key_pattern(indent, "needs")
+    block_need = block_need_pattern(indent)
+    for i in range(start + 1, end):
+        match = needs_key.match(lines[i].rstrip("\r\n"))
+        if not match:
+            continue
+        value = strip_comment(match.group(1)).strip()
+        if value:
+            return set(parse_need_ids(value))
+        result = set()
+        for line in lines[i + 1 : end]:
+            item = block_need.match(line.rstrip("\r\n"))
+            if item:
+                result.add(item.group(1) or item.group(2) or item.group(3))
+                continue
+            if COMMENT_OR_BLANK.match(line):
+                continue
+            if len(line) - len(line.lstrip(" ")) <= indent:
+                break
+        return result
+    return set()
 
 
 def normalise_condition(value):
@@ -1047,9 +1098,17 @@ def ends_non_zero(body):
     # This predates the message-prefix rule: the same body passed the any-line rule on
     # its `throw` alone. What the subexpression does cannot be read from the file, which
     # is the basis on which this function vouches at all, so it is refused rather than
-    # parsed. GitHub's own `${{ ... }}` is untouched -- it is not `$(`.
+    # parsed. GitHub substitutes `${{ ... }}` textually before the shell parses
+    # the body, so an expression can splice a separator or early exit into an
+    # otherwise inert message line. Keep expressions in `env:` instead.
     # (CodeRabbit, PR #176.)
     if "$(" in body:
+        return False
+    if "${{" in body:
+        return False
+    if re.search(r"\bthrow\s+[@(]", body):
+        return False
+    if re.search(r"\bexit\s+[^\s\n;|&<>]*['\"]", body):
         return False
     text = mask_quoted(body)
     # Drop comments AFTER masking, so a `#` inside a string is not treated as one.
@@ -1102,6 +1161,16 @@ def step_can_fail(block, span, key_indent):
         if normalise_condition(value) not in ("false", ""):
             return False, "carries `continue-on-error`, so it cannot fail the job"
 
+    shell = "bash"
+    shell_key = step_key_pattern(key_indent, "shell")
+    for i in range(start, end):
+        match = shell_key.match(block[i])
+        if match and len(match.group(1)) == key_indent:
+            shell = decode_yaml_scalar(strip_inline_comment(match.group(2)).strip()).strip()
+            break
+    if shell not in ("bash", "bash {0}", "pwsh", "pwsh {0}"):
+        return False, f"uses unsupported shell `{shell}`"
+
     run_key = step_key_pattern(key_indent, "run")
     for i in range(start, end):
         match = run_key.match(block[i])
@@ -1135,6 +1204,10 @@ def step_can_fail(block, span, key_indent):
         # backslash-continued echo read as failable commands.
         joined = "\n".join(body)
         joined = re.sub(r"\\\n\s*", " ", joined)
+        if shell.startswith("pwsh") and not re.fullmatch(
+            r"\s*throw(?:\s+(?:'[^'\n]*'|\"[^\"\n]*\"))?\s*", joined
+        ):
+            return False, "uses pwsh; only an unconditional throw with an optional static message is supported"
         if ends_non_zero(joined):
             return True, ""
         return False, (
@@ -1186,6 +1259,16 @@ def step_conditions(block, indent):
 
         match = step_if_value.match(line)
         if match:
+            key_column = len(match.group(1))
+            for prior in range(index, -1, -1):
+                prefix = block[prior].lstrip()
+                prior_indent = len(block[prior]) - len(prefix)
+                if prefix.startswith("- ") and prior_indent < key_column:
+                    key_column = prior_indent + 2
+                    break
+            if len(match.group(1)) != key_column:
+                index += 1
+                continue
             value = strip_comment(match.group(2)).strip()
             if value and not BLOCK_SCALAR.match(value):
                 yield value, index
@@ -1388,13 +1471,17 @@ def parse_jobs(workflow_path):
 # script name inside an `echo` message, or a path that a later commit deleted, from
 # reddening a repository over a file it does not have.
 GATE_SCRIPT = re.compile(
-    r"""(?<![\w./-])\.?/?((?:\.github/scripts|scripts|build|tools)/[\w./-]*\.(?:ps1|py|sh))\b"""
+    # The extension set is deliberately closed: these are the gate-script languages
+    # supported by the estate checker. Add a new extension here and to the policy
+    # review before wiring it into a merge barrier.
+    r"""(?<![\w.-])\.?/?((?:\.github/scripts|scripts|build|tools)/[\w./-]*\.(?:ps1|py|sh))\b"""
 )
 # A `run:` key at any depth. Group 1 is everything before the key, so its LENGTH is the
 # key's own column -- which is what continuation_lines needs to find a block scalar's
 # body. Same reasoning as step_key_pattern, and the same dash-form hazard: a `- run: |`
 # opens at the key, two columns right of the dash.
 RUN_KEY = re.compile(r"""^(\s*(?:-\s+)?)(?:'run'|"run"|run)\s*:\s*(.*?)\s*$""")
+LOCAL_USES = re.compile(r"""^\s*(?:-\s+)?(?:'uses'|"uses"|uses)\s*:\s*['"]?((?:\./|\$/)[^\s#'"]+)""")
 
 
 def glob_to_regex(pattern):
@@ -1444,10 +1531,49 @@ def policy_root(workflow_path):
     for parent in Path(workflow_path).resolve().parents:
         if (parent / ".claude" / "review-policy.json").is_file():
             return parent
+        if (parent / ".git").exists():
+            break
     return None
 
 
-def gated_run_bodies(lines, jobs, needs, gate_job):
+def delegated_run_bodies(root, ref, visited):
+    """Yield run-body lines from a local composite action or reusable workflow."""
+    relative = ref[2:]
+    target = root / relative
+    if target.is_dir():
+        target = next((target / name for name in ("action.yml", "action.yaml") if (target / name).is_file()), None)
+    if target is None or not target.is_file():
+        return
+    key = target.resolve().as_posix()
+    if key in visited:
+        return
+    visited.add(key)
+    lines = target.read_text(encoding="utf-8").splitlines()
+    using = re.search(r"^\s+using:\s*['\"]?([^\s#'\"]+)", "\n".join(lines), re.MULTILINE)
+    if using and using.group(1) != "composite":
+        raise ValueError(
+            f"{target}: local action uses runs.using {using.group(1)}; "
+            "gate coverage only follows composite action bodies"
+        )
+    index = 0
+    while index < len(lines):
+        match = RUN_KEY.match(lines[index])
+        if not match:
+            index += 1
+            continue
+        value = strip_inline_comment(match.group(2)).strip()
+        if BLOCK_SCALAR.match(value):
+            body, index = continuation_lines(lines, index, len(match.group(1)))
+        else:
+            body, index = ([value] if value else []), index + 1
+        yield from body
+    for line in lines:
+        match = LOCAL_USES.match(line)
+        if match:
+            yield from delegated_run_bodies(root, match.group(1), visited)
+
+
+def gated_run_bodies(lines, jobs, needs, gate_job, root):
     """Every `run:` body line belonging to a job that can fail the gate, with its job id.
 
     Scoped to the gate's `needs:` plus the gate job itself, because that is exactly the
@@ -1455,7 +1581,14 @@ def gated_run_bodies(lines, jobs, needs, gate_job):
     job cannot neuter the barrier, so requiring it to be HIGH would be a cost with no
     control behind it.
     """
-    for job_id in sorted(set(needs) | {gate_job}):
+    job_indent = len(lines[jobs[gate_job]]) - len(lines[jobs[gate_job]].lstrip(" "))
+    pending = list(set(needs) | {gate_job})
+    seen = set()
+    while pending:
+        job_id = pending.pop()
+        if job_id in seen:
+            continue
+        seen.add(job_id)
         if job_id not in jobs:
             continue
         block = job_block(lines, jobs, job_id)
@@ -1480,6 +1613,12 @@ def gated_run_bodies(lines, jobs, needs, gate_job):
                 body, index = ([value] if value else []), index + 1
             for body_line in body:
                 yield job_id, body_line
+        for line in block:
+            match = LOCAL_USES.match(line)
+            if match:
+                for body_line in delegated_run_bodies(root, match.group(1), set()):
+                    yield job_id, body_line
+        pending.extend(job_needs(lines, jobs, job_id, job_indent) - seen)
 
 
 def gate_script_paths(lines, jobs, needs, gate_job, root):
@@ -1490,7 +1629,7 @@ def gate_script_paths(lines, jobs, needs, gate_job, root):
     cannot be edited to neuter anything.
     """
     found = {}
-    for job_id, body_line in gated_run_bodies(lines, jobs, needs, gate_job):
+    for job_id, body_line in gated_run_bodies(lines, jobs, needs, gate_job, root):
         for match in GATE_SCRIPT.finditer(body_line):
             relative = match.group(1)
             if (root / relative).is_file():
@@ -1579,6 +1718,9 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
     if gate_job not in jobs:
         return False
 
+    gate_line = lines[jobs[gate_job]]
+    job_indent = len(gate_line) - len(gate_line.lstrip(" "))
+
     missing = sorted(set(jobs) - set(needs) - exempt - {gate_job})
     if missing:
         sys.exit(
@@ -1597,6 +1739,14 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             "A skipped job passes the gate, so a conditional quality job can report "
             "green while checking nothing. Remove the condition, or name the job in "
             "GATE_CONDITIONAL_EXEMPT with a written rationale in the workflow."
+        )
+
+    tolerant = sorted((tolerant_jobs(lines, jobs, job_indent) & (set(needs) | {gate_job})))
+    if tolerant:
+        sys.exit(
+            f"{workflow_path}: job-level 'continue-on-error' on merge-blocking job(s): "
+            f"{', '.join(tolerant)}.\n"
+            "A tolerated job cannot provide a required check or serve as the aggregate gate."
         )
 
     assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs)
@@ -1623,6 +1773,8 @@ def main(argv):
     conditional_exempt = split_env("GATE_CONDITIONAL_EXEMPT")
 
     if not Path(target).is_dir():
+        if not Path(target).is_file():
+            sys.exit(f"{target}: workflow path does not exist or is not a file.")
         unknown = sorted((exempt | conditional_exempt) - parse_jobs(target))
         if unknown:
             sys.exit(

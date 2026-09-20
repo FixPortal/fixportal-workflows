@@ -7,7 +7,9 @@ review was never reliably catching:
   * no target-context trigger (`pull_request_target`, `workflow_run`) -- both run in
     the BASE repo's context with its secrets and a write-scoped token, while able to
     reach attacker-controlled head code;
-  * no blanket `write-all` token, at workflow or job scope;
+  * no blanket `write-all` token, at workflow or job scope. If a workflow omits its
+    own `permissions:` key, the inherited repository/organization default is outside
+    this file's visibility and is reported as a notice rather than guessed at;
   * every third-party action AND container image pinned to an immutable revision.
 
 PARSED, NOT GREPPED. The greps this replaced carried a self-match hazard -- the
@@ -388,7 +390,9 @@ def workflow_checks_out_code(document):
     content by any means -- not merely that it calls no `actions/checkout`. Read every
     `run:` body in the workflow and in every local action it delegates to, and look for
     `git clone`/`git fetch` of a PR ref, `gh pr checkout`, and any `curl`/`wget` of a
-    tarball or archive URL. A rationale that only says "no checkout action" has not
+    tarball or archive URL. Also inspect remote reusable workflows: their YAML is not
+    available in the caller's checkout, so this checker cannot follow them. A rationale
+    that only says "no checkout action" has not
     discharged this.
     """
     return checks_out_code(document, set())

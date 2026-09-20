@@ -78,6 +78,8 @@ jobs:
     steps:
       - name: Fail if any upstream job did not succeed
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        env:
+          RESULTS: ${{ join(needs.*.result, ', ') }}
         run: |
-          echo "Upstream results: ${{ join(needs.*.result, ', ') }}"
+          echo "Upstream results: $RESULTS"
           exit 1
