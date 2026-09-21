@@ -59,6 +59,9 @@ jobs:
           GATE_FILE_EXEMPT: '.github/workflows/review-policy-guard.yml'
         run: python3 .github/scripts/assert_gate_coverage.py .github/workflows
 
+      - name: Assert canonical asset copies match the committed manifest
+        run: python3 .github/scripts/assert_canonical_assets.py
+
   # Required status check. Deliberately a pure aggregator of needs.*.result: it decides
   # what can merge, so it has no checkout, no parser and no network of its own.
   #

@@ -31,6 +31,8 @@
   "version": 1,
 
   "high": [
+    ".github/canonical-assets.json",
+    ".github/scripts/assert_canonical_assets.py",
     ".github/workflows/review-policy-guard.yml",
     ".github/scripts/assert_workflow_hygiene.py",
     ".github/workflows/ci.yml",
