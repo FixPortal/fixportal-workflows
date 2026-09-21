@@ -1223,10 +1223,29 @@ def step_can_fail(block, span, key_indent):
         # backslash-continued echo read as failable commands.
         joined = "\n".join(body)
         joined = re.sub(r"\\\n\s*", " ", joined)
-        if shell.startswith("pwsh") and not re.fullmatch(
-            r"\s*throw(?:\s+(?:'[^'\n]*'|\"[^\"\n]*\"))?\s*", joined
-        ):
-            return False, "uses pwsh; only an unconditional throw with an optional static message is supported"
+        if shell.startswith("pwsh"):
+            # STRIP COMMENTS BEFORE THE FULLMATCH, the way the bash path already does.
+            # `continuation_lines` keeps comments intact deliberately, and ends_non_zero
+            # masks then strips them (below). This arm did neither, so a pwsh
+            # `throw "..." # note` inside a `run: |` block was refused outright while the
+            # identical bash `exit 1 # note` was accepted and the same pwsh throw written
+            # inline passed via strip_inline_comment. A false RED on a gate that does
+            # fail. (Issue #232.)
+            #
+            # Located in the MASKED copy, not stripped by a blind re.sub: mask_quoted
+            # preserves offsets exactly -- every branch emits as many characters as it
+            # consumes -- so a span found there cuts the original at the right place,
+            # while a `#` inside the throw's own quoted message stays masked and is left
+            # alone. A blind sub would eat that message and fail the fullmatch for an
+            # unrelated reason. Removed back-to-front so earlier offsets stay valid.
+            probe = joined
+            masked = mask_quoted(probe)
+            for comment in reversed(list(re.finditer(r"(?m)(?<!\S)#[^\n]*", masked))):
+                probe = probe[: comment.start()] + probe[comment.end() :]
+            if not re.fullmatch(
+                r"\s*throw(?:\s+(?:'[^'\n]*'|\"[^\"\n]*\"))?\s*", probe
+            ):
+                return False, "uses pwsh; only an unconditional throw with an optional static message is supported"
         if ends_non_zero(joined):
             return True, ""
         return False, (
@@ -1473,8 +1492,11 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
 
 def parse_jobs(workflow_path):
     """The job-name set for one file, read once so callers can validate exemptions
-    against it before (or across, in directory mode) running the full assertion."""
-    with open(workflow_path, encoding="utf-8") as handle:
+    against it before (or across, in directory mode) running the full assertion.
+
+    utf-8-sig, not utf-8: see the note on the main read in assert_gate_coverage.
+    """
+    with open(workflow_path, encoding="utf-8-sig") as handle:
         lines = handle.readlines()
     jobs, _, _ = read_gate_contract(lines, "")
     return set(jobs)
@@ -1489,11 +1511,29 @@ def parse_jobs(workflow_path):
 # is asserted about it (see gate_script_paths). That existence test is what keeps a
 # script name inside an `echo` message, or a path that a later commit deleted, from
 # reddening a repository over a file it does not have.
+#
+# BOTH SEPARATORS, EITHER CASE. Windows resolves a path case-insensitively and accepts
+# `\` as well as `/`, so on a windows-latest runner `.\scripts\probe.ps1` and
+# `./scripts/probe.PS1` run the repo-local script exactly as the POSIX spelling does.
+# Admitting only `/` and lowercase extensions meant gate_script_paths never saw either,
+# assert_gate_scripts asserted nothing, and a repo-authored gate script stayed editable
+# in a NORMAL-tier pull request -- reachable by punctuation rather than by deleting
+# anything, which is the precise hole assert_gate_scripts exists to close. Widening here
+# widens DETECTION only: more scripts are required HIGH, never fewer. That is the
+# opposite error direction from widening an accept-list, which is why it is safe to do
+# and an ACCEPTED_FAILING_FORMS widening was not.
+#
+# Probed on a mini-repo (issue #230): `.\scripts\probe.ps1` and `./scripts/probe.PS1`
+# both exited 0 -- green, ungated -- while the POSIX control `./scripts/probe.ps1`
+# exited 1 with "not tiered HIGH".
 GATE_SCRIPT = re.compile(
     # The extension set is deliberately closed: these are the gate-script languages
     # supported by the estate checker. Add a new extension here and to the policy
-    # review before wiring it into a merge barrier.
-    r"""(?<![\w.-])\.?/?((?:\.github/scripts|scripts|build|tools)/[\w./-]*\.(?:ps1|py|sh))\b"""
+    # review before wiring it into a merge barrier. Spelled as character classes rather
+    # than an inline `(?i:...)` group, which needs Python 3.11 -- this asset runs on
+    # whatever python3 a consuming repository's runner provides.
+    r"""(?<![\w.-])\.?[\\/]?((?:\.github[\\/]scripts|scripts|build|tools)[\\/]"""
+    r"""[\w.\\/-]*\.(?:[Pp][Ss]1|[Pp][Yy]|[Ss][Hh]))\b"""
 )
 # A `run:` key at any depth. Group 1 is everything before the key, so its LENGTH is the
 # key's own column -- which is what continuation_lines needs to find a block scalar's
@@ -1789,7 +1829,10 @@ def delegated_run_bodies(root, ref, visited):
     if key in visited:
         return
     visited.add(key)
-    lines = target.read_text(encoding="utf-8").splitlines()
+    # utf-8-sig, not utf-8: see the note on the main read in assert_gate_coverage. A
+    # BOM'd local action manifest would otherwise read as having no `runs:` mapping,
+    # and its delegated body would escape the scan entirely.
+    lines = target.read_text(encoding="utf-8-sig").splitlines()
     # `using` is resolved INSIDE the `runs:` mapping by resolve_runs_using -- see its
     # docstring. Quoted keys ('using'/"using"/using) are admitted in both block and
     # flow style, as they were here. (CodeRabbit, fixportal-claude-skills#110.)
@@ -1871,19 +1914,76 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root):
         pending.extend(job_needs(lines, jobs, job_id, job_indent) - seen)
 
 
+def resolve_committed_paths(root, relative):
+    """The COMMITTED spelling(s) of `relative` under `root`; empty when it resolves to
+    no file at all.
+
+    Windows resolves a path case-insensitively, so a windows-latest job runs
+    `./scripts/probe.PS1` against a file committed as `scripts/probe.ps1`. This checker
+    runs on ubuntu, where the exact lookup fails -- so admitting the mixed-case spelling
+    in GATE_SCRIPT without resolving it would capture the reference and then silently
+    drop it. That is the same fail-open the widening exists to close, moved one step
+    later and harder to see, because detection would LOOK correct.
+
+    The COMMITTED spelling is what is returned, not what the workflow typed, because the
+    review policy is matched against what is in the repository -- an exact policy entry
+    like `scripts/assert-coverage-floor.ps1` would never match a key spelled `PS1`.
+
+    EVERY case-insensitive match is returned, not the first. Two files differing only by
+    case cannot both be what Windows ran, and picking one arbitrarily would vouch for a
+    tier the other may not hold; requiring all of them is the fail-closed direction and
+    matches the error direction of the rest of this check -- more scripts required HIGH,
+    never fewer. An EXACT match still wins outright when one exists, which is the right
+    disambiguation and the only case where two such files can be told apart.
+
+    The walk is UNCONDITIONAL rather than a fallback behind an exact-path test. A
+    fallback would never execute on Windows, whose filesystem matches case-insensitively
+    -- so this resolution, and every fixture covering it, would be inert on the host it
+    was written on and live only on the runner. That is the inert-test shape this file's
+    own suite already carries a warning about. Walking always also makes the returned
+    spelling identical on both platforms, so a fixture can assert on it.
+
+    The cost is one `iterdir` per path segment per gate script found, and a repository
+    has a handful of gate scripts at most.
+    """
+    candidates = [(root, [])]
+    for part in relative.split("/"):
+        following = []
+        for base, resolved in candidates:
+            try:
+                entries = list(base.iterdir())
+            except (OSError, ValueError):
+                continue
+            for entry in entries:
+                if entry.name.lower() == part.lower():
+                    following.append((entry, resolved + [entry.name]))
+        candidates = following
+        if not candidates:
+            return []
+    matches = sorted("/".join(resolved) for path, resolved in candidates if path.is_file())
+    return [relative] if relative in matches else matches
+
+
 def gate_script_paths(lines, jobs, needs, gate_job, root):
     """Repo-local scripts a merge-blocking job runs from the checkout, path -> job id.
 
     Only paths that EXIST under `root` are returned. Nothing is asserted about a
     candidate that does not resolve to a file: the repository does not have it, so it
     cannot be edited to neuter anything.
+
+    A Windows-spelled candidate is normalised to `/` here, once, before either use.
+    Both downstream consumers need it: `Path("a\\b")` is a single filename on Linux, so
+    the existence test would miss the file, and the review policy's globs are written
+    with `/`, so a backslashed key would never match a tier and would report the script
+    as untiered even where the policy covers it. Case is settled separately, against the
+    disk, by resolve_committed_paths.
     """
     found = {}
     for job_id, body_line in gated_run_bodies(lines, jobs, needs, gate_job, root):
         for match in GATE_SCRIPT.finditer(body_line):
-            relative = match.group(1)
-            if (root / relative).is_file():
-                found.setdefault(relative, job_id)
+            relative = match.group(1).replace("\\", "/")
+            for committed in resolve_committed_paths(root, relative):
+                found.setdefault(committed, job_id)
     return found
 
 
@@ -1914,7 +2014,12 @@ def assert_gate_scripts(workflow_path, lines, jobs, needs, gate_job):
         return
     policy_path = root / ".claude" / "review-policy.json"
     try:
-        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        # utf-8-sig for the same reason as the workflow reads, and for one more: a BOM
+        # makes json.loads raise, which the except below swallows as "no policy" -- so a
+        # BOM'd policy file would disable the HIGH-tier assertion silently rather than
+        # noisily. Not named in issue #231, which covered the workflow reads; it is the
+        # same one-word defect in the same file and the same fail-open direction.
+        policy = json.loads(policy_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         # An unreadable or malformed policy is review-policy-guard.yml's failure to
         # report, and it already does. Duplicating it here would print the same breach
@@ -1955,9 +2060,19 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
     against a single file's job set here reddened every OTHER workflow that also
     contains the gate job with a false "names jobs that do not exist". Found by
     CodeRabbit on the upstream review.
+
+    READ AS utf-8-sig. A plain utf-8 read leaves a leading BOM in the first character,
+    so `JOBS_KEY` -- anchored at `^` -- never matched a BOM'd file's `jobs:` line, and
+    Windows editors add BOMs silently. The consequence split on invocation mode and was
+    bad in both directions: in FILE mode (how the estate wires this) the file exited 1
+    with "no jobs found", a permanently red required check over a valid workflow; in
+    DIRECTORY mode it was written off as "not a workflow, skipped" and every job in it
+    escaped coverage. A checker must not disagree with the runner about whether a file
+    is a workflow. The canonical-asset hasher already tolerates a BOM, so the two now
+    agree. (Issue #231, probed both modes.)
     """
 
-    with open(workflow_path, encoding="utf-8") as handle:
+    with open(workflow_path, encoding="utf-8-sig") as handle:
         lines = handle.readlines()
     jobs, needs, conditional = read_gate_contract(lines, gate_job)
 
