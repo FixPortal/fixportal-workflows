@@ -1946,8 +1946,29 @@ def resolve_committed_paths(root, relative):
     The cost is one `iterdir` per path segment per gate script found, and a repository
     has a handful of gate scripts at most.
     """
-    candidates = [(root, [])]
+    # NORMALISE DOT COMPONENTS FIRST. `iterdir()` never yields `.` or `..`, so walking
+    # them literally matches nothing and drops the candidate -- fail-open. The exact
+    # `is_file()` this walk replaced did not have that problem for `.`, because pathlib
+    # collapses a single dot on construction, so leaving it out was a REGRESSION rather
+    # than an unchanged gap. `..` is resolved here too, and a path that climbs above the
+    # repository root is refused outright rather than clamped: nothing outside the
+    # checkout is a repo-local gate script. (CodeRabbit, on the review of this change.)
+    parts = []
     for part in relative.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not parts:
+                return []
+            parts.pop()
+            continue
+        parts.append(part)
+    if not parts:
+        return []
+    normalised = "/".join(parts)
+
+    candidates = [(root, [])]
+    for part in parts:
         following = []
         for base, resolved in candidates:
             try:
@@ -1961,7 +1982,9 @@ def resolve_committed_paths(root, relative):
         if not candidates:
             return []
     matches = sorted("/".join(resolved) for path, resolved in candidates if path.is_file())
-    return [relative] if relative in matches else matches
+    # The exact-match test uses the NORMALISED spelling: `scripts/./probe.py` resolves to
+    # `scripts/probe.py`, and comparing against the raw text would never match it.
+    return [normalised] if normalised in matches else matches
 
 
 def gate_script_paths(lines, jobs, needs, gate_job, root):
