@@ -56,7 +56,7 @@ jobs:
           # Per-file exemption. review-policy-guard.yml is covered by its own required
           # context ("Review policy intact"); reusable workflow_call workflows belong
           # here too -- their jobs run in the caller and must not be wired into ci-gate.
-          GATE_FILE_EXEMPT: '.github/workflows/review-policy-guard.yml'
+          GATE_FILE_EXEMPT: '.github/workflows/review-policy-guard.yml .github/workflows/review-tier.yml'
         run: python3 .github/scripts/assert_gate_coverage.py .github/workflows
 
       - name: Assert canonical asset copies match the committed manifest
