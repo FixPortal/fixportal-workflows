@@ -1,0 +1,97 @@
+name: Review tier
+
+# Server-side enforcement of the HIGH tier. CodeRabbit is label-triggered
+# (.coderabbit.yaml -> auto_review.labels: ["review-high"]), and the only other thing
+# applying that label was a local PR-create hook on one workstation — so a PR that
+# acquired a HIGH path on a later push was never re-tiered. This workflow classifies the
+# PR's changed paths against .claude/review-policy.json on every head change and applies
+# or removes the label to match.
+#
+# The policy is read at the PR BASE SHA, never the head: a PR that removed an entry
+# from `high` would otherwise tier itself NORMAL and merge the unguarded path without
+# the review it requires. review-policy-guard.yml keeps the policy file itself
+# HIGH-tiered; the base-ref read here is what extends that protection to the policy's
+# contents.
+#
+# `pull_request_target` is used deliberately, and the workflow hygiene gate
+# (.github/scripts/assert_workflow_hygiene.py) carries this file's written-rationale
+# exemption: fork-originated PRs get a read-only token under plain `pull_request`, so
+# the label write would 403 on exactly the external PRs this workflow exists for.
+# Safety property the exemption rests on: this job never checks out or executes PR
+# code — every read is an API call against the base SHA, and the only writes are
+# label operations. The gate fails this workflow if a checkout ever appears.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    branches: [main]
+
+permissions:
+  contents: read        # read .claude/review-policy.json at the PR base SHA
+  issues: write         # gh label create --force calls the repository labels API
+  pull-requests: write  # add/remove the review-high label on the pull request
+
+concurrency:
+  group: review-tier-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  tier:
+    name: Apply review tier label
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Classify changed paths and set the review-high label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Policy from the BASE ref via the API: no checkout at all (nothing from the
+          # PR head ever lands on disk), and a head-side policy edit cannot re-tier its
+          # own PR. The compare call below is API-based for the same reason.
+          # Fail CLOSED when the policy cannot be read at the base SHA (renamed, deleted,
+          # or the API errors): an unclassifiable PR keeps no label only if we say so
+          # loudly here, not silently.
+          if ! policy=$(gh api "repos/$GITHUB_REPOSITORY/contents/.claude/review-policy.json?ref=$BASE_SHA" --jq '.content' 2>/dev/null | base64 --decode) || [ -z "$policy" ]; then
+            echo "::error::Could not read .claude/review-policy.json at base $BASE_SHA — refusing to tier. Failing closed."
+            exit 1
+          fi
+
+          files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" --jq '.files[].filename')
+
+          # Any high match tiers the PR HIGH (the policy's own rule). bash case patterns
+          # match across '/', which is exactly the policy glob semantics used here.
+          high=false
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            while IFS= read -r pattern; do
+              # shellcheck disable=SC2254  # the pattern comes from the policy file by design
+              case "$file" in
+                $pattern) high=true ;;
+              esac
+            done < <(jq -r '.high[]' <<< "$policy")
+            $high && break
+          done <<< "$files"
+
+          labelled=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name' | grep -cx 'review-high' || true)
+
+          if $high; then
+            echo "HIGH tier: at least one changed path matches the policy's high list."
+            gh label create review-high --repo "$GITHUB_REPOSITORY" --force --description "HIGH review tier: CodeRabbit review required" >/dev/null
+            if [ "$labelled" -eq 0 ]; then
+              gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label review-high
+              echo "Applied the review-high label."
+            else
+              echo "The review-high label is already present."
+            fi
+          else
+            echo "Not HIGH: no changed path matches the policy's high list."
+            if [ "$labelled" -gt 0 ]; then
+              gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label review-high
+              echo "Removed the review-high label."
+            fi
+          fi
