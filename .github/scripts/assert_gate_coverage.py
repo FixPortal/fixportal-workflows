@@ -1954,21 +1954,35 @@ def resolve_committed_paths(root, relative):
     # repository root is refused outright rather than clamped: nothing outside the
     # checkout is a repo-local gate script. (CodeRabbit, on the review of this change.)
     parts = []
+    climbed = False
+    overclimbed = False
     for part in relative.split("/"):
         if part in ("", "."):
             continue
         if part == "..":
+            climbed = True
             if not parts:
-                return []
+                # OVER-CLIMBED LEXICALLY. Returning here would be the same early-exit
+                # mistake as the one below, one step earlier: `scripts/link/../../../gate.py`
+                # escapes the checkout on paper, but if `link` targets a sufficiently deep
+                # in-checkout directory the OS lands back INSIDE it, and the gate script
+                # that actually runs would be omitted from coverage. Fall through to the
+                # filesystem resolution instead; its `is_relative_to` containment check is
+                # what excludes a genuinely external target, and it does so on the real
+                # answer rather than the lexical one. (CodeRabbit.)
+                overclimbed = True
+                continue
             parts.pop()
             continue
         parts.append(part)
-    if not parts:
-        return []
+
     normalised = "/".join(parts)
 
-    candidates = [(root, [])]
-    for part in parts:
+    # An over-climbed path has NO trustworthy lexical spelling -- the components left in
+    # `parts` no longer describe where the path points -- so the component walk is skipped
+    # entirely and only the filesystem answer is used.
+    candidates = [] if (overclimbed or not parts) else [(root, [])]
+    for part in (parts if candidates else []):
         following = []
         for base, resolved in candidates:
             try:
@@ -1980,8 +1994,55 @@ def resolve_committed_paths(root, relative):
                     following.append((entry, resolved + [entry.name]))
         candidates = following
         if not candidates:
-            return []
-    matches = sorted("/".join(resolved) for path, resolved in candidates if path.is_file())
+            # BREAK, do not return. When the candidate CLIMBED, the lexical spelling is
+            # not the only one worth trying: `scripts/link/../gate.ps1` reduces to
+            # `scripts/gate.ps1`, and if that file does not exist a return here would
+            # abandon the path before the filesystem resolution below ever ran -- leaving
+            # the repository-root `gate.ps1` the runner actually executes untiered.
+            # Fail-open, and invisible to a fixture that creates both targets. The empty
+            # case is re-checked after the climbed block instead. (CodeRabbit.)
+            break
+    matches = sorted(
+        "/".join(resolved) for path, resolved in candidates if path.is_file()
+    ) if candidates else []
+
+    # A `..` REDUCED LEXICALLY IS NOT WHAT THE RUNNER EXECUTES when a symlink precedes it.
+    # `scripts/link/../gate.py` reduces here to `scripts/gate.py`, but the OS resolves
+    # `link` first and then climbs from the TARGET's parent, so the file that actually
+    # runs can be a different one -- and vouching for the lexical answer would require
+    # HIGH on a path the gate never runs while the one it does run goes untiered.
+    #
+    # So when the candidate climbed, resolve it through the filesystem as well and keep
+    # BOTH spellings. The error direction is the same as everywhere else in this check:
+    # more scripts required HIGH, never fewer. A disagreement between the lexical and the
+    # real answer can only ADD a requirement. A target outside the checkout is dropped
+    # rather than clamped -- nothing out there is a repo-local gate script.
+    #
+    # Measured before writing this: zero committed symlinks across the estate, so the
+    # hazard is unreachable today. It is closed because the cost is a dozen lines and the
+    # direction is fail-open, not because it was observed. (CodeRabbit.)
+    if climbed:
+        try:
+            real = (root / relative).resolve()
+            if real.is_file() and real.is_relative_to(root.resolve()):
+                spelled = real.relative_to(root.resolve()).as_posix()
+                if spelled not in matches:
+                    return sorted(matches + [spelled])
+        except (OSError, ValueError):
+            # Resolution can fail on a broken or circular link, a permission error, or a
+            # path the platform rejects outright. Falling through leaves the LEXICAL
+            # answer, which is already in `matches` and is what this function returned
+            # before the filesystem check existed -- so a failure here costs the extra
+            # requirement this block might have added and nothing else. Reporting no gate
+            # script at all because a link could not be read would be the fail-open
+            # direction, which is what this whole block exists to avoid.
+            pass
+
+    # The walk may have broken out with nothing, and the climbed block above may have
+    # added nothing to it. Only now is "this path resolves to no file at all" true.
+    if not matches:
+        return []
+
     # The exact-match test uses the NORMALISED spelling: `scripts/./probe.py` resolves to
     # `scripts/probe.py`, and comparing against the raw text would never match it.
     return [normalised] if normalised in matches else matches
