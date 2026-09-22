@@ -61,21 +61,56 @@ jobs:
             exit 1
           fi
 
-          files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" --jq '.files[].filename')
+          # The high patterns, extracted ONCE and with jq's exit status CHECKED.
+          #
+          # This previously ran as `< <(jq -r '.high[]' <<< "$policy")` inside the file
+          # loop. Process substitution runs in a subshell whose exit status `set -e` never
+          # sees, so a malformed policy -- `high` renamed, null, or not an array -- yielded
+          # zero patterns and every path read as NORMAL, silently, while the comments above
+          # claimed the check failed closed. Measured on a policy with no `high` key:
+          # patterns read 0, high false, script still running. An empty `high: []` remains
+          # legitimate and still succeeds; what fails now is jq failing.
+          if ! patterns=$(jq -r '.high[]' <<< "$policy" 2>/dev/null); then
+            echo "::error::.claude/review-policy.json at base $BASE_SHA has no usable .high array — refusing to tier. Failing closed."
+            exit 1
+          fi
+
+          high=false
+
+          # Changed files via the PULL REQUEST endpoint under --paginate, not compare.
+          #
+          # `compare/$BASE...$HEAD` caps its `files` array at 300 for the whole comparison,
+          # returns them only on the first page, and signals nothing when it truncates. A
+          # pull request touching more than 300 files that also modified a HIGH path was
+          # therefore tiered NORMAL -- precisely the large refactor, vendored bump or
+          # generated-file regeneration that most needs the heavier review.
+          #
+          # The count is then checked against the pull request's own changed_files. If the
+          # enumeration falls short for ANY reason -- the endpoint's own 3000-file ceiling,
+          # a transient page error -- the pull request is tiered HIGH. An enumeration this
+          # job cannot complete resolves to MORE review, never less.
+          expected=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.changed_files')
+          files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+          retrieved=$(printf '%s\n' "$files" | grep -c . || true)
+          if [ "$retrieved" -ne "$expected" ]; then
+            echo "::warning::Enumerated $retrieved of $expected changed files; tiering HIGH rather than under-tiering on a partial list."
+            high=true
+          fi
 
           # Any high match tiers the PR HIGH (the policy's own rule). bash case patterns
           # match across '/', which is exactly the policy glob semantics used here.
-          high=false
-          while IFS= read -r file; do
-            [ -n "$file" ] || continue
-            while IFS= read -r pattern; do
-              # shellcheck disable=SC2254  # the pattern comes from the policy file by design
-              case "$file" in
-                $pattern) high=true ;;
-              esac
-            done < <(jq -r '.high[]' <<< "$policy")
-            $high && break
-          done <<< "$files"
+          if ! $high; then
+            while IFS= read -r file; do
+              [ -n "$file" ] || continue
+              while IFS= read -r pattern; do
+                # shellcheck disable=SC2254  # the pattern comes from the policy file by design
+                case "$file" in
+                  $pattern) high=true ;;
+                esac
+              done <<< "$patterns"
+              $high && break
+            done <<< "$files"
+          fi
 
           labelled=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name' | grep -cx 'review-high' || true)
 
