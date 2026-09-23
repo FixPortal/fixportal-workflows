@@ -21,9 +21,15 @@ changes is a control that gets switched off.
 
 Hash contract (shared with sync-canonical-asset-manifest.ps1, which writes what this
 reads): UTF-8 with BOM tolerated, line endings normalised CRLF/CR -> LF, hashed as UTF-8
-with no BOM. Only line endings and BOM are normalised -- git flips those per
+with no BOM. Line endings and BOM are normalised -- git flips those per
 .gitattributes, and a hash that red-lines a CRLF checkout is a false-positive factory.
-Everything else is exact, because exactness is the point.
+One more thing is masked: on a `uses: owner/repo@<40-hex sha>` line, the SHA and any
+trailing `# vX` comment are replaced by a fixed token before hashing. Dependabot bumps
+those pins in consuming repos on its own schedule; hashing them red-lined every bump of
+a canonical workflow. The action NAME stays hashed, and a non-SHA ref (`@v3`, `@main`)
+is not masked, so swapping the action or unpinning it still reads DIVERGED -- and
+assert_workflow_hygiene.py separately enforces SHA pinning. Everything else is exact,
+because exactness is the point.
 
 Pure Python, stdlib only, read-only, no network -- same reasons as
 assert_gate_coverage.py (a shell wrapper cannot survive CRLF; Python does not care).
@@ -34,6 +40,7 @@ the repository -- the control is broken, which must never read as "assets fine".
 """
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -55,9 +62,14 @@ file is a copy of a canonical scaffold-ci asset.
 """
 
 
+# Must stay equivalent to the generator's $PinnedUses pattern -- both sides of the contract.
+PINNED_USES = re.compile(r"^([ \t]*(?:-[ \t]+)?uses:[ \t]*[^\s@#]+@)[0-9a-f]{40}(?:[ \t]+#.*)?$", re.M)
+
+
 def asset_hash(path: Path) -> str:
     text = path.read_bytes().decode("utf-8-sig")
     normalised = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalised = PINNED_USES.sub(r"\1<pinned>", normalised)
     return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
 
@@ -72,7 +84,7 @@ def main() -> int:
         return 2
     try:
         manifest = json.loads(manifest_path.read_bytes().decode("utf-8-sig"))
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
         print(f"ERROR: {manifest_path} is not valid JSON: {exc}")
         print("The manifest may carry a hand-edit; fix it or regenerate it (see above).")
         return 2
@@ -96,15 +108,21 @@ def main() -> int:
         if rel_path.is_absolute() or ".." in rel_path.parts:
             print(f"ERROR: manifest entry escapes the repository: {rel}")
             return 2
-        target = root / rel
+        root_resolved = root.resolve()
+        target = (root / rel).resolve()
+        try:
+            target.relative_to(root_resolved)
+        except ValueError:
+            print(f"ERROR: manifest entry resolves outside the repository: {rel}")
+            return 2
         if not target.is_file():
             print(f"MISSING  {rel}  (listed in the manifest, absent from the tree)")
             failures += 1
             continue
         try:
             actual = asset_hash(target)
-        except UnicodeDecodeError:
-            print(f"ERROR    {rel}  (not valid UTF-8; cannot verify)")
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"ERROR    {rel}  (cannot read or decode; cannot verify: {exc})")
             failures += 1
             continue
         if actual == expected:
