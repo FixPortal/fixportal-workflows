@@ -157,8 +157,16 @@ jobs:
                   $pattern) high=true ;;
                 esac
                 case "$pattern" in
-                  '**/'*) # shellcheck disable=SC2254  # policy patterns intentionally act as globs
-                    case "$file" in ${pattern#\*\*/}) high=true ;; esac ;;
+                  '**/'*)
+                    # The suffix gets the mid-pattern retry too, so `**/a/**/b` also
+                    # matches `a/b` with zero directories at BOTH gaps.
+                    rest=${pattern#\*\*/}
+                    # shellcheck disable=SC2254  # policy patterns intentionally act as globs
+                    case "$file" in $rest) high=true ;; esac
+                    case "$rest" in
+                      *'/**/'*) # shellcheck disable=SC2254  # policy patterns intentionally act as globs
+                        case "$file" in ${rest//\/\*\*\//@(\/|\/*\/)}) high=true ;; esac ;;
+                    esac ;;
                 esac
                 case "$pattern" in
                   *'/**/'*) # shellcheck disable=SC2254  # policy patterns intentionally act as globs

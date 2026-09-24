@@ -2150,25 +2150,67 @@ def resolve_committed_paths(root, relative):
 
 
 DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|])\s*(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
-# The same, where an opening quote also starts a command: `bash -c "cd sub; ..."`.
-QUOTED_DIRECTORY_CHANGE = re.compile(r"""(?:^|[;&|"'])\s*(?:cd|pushd|Set-Location)\b""", re.IGNORECASE)
+# A directory change as a command INSIDE a quoted string, which may span lines.
+SEGMENT_DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|\n])\s*(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
+# The command a quoted string is an argument to, when that command only prints it.
+MESSAGE_COMMAND = re.compile(
+    r"(?:^|[;&|\n])\s*(?:echo|printf|Write-Host|Write-Output|Write-Warning|Write-Error|Write-Verbose)\b[^;&|\n]*$",
+    re.IGNORECASE,
+)
+
+
+def quoted_segments(text):
+    """(start, content) of every quoted span in `text`, by mask_quoted's quoting rules.
+
+    An unterminated quote runs to the end of the text, as it does in mask_quoted.
+    """
+    segments = []
+    quote = None
+    start = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote != "'" and char == BACKSLASH and index + 1 < len(text):
+            index += 2
+            continue
+        if quote is None and char in "'\"":
+            quote = char
+            start = index
+        elif quote == char:
+            segments.append((start, text[start + 1:index]))
+            quote = None
+        index += 1
+    if quote is not None:
+        segments.append((start, text[start + 1:]))
+    return segments
 
 
 def changes_directory(body):
     """True when a run body may change directory before a gate script runs.
 
-    Quoted text is masked first, so `echo "step1; cd scripts is deprecated"` is a message,
-    not a directory change (fixportal-agents-skills#263, item 2). A quoted COMMAND string
-    is different: `bash -c "cd sub; python3 scripts/gate.py"` really does run the script
-    from `sub`, and masking it would resolve the path against the root instead -- the
-    fail-open direction. So a directory change inside quotes still counts when that same
-    line also invokes a gate script.
+    Unquoted text is read line by line with quoted spans masked, so a `cd` inside
+    `echo "step1; cd scripts is deprecated"` is not a directory change
+    (fixportal-agents-skills#263, item 2).
+
+    A quoted COMMAND string is different: `bash -c "cd sub; python3 scripts/gate.py"`
+    really does run the script from `sub`, and masking it would resolve the path against
+    the root instead -- the fail-open direction. So every quoted string in the WHOLE body
+    is read as well (it may span lines of a block scalar), and one that both changes
+    directory and names a gate script counts -- unless it is only the argument of a
+    command that prints it (`echo`, `printf`, `Write-Host`, ...), where the same words are
+    a message. (Review follow-up on the fixportal-agents-skills#265 rollout.)
     """
     for line in body:
         if DIRECTORY_CHANGE.search(mask_quoted(line)):
             return True
-        if QUOTED_DIRECTORY_CHANGE.search(line) and GATE_SCRIPT.search(line):
-            return True
+    text = "\n".join(body)
+    masked = mask_quoted(text)
+    for start, content in quoted_segments(text):
+        if not (SEGMENT_DIRECTORY_CHANGE.search(content) and GATE_SCRIPT.search(content)):
+            continue
+        if MESSAGE_COMMAND.search(masked[:start]):
+            continue
+        return True
     return False
 
 
