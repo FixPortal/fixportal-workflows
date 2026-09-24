@@ -75,7 +75,7 @@ CONDITION_REFINEMENT = re.compile(rf"needs\.({ID})\.result!=['\"]skipped['\"]")
 BACKSLASH = "\\"
 DIRECTORY_CHANGE = re.compile(
     r"(?:^|[;&|(){}`]|\$\(|\b(?:then|do|else|if|elif|while|until)\b|!)\s*"
-    r"(?:cd|pushd|popd|chdir|Set-Location|Push-Location|Pop-Location|sl)\b",
+    r"(?:cd|pushd|popd|chdir|Set-Location|Push-Location|Pop-Location|sl)\b(?!\.\w)",
     re.IGNORECASE,
 )
 SHELL_ARGUMENT_OPTIONS = {"-o", "-O"}
@@ -90,6 +90,7 @@ MESSAGE_COMMAND = re.compile(
 
 def shell_c_arguments(line):
     """Return shell `-c` bodies and whether an invocation could not be classified."""
+    bodies = []
     try:
         tokens = shlex.split(line)
     except ValueError:
@@ -100,13 +101,24 @@ def shell_c_arguments(line):
             basename = re.sub(r"\.(?:exe|com|cmd|bat)$", "", basename)
             if basename not in ("bash", "sh", "pwsh", "powershell"):
                 continue
-            for option in tokens[index + 1 :]:
+            for option_index, option in enumerate(tokens[index + 1 :], start=index + 1):
                 if option in separators:
                     break
-                if option.lower() in ("-encodedcommand", "-enc", "-ec", "-e") or re.fullmatch(r"-[a-z]*c[a-z]*", option, re.IGNORECASE):
+                if not option.startswith("-"):
+                    break
+                if basename in ("pwsh", "powershell") and (
+                    option.lower() in ("-encodedcommand", "-enc", "-ec", "-e")
+                    or re.fullmatch(r"-[a-z]*c[a-z]*", option, re.IGNORECASE)
+                ):
                     return [], True
-        return [], False
-    bodies = []
+                if basename in ("bash", "sh") and re.fullmatch(
+                    r"-[a-z]*c[a-z]*", option, re.IGNORECASE
+                ):
+                    if option_index + 1 >= len(tokens):
+                        return [], True
+                    bodies.append(" ".join(tokens[option_index + 1 :]))
+                    break
+        return bodies, False
     for index, token in enumerate(tokens):
         basename = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
         basename = re.sub(r"\.(?:exe|com|cmd|bat)$", "", basename)
@@ -123,10 +135,33 @@ def shell_c_arguments(line):
             if option in SHELL_FLAG_OPTIONS or (option.startswith("--") and "=" in option):
                 cursor += 1
                 continue
-            if option.lower() in ("-encodedcommand", "-enc", "-ec", "-e"):
-                return bodies, True
-            if basename in ("pwsh", "powershell") and option.lower().startswith("-workingdirectory"):
-                return bodies, True
+            if basename in ("pwsh", "powershell"):
+                option = option.lower()
+                option_name = option.split("=", 1)[0]
+                if option in ("-encodedcommand", "-enc", "-ec", "-e", "-encodedarguments", "-commandwithargs", "-cwa"):
+                    return bodies, True
+                if option == "-file" or option == "-f":
+                    break
+                if option in ("-workingdirectory", "-wd") or option.startswith("-workingdirectory="):
+                    return bodies, True
+                if option in ("-command", "-c"):
+                    if cursor + 1 >= len(tokens):
+                        return bodies, True
+                    bodies.append(" ".join(tokens[cursor + 1 :]))
+                    break
+                if option_name in ("-configurationname", "-config", "-configurationfile", "-custompipename", "-executionpolicy", "-ep", "-ex", "-inputformat", "-inp", "-if", "-outputformat", "-o", "-of", "-settingsfile", "-settings", "-windowstyle", "-w"):
+                    if "=" in option:
+                        cursor += 1
+                    elif cursor + 1 < len(tokens):
+                        cursor += 2
+                    else:
+                        return bodies, True
+                    continue
+                if option in ("-interactive", "-i", "-login", "-l", "-mta", "-noexit", "-noe", "-nologo", "-nol", "-noninteractive", "-noni", "-noprofile", "-nop", "-noprofileloadtime", "-sshservermode", "-sshs", "-sta", "-version", "-v", "-help", "-h", "-?"):
+                    cursor += 1
+                    continue
+                if option.startswith("-"):
+                    return bodies, True
             if option.lower() in ("-command", "-c"):
                 if cursor + 1 >= len(tokens):
                     return bodies, True
@@ -141,8 +176,6 @@ def shell_c_arguments(line):
                 cursor += 1
                 continue
             if option.startswith("-"):
-                return bodies, True
-            if any(re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", later) for later in tokens[cursor + 1 :]):
                 return bodies, True
             break
     return bodies, False
@@ -460,7 +493,6 @@ def working_directory_value(line):
             sys.exit("cannot verify gate script paths with an unresolved working-directory expression")
         return unquoted
     sys.exit("cannot verify gate script paths with an unsupported working-directory value")
-    return None
 
 
 def working_directory_lines(lines):
@@ -469,7 +501,7 @@ def working_directory_lines(lines):
     stack = []
     candidates = []
     for index, line in enumerate(lines):
-        if index in payload:
+        if index in payload or COMMENT_OR_BLANK.match(line):
             continue
         indent = len(line) - len(line.lstrip(" "))
         while stack and stack[-1][0] >= indent:
@@ -574,30 +606,114 @@ def writes_bash_env_to_github_env(body):
     assignment = re.compile(r"\bBASH_ENV\s*=", re.IGNORECASE)
     environment_file = re.compile(r"\$(?:\{GITHUB_ENV\}|GITHUB_ENV|env:GITHUB_ENV)", re.IGNORECASE)
 
+    def split_shell_commands(tokens):
+        commands = [[]]
+        for token in tokens:
+            if token in (";", "&", "&&", "||"):
+                commands.append([])
+            else:
+                commands[-1].append(token)
+        return commands
+
+    def split_shell_pipeline(tokens):
+        stages = [[]]
+        for token in tokens:
+            if token in ("|", "|&"):
+                stages.append([])
+            else:
+                stages[-1].append(token)
+        return stages
+
+    def command_index(tokens):
+        for index, token in enumerate(tokens):
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+                continue
+            return index
+        return len(tokens)
+
+    def command_name(tokens):
+        index = command_index(tokens)
+        return tokens[index].rsplit("/", 1)[-1].lower() if index < len(tokens) else ""
+
+    def writes_environment_file(tokens):
+        if any(
+            token in (">", ">>", "&>", "&>>")
+            and index + 1 < len(tokens)
+            and environment_file.search(tokens[index + 1])
+            for index, token in enumerate(tokens)
+        ):
+            return True
+        if command_name(tokens) not in (
+            "tee", "tee-object", "add-content", "set-content", "out-file"
+        ):
+            return False
+        return any(environment_file.search(argument) for argument in tokens[1:])
+
+    def pipeline_writes_assignment(tokens):
+        input_has_assignment = False
+        pass_through = ("tee", "tee-object", "cat")
+        input_writers = (
+            "tee", "tee-object", "add-content", "set-content", "out-file", "cat"
+        )
+        for stage in split_shell_pipeline(tokens):
+            if not stage:
+                continue
+            name = command_name(stage)
+            stage_has_assignment = any(
+                assignment.search(token) for token in stage[command_index(stage) + 1 :]
+            )
+            writes_environment = writes_environment_file(stage)
+            if writes_environment and (
+                stage_has_assignment
+                or (name in input_writers and input_has_assignment)
+            ):
+                return True
+            if name not in pass_through:
+                input_has_assignment = stage_has_assignment
+        return False
+
+    def pipeline_outputs_assignment(tokens):
+        output_has_assignment = False
+        for stage in split_shell_pipeline(tokens):
+            if not stage:
+                continue
+            name = command_name(stage)
+            if name not in ("tee", "tee-object", "cat"):
+                output_has_assignment = any(
+                    assignment.search(token)
+                    for token in stage[command_index(stage) + 1 :]
+                )
+        return output_has_assignment
+
     def line_writes_environment_file(line):
         try:
-            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|<>")
             lexer.whitespace_split = True
-            commands = [[]]
-            for token in lexer:
-                if re.fullmatch(r"[;&|]+", token):
-                    commands.append([])
-                else:
-                    commands[-1].append(token)
+            commands = split_shell_commands(list(lexer))
         except ValueError:
-            return bool(assignment.search(line) and environment_file.search(line))
-        return any(
-            any(assignment.search(token) for token in command)
-            and any(environment_file.search(token) for token in command)
-            for command in commands
-        )
+            return bool(
+                assignment.search(line)
+                and environment_file.search(line)
+                and re.search(r"(?:>>?|&>>?)\s*[\"']?\$(?:\{GITHUB_ENV\}|GITHUB_ENV|env:GITHUB_ENV)", line, re.IGNORECASE)
+            )
+        return any(pipeline_writes_assignment(command) for command in commands)
 
     def group_writes_environment_file(commands, redirect):
         target = re.match(r'''\s*(?:"([^"]*)"|'([^']*)'|([^\s;|&]+))''', redirect or "")
         if not target:
             return False
         destination = next(value for value in target.groups() if value is not None)
-        return bool(assignment.search(commands) and environment_file.search(destination))
+        if not environment_file.search(destination):
+            return False
+        try:
+            lexer = shlex.shlex(commands, posix=True, punctuation_chars=";&|")
+            lexer.whitespace_split = True
+            return any(
+                pipeline_outputs_assignment(command)
+                for command in split_shell_commands(list(lexer))
+            )
+        except ValueError:
+            return bool(assignment.search(commands))
 
     heredoc = None
     grouped_write = None
@@ -606,10 +722,10 @@ def writes_bash_env_to_github_env(body):
             closing = re.search(r"(?:^|\s)\}\s*(?:(>>|>)\s*(.*?)\s*)?$", line)
             if closing:
                 commands = "\n".join(grouped_write + [line[: closing.start()]])
-                if (
-                    closing.group(1)
-                    and group_writes_environment_file(commands, closing.group(2))
-                ):
+                redirect_hit = closing.group(1) and group_writes_environment_file(
+                    commands, closing.group(2)
+                )
+                if redirect_hit:
                     return True
                 grouped_write = None
             else:
@@ -626,7 +742,17 @@ def writes_bash_env_to_github_env(body):
         if line_writes_environment_file(line):
             return True
         marker = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", line)
-        if marker and environment_file.search(line):
+        try:
+            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|<>")
+            lexer.whitespace_split = True
+            tokens = list(lexer)
+        except ValueError:
+            tokens = []
+        if marker and any(
+            any(token in ("<<", "<<-") for token in command)
+            and writes_environment_file(command)
+            for command in split_shell_commands(tokens)
+        ):
             heredoc = marker.group(2)
             continue
         opening = re.search(r"(?:^|\s)\{\s*", line)
@@ -2572,15 +2698,6 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
 
     with open(workflow_path, encoding="utf-8-sig") as handle:
         lines = handle.readlines()
-    if has_inline_bash_env(lines) or any(re.match(
-        r"^\s*(?:['\"]?BASH_ENV['\"]?\s*:|env\s*:\s*\{[^}]*['\"]?BASH_ENV['\"]?\s*:)",
-        strip_comment(line),
-        re.IGNORECASE,
-    ) for line in lines):
-        sys.exit(
-            f"{workflow_path}: BASH_ENV can load shell functions that override the gate's "
-            "accepted exit command. Remove the override or use a separately verified gate shell."
-        )
     jobs, needs, conditional = read_gate_contract(lines, gate_job)
 
     if not jobs:
@@ -2591,6 +2708,16 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
         sys.exit(f"{workflow_path}: no jobs found -- refusing to report coverage over nothing.")
     if gate_job not in jobs:
         return False
+
+    if has_inline_bash_env(lines) or any(re.match(
+        r"^\s*(?:['\"]?BASH_ENV['\"]?\s*:|env\s*:\s*\{[^}]*['\"]?BASH_ENV['\"]?\s*:)",
+        strip_comment(line),
+        re.IGNORECASE,
+    ) for line in lines):
+        sys.exit(
+            f"{workflow_path}: BASH_ENV can load shell functions that override the gate's "
+            "accepted exit command. Remove the override or use a separately verified gate shell."
+        )
 
     repository = repository_root(workflow_path)
     if repository is not None and any(
