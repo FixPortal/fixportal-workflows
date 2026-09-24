@@ -2149,10 +2149,19 @@ def resolve_committed_paths(root, relative):
     return [normalised] if normalised in matches else matches
 
 
-DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|])\s*(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
+# A directory change at a COMMAND position: line start, after a separator, inside a
+# subshell or brace group (`(cd x && ...)`, `{ cd x; ...; }`), after `!`, or after a
+# compound keyword (`if cd x; then`). Those are ordinary ways to write one, so missing them
+# let a gate script run from a directory the checker never considered.
+# (fixportal-agents-skills#266 rollout review.)
+_COMMAND_START = r"(?:^|[;&|({!]|\b(?:then|do|else|if|elif|while|until)\b)"
+DIRECTORY_CHANGE = re.compile(_COMMAND_START + r"\s*(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
 # A directory change as a command INSIDE a quoted string, which may span lines. An opening
 # `$(` or backtick starts a command too: a substitution runs even inside printed text.
-SEGMENT_DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|\n(`])\s*(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
+SEGMENT_DIRECTORY_CHANGE = re.compile(
+    r"(?:^|[;&|\n(`{!]|\b(?:then|do|else|if|elif|while|until)\b)\s*(?:cd|pushd|Set-Location)\b",
+    re.IGNORECASE,
+)
 # A single pipe (not `||`), which feeds printed text onward to another command.
 PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 # The command a quoted string is an argument to, when that command only prints it.
@@ -2437,8 +2446,10 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
     # (fixportal-agents-skills#263, item 4). And block-scalar `run:` payloads are skipped:
     # a heredoc line starting `BASH_ENV:` is shell text, not an env key (item 1).
     payload_indexes = run_payload_indexes(lines)
+    # Quoted keys admitted, as for every other key this checker reads: `"BASH_ENV":` is the
+    # same env key, and missing it let the override through.
     if any(
-        re.match(r"^\s*BASH_ENV\s*:", strip_comment(line))
+        re.match(r"""^\s*(?:'BASH_ENV'|"BASH_ENV"|BASH_ENV)\s*:""", strip_comment(line))
         for index, line in enumerate(lines)
         if index not in payload_indexes
     ):
