@@ -186,7 +186,8 @@ BLOCK_SCALAR = re.compile(r"^[|>](?:[0-9][+-]?|[+-][0-9]?)?$")
 # "not a workflow, skipped" and counted GREEN -- so a whole workflow's jobs escaped
 # gate coverage on how its key was punctuated. Same fail-OPEN class as the quoted job
 # key below, one level up.
-JOBS_KEY = re.compile(r"""^(?:'jobs'|"jobs"|jobs)\s*:\s*$""")
+JOBS_KEY = re.compile(r"""^(?:'jobs'|"jobs"|jobs)\s*:\s*(?:$|\{)""")
+JOBS_DECL = re.compile(r"""^(?:'jobs'|"jobs"|jobs)\s*:""")
 
 
 def is_block_scalar_header(raw):
@@ -510,8 +511,10 @@ def conditional_jobs(lines, jobs, job_indent):
         if indent is None:
             continue
         job_if = key_pattern(indent, "if")
-        if any(job_if.match(lines[i].rstrip("\r\n")) for i in range(start + 1, end)):
-            conditional.add(job_id)
+        for i in range(start + 1, end):
+            match = job_if.match(lines[i].rstrip("\r\n"))
+            if match and normalise_condition(match.group(1)) not in ("always()", "!cancelled()"):
+                conditional.add(job_id)
     return conditional
 
 
@@ -1818,7 +1821,7 @@ def run_payload_indexes(lines):
 
 
 def delegated_run_bodies(root, ref, visited):
-    """Yield run-body lines from a local composite action or reusable workflow."""
+    """Yield run bodies and their action-level working directories."""
     relative = ref[2:]
     target = root / relative
     if target.is_dir():
@@ -1853,7 +1856,13 @@ def delegated_run_bodies(root, ref, visited):
             body, index = continuation_lines(lines, index, len(match.group(1)))
         else:
             body, index = ([value] if value else []), index + 1
-        yield from body
+        if body:
+            directories = set()
+            for line in lines:
+                workdir = re.match(r"^\s*working-directory\s*:\s*['\"]?([^\s#'\"]+)", strip_comment(line))
+                if workdir:
+                    directories.add(workdir.group(1).replace("\\", "/").rstrip("/"))
+            yield body, directories
     payload_indexes = run_payload_indexes(lines)
     for index, line in enumerate(lines):
         if index in payload_indexes:
@@ -1902,15 +1911,16 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root):
             else:
                 body, index = ([value] if value else []), index + 1
             for body_line in body:
-                yield job_id, body_line
+                yield job_id, body_line, body, set()
         payload_indexes = run_payload_indexes(block)
         for index, line in enumerate(block):
             if index in payload_indexes:
                 continue
             match = LOCAL_USES.match(line)
             if match:
-                for body_line in delegated_run_bodies(root, match.group(1), set()):
-                    yield job_id, body_line
+                for delegated_body, directories in delegated_run_bodies(root, match.group(1), set()):
+                    for body_line in delegated_body:
+                        yield job_id, body_line, delegated_body, directories
         pending.extend(job_needs(lines, jobs, job_id, job_indent) - seen)
 
 
@@ -2063,12 +2073,79 @@ def gate_script_paths(lines, jobs, needs, gate_job, root):
     disk, by resolve_committed_paths.
     """
     found = {}
-    for job_id, body_line in gated_run_bodies(lines, jobs, needs, gate_job, root):
+    for job_id, body_line, body, delegated_directories in gated_run_bodies(lines, jobs, needs, gate_job, root):
         for match in GATE_SCRIPT.finditer(body_line):
             relative = match.group(1).replace("\\", "/")
-            for committed in resolve_committed_paths(root, relative):
-                found.setdefault(committed, job_id)
+            if any(re.search(r"(?:^|[;&|])\s*(?:cd|pushd|Set-Location)\b", line, re.IGNORECASE) for line in body):
+                sys.exit(f"{root}: cannot verify gate script paths after a directory change in job '{job_id}'; use working-directory:")
+            # Resolve a single job/step working-directory declaration. Multiple values
+            # are ambiguous to this line-oriented parser, so fail closed instead of
+            # silently checking the repository-root spelling.
+            block = job_block(lines, jobs, job_id)
+            directories = set()
+            job_start = jobs[job_id]
+            # Workflow-level lines end at the first job. Values in sibling jobs
+            # cannot affect this command; step-level and job-level values inside this
+            # block can, so retain every plausible path spelling.
+            for line in lines[:min(jobs.values())] + block:
+                workdir = re.match(r"^\s*(?:working-directory)\s*:\s*['\"]?([^\s#'\"]+)", strip_comment(line))
+                if workdir:
+                    directories.add(workdir.group(1).replace("\\", "/").rstrip("/"))
+            candidates = {relative} | {directory + "/" + relative for directory in directories if directory}
+            candidates.update(directory + "/" + relative for directory in delegated_directories if directory)
+            for candidate in candidates:
+                for committed in resolve_committed_paths(root, candidate):
+                    found.setdefault(committed, job_id)
+    # Local actions and reusable workflows execute from the PR checkout too. Their
+    # own files therefore need HIGH coverage even when their run bodies contain no
+    # directly named script.
+    job_indent = len(lines[jobs[gate_job]]) - len(lines[jobs[gate_job]].lstrip(" "))
+    pending = list(set(needs) | {gate_job})
+    seen = set()
+    while pending:
+        job_id = pending.pop()
+        if job_id in seen or job_id not in jobs:
+            continue
+        seen.add(job_id)
+        block = job_block(lines, jobs, job_id)
+        payload_indexes = run_payload_indexes(block)
+        for index, line in enumerate(block):
+            match = LOCAL_USES.match(line)
+            if match and index not in payload_indexes and match.group(1).startswith(("./", "$/")):
+                for relative in local_action_paths(root, match.group(1)):
+                    found.setdefault(relative, job_id)
+        pending.extend(job_needs(lines, jobs, job_id, job_indent) - seen)
     return found
+
+
+def local_action_paths(root, ref, visited=None):
+    """Action manifests reachable from a local composite action reference."""
+    if visited is None:
+        visited = set()
+    target = root / ref[2:]
+    if target.is_dir():
+        target = next((target / name for name in ("action.yml", "action.yaml") if (target / name).is_file()), None)
+    if target is None or not target.is_file():
+        return set()
+    target = target.resolve()
+    if target in visited:
+        return set()
+    visited.add(target)
+    try:
+        relative = target.relative_to(root.resolve()).as_posix()
+    except ValueError:
+        sys.exit(f"{root}: local action escapes repository: {ref}")
+    paths = {relative}
+    lines = target.read_text(encoding="utf-8-sig").splitlines()
+    using = resolve_runs_using(lines, target)
+    if using is not None and using != "composite":
+        return paths
+    payload_indexes = run_payload_indexes(lines)
+    for index, line in enumerate(lines):
+        match = LOCAL_USES.match(line) if index not in payload_indexes else None
+        if match and match.group(1).startswith(("./", "$/")):
+            paths.update(local_action_paths(root, match.group(1), visited))
+    return paths
 
 
 def assert_gate_scripts(workflow_path, lines, jobs, needs, gate_job):
@@ -2109,6 +2186,8 @@ def assert_gate_scripts(workflow_path, lines, jobs, needs, gate_job):
         # report, and it already does. Duplicating it here would print the same breach
         # twice and, worse, make THIS check the one that fails on a repository whose
         # actual problem is elsewhere.
+        return
+    if not isinstance(policy, dict):
         return
     high = policy.get("high")
     if not isinstance(high, list):
@@ -2158,9 +2237,16 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
 
     with open(workflow_path, encoding="utf-8-sig") as handle:
         lines = handle.readlines()
+    if any(re.match(r"^\s*BASH_ENV\s*:", strip_comment(line)) for line in lines):
+        sys.exit(
+            f"{workflow_path}: BASH_ENV can load shell functions that override the gate's "
+            "accepted exit command. Remove the override or use a separately verified gate shell."
+        )
     jobs, needs, conditional = read_gate_contract(lines, gate_job)
 
     if not jobs:
+        if any(JOBS_DECL.match(strip_comment(line).rstrip()) for line in lines):
+            sys.exit(f"{workflow_path}: flow-style or empty 'jobs' mapping is unsupported; refusing to skip coverage.")
         if on_empty == "skip":
             return None
         sys.exit(f"{workflow_path}: no jobs found -- refusing to report coverage over nothing.")
@@ -2176,6 +2262,44 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             f"{workflow_path}: not gated by '{gate_job}': {', '.join(missing)}.\n"
             f"Add each to the '{gate_job}' needs: list, or to GATE_EXEMPT if it is "
             "deliberately not merge-blocking."
+        )
+
+    # A typo in the gate's needs: would otherwise surface as a KeyError traceback from the
+    # feeder lookup below. GitHub rejects such a workflow too, so say so plainly.
+    undefined = sorted(set(needs) - set(jobs))
+    if undefined:
+        sys.exit(f"{workflow_path}: '{gate_job}' needs undefined job(s): {', '.join(undefined)}.")
+
+    # A feeder can be skipped transitively when it depends on a conditional or
+    # explicitly exempt job. Since the gate treats skipped as success, require an
+    # always-running condition on that feeder before accepting the chain.
+    unsafe_feeders = set()
+    for feeder in set(needs) - {gate_job}:
+        feeder_start = jobs[feeder]
+        feeder_end = min((i for i in jobs.values() if i > feeder_start), default=len(lines))
+        feeder_indent = job_body_indent(lines, jobs, feeder, job_indent)
+        feeder_if = key_pattern(feeder_indent, "if") if feeder_indent is not None else None
+        condition = next((normalise_condition(match.group(1))
+                          for i in range(feeder_start + 1, feeder_end)
+                          if feeder_if and (match := feeder_if.match(lines[i].rstrip("\r\n")))), "")
+        if condition in ("always()", "!cancelled()"):
+            continue
+        pending = list(job_needs(lines, jobs, feeder, job_indent))
+        visited = set()
+        while pending:
+            dependency = pending.pop()
+            if dependency in visited or dependency not in jobs:
+                continue
+            visited.add(dependency)
+            if dependency in exempt or dependency in conditional:
+                unsafe_feeders.add(feeder)
+            pending.extend(job_needs(lines, jobs, dependency, job_indent) - visited)
+    if unsafe_feeders:
+        sys.exit(
+            f"{workflow_path}: gate feeder dependency chain reaches conditional or exempt "
+            f"job(s): {', '.join(sorted(unsafe_feeders))}. A skipped feeder passes the gate; "
+            "add `if: always()` or `if: ${{ !cancelled() }}` to the dependent feeder, or remove "
+            "the unsafe dependency."
         )
 
     # The gate counts `skipped` as a pass, so a job feeding it must be unconditional:
@@ -2250,6 +2374,7 @@ def main(argv):
     files = sorted(
         path.as_posix()
         for path in list(Path(target).glob("*.yml")) + list(Path(target).glob("*.yaml"))
+        if path.is_file()
     )
     if not files:
         sys.exit(f"{target}: no workflow files found -- refusing to report coverage over nothing.")
