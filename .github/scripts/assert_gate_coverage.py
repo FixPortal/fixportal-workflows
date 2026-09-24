@@ -2156,12 +2156,14 @@ def resolve_committed_paths(root, relative):
 # (fixportal-agents-skills#266 rollout review.)
 # A compound keyword starts a command only when it is itself at a command position, so the
 # keywords are an optional chain AFTER a real command start: `echo then cd sub` is an echo.
-_KEYWORDS = r"(?:(?:then|do|else|if|elif|while|until)\s+)*"
-DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|({!])\s*" + _KEYWORDS + r"(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
+# `!` is the same: a separate token at a command position (`! cd x`), not a character
+# inside an argument (`echo hi! cd x`).
+_KEYWORDS = r"(?:(?:then|do|else|if|elif|while|until|!)\s+)*"
+DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|({])\s*" + _KEYWORDS + r"(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
 # A directory change as a command INSIDE a quoted string, which may span lines. An opening
 # `$(` or backtick starts a command too: a substitution runs even inside printed text.
 SEGMENT_DIRECTORY_CHANGE = re.compile(
-    r"(?:^|[;&|\n(`{!])\s*" + _KEYWORDS + r"(?:cd|pushd|Set-Location)\b",
+    r"(?:^|[;&|\n(`{])\s*" + _KEYWORDS + r"(?:cd|pushd|Set-Location)\b",
     re.IGNORECASE,
 )
 # A single pipe (not `||`), which feeds printed text onward to another command.
