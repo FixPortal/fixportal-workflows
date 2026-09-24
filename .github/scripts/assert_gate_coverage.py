@@ -2153,6 +2153,8 @@ DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|])\s*(?:cd|pushd|Set-Location)\b", re.I
 # A directory change as a command INSIDE a quoted string, which may span lines. An opening
 # `$(` or backtick starts a command too: a substitution runs even inside printed text.
 SEGMENT_DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|\n(`])\s*(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
+# A single pipe (not `||`), which feeds printed text onward to another command.
+PIPE = re.compile(r"(?<!\|)\|(?!\|)")
 # The command a quoted string is an argument to, when that command only prints it.
 MESSAGE_COMMAND = re.compile(
     r"(?:^|[;&|\n])\s*(?:echo|printf|Write-Host|Write-Output|Write-Warning|Write-Error|Write-Verbose)\b[^;&|\n]*$",
@@ -2161,7 +2163,9 @@ MESSAGE_COMMAND = re.compile(
 
 
 def quoted_segments(text):
-    """(start, content) of every quoted ARGUMENT in `text`, by mask_quoted's quoting rules.
+    """(start, end, content) of every quoted ARGUMENT in `text`, by mask_quoted's rules.
+
+    `start` is the opening quote's index and `end` the closing quote's.
 
     Spans that touch with nothing between them (`"cd sub; "'python3 x.py'`) are one shell
     argument, so they are returned as one segment. An unterminated quote runs to the end
@@ -2183,15 +2187,15 @@ def quoted_segments(text):
         elif quote == char:
             content = text[start + 1:index]
             if segments and start == last_end + 1:
-                previous_start, previous = segments.pop()
-                segments.append((previous_start, previous + content))
+                previous_start, _, previous = segments.pop()
+                segments.append((previous_start, index, previous + content))
             else:
-                segments.append((start, content))
+                segments.append((start, index, content))
             last_end = index
             quote = None
         index += 1
     if quote is not None:
-        segments.append((start, text[start + 1:]))
+        segments.append((start, len(text), text[start + 1:]))
     return segments
 
 
@@ -2208,9 +2212,12 @@ def changes_directory(body):
     is read as well (it may span lines of a block scalar), and one that both changes
     directory and names a gate script counts -- unless it is only the argument of a
     command that prints it (`echo`, `printf`, `Write-Host`, ...), where the same words are
-    a message. A printed string holding a command substitution (`$(...)` or backticks) is
-    not exempt, because the substitution runs. Adjacent quoted spans are read as the one
-    argument they are. (Review follow-up on the fixportal-agents-skills#265 rollout.)
+    a message. The exemption covers PLAINLY printed text only: not a string holding a
+    command substitution (`$(...)` or backticks), not one inside a substitution opened
+    earlier on its line (`echo $(bash -c "cd sub; ...")`), and not one piped onward
+    (`echo "cd sub; ..." | bash`) -- each of those runs the text. Adjacent quoted spans
+    are read as the one argument they are. (Review follow-up on the
+    fixportal-agents-skills#265 rollout.)
 
     THE BOUNDARY, stated so a pass is not read as more than it is: this is a line-level
     heuristic, not a shell parser. It covers the ways a workflow author ordinarily writes a
@@ -2225,11 +2232,19 @@ def changes_directory(body):
             return True
     text = "\n".join(body)
     masked = mask_quoted(text)
-    for start, content in quoted_segments(text):
+    for start, end, content in quoted_segments(text):
         if not (SEGMENT_DIRECTORY_CHANGE.search(content) and GATE_SCRIPT.search(content)):
             continue
-        substitution = "$(" in content or "`" in content
-        if MESSAGE_COMMAND.search(masked[:start]) and not substitution:
+        line_start = text.rfind("\n", 0, start) + 1
+        line_end = text.find("\n", end)
+        before = text[line_start:start]
+        after = masked[end + 1:line_end if line_end != -1 else len(text)]
+        executed = (
+            "$(" in content or "`" in content          # a substitution inside the string
+            or "$(" in before or "`" in before         # the string sits inside a substitution
+            or PIPE.search(after) is not None          # the string is piped onward
+        )
+        if MESSAGE_COMMAND.search(masked[:start]) and not executed:
             continue
         return True
     return False
