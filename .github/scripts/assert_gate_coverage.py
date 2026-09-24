@@ -2237,7 +2237,9 @@ def changes_directory(body):
             continue
         line_start = text.rfind("\n", 0, start) + 1
         line_end = text.find("\n", end)
-        before = text[line_start:start]
+        # MASKED, so an earlier string that already closed on this line (`echo "$(date)";`)
+        # cannot leak its `$(` into this one's test; an unquoted `$(` stays visible.
+        before = masked[line_start:start]
         after = masked[end + 1:line_end if line_end != -1 else len(text)]
         executed = (
             "$(" in content or "`" in content          # a substitution inside the string
