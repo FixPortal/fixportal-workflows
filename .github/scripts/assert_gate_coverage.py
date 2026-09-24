@@ -2159,11 +2159,17 @@ def resolve_committed_paths(root, relative):
 # `!` is the same: a separate token at a command position (`! cd x`), not a character
 # inside an argument (`echo hi! cd x`).
 _KEYWORDS = r"(?:(?:then|do|else|if|elif|while|until|!)\s+)*"
-DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|({])\s*" + _KEYWORDS + r"(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
+# The command word ends where a shell word ends, at whitespace or a metacharacter, not at
+# any `\b`: `${cd:-x}`, `${cd}` and `{cd,ls}` name a `cd` without running one, and a `{`
+# anchor followed by `\b` read all three as a directory change. A redirection ends the word
+# too (`cd>log` is `cd` to $HOME); `#` does not, since `cd#x` is one word, not a comment.
+_DIRECTORY_COMMAND = r"(?:cd|pushd|Set-Location)(?=[\s;&|()`<>]|$)"
+# An unquoted backtick opens a command substitution just as `$(` does, so it anchors too.
+DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|(`{])\s*" + _KEYWORDS + _DIRECTORY_COMMAND, re.IGNORECASE)
 # A directory change as a command INSIDE a quoted string, which may span lines. An opening
 # `$(` or backtick starts a command too: a substitution runs even inside printed text.
 SEGMENT_DIRECTORY_CHANGE = re.compile(
-    r"(?:^|[;&|\n(`{])\s*" + _KEYWORDS + r"(?:cd|pushd|Set-Location)\b",
+    r"(?:^|[;&|\n(`{])\s*" + _KEYWORDS + _DIRECTORY_COMMAND,
     re.IGNORECASE,
 )
 # A single pipe (not `||`), which feeds printed text onward to another command.
@@ -2212,6 +2218,18 @@ def quoted_segments(text):
     return segments
 
 
+def opening_backticks_only(text):
+    """`text` with every CLOSING backtick blanked, so only an opening one anchors a command.
+
+    Backticks pair up, and only the first of each pair starts a substitution: in
+    `` echo `pwd` cd sub `` the second `cd` is an argument to echo, not a command.
+    The placeholder is not whitespace: a substitution closing at the start of a later line
+    must not leave that line's `cd` looking like the first word of a command.
+    """
+    parts = text.split("`")
+    return "".join(part + ("`" if index % 2 == 0 else "_") for index, part in enumerate(parts[:-1])) + parts[-1]
+
+
 def changes_directory(body):
     """True when a run body may change directory before a gate script runs.
 
@@ -2240,13 +2258,16 @@ def changes_directory(body):
     the workflow change that introduces it is itself HIGH-tier and reviewed, and review is
     the control for intent. Further spellings of that kind are declined, not chased.
     """
-    for line in body:
-        if DIRECTORY_CHANGE.search(mask_quoted(line)):
+    # Backtick pairs are counted across the whole body, not per line: a substitution may
+    # close on a later line, and its closing backtick must not read as an opening one.
+    unquoted = opening_backticks_only("\n".join(mask_quoted(line) for line in body))
+    for line in unquoted.split("\n"):
+        if DIRECTORY_CHANGE.search(line):
             return True
     text = "\n".join(body)
     masked = mask_quoted(text)
     for start, end, content in quoted_segments(text):
-        if not (SEGMENT_DIRECTORY_CHANGE.search(content) and GATE_SCRIPT.search(content)):
+        if not (SEGMENT_DIRECTORY_CHANGE.search(opening_backticks_only(content)) and GATE_SCRIPT.search(content)):
             continue
         line_start = text.rfind("\n", 0, start) + 1
         line_end = text.find("\n", end)
