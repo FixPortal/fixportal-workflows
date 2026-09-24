@@ -1,5 +1,7 @@
 name: Review tier
 
+# Existing open PRs converge on their next event; policy or workflow changes do not
+# sweep them. A later PR event reclassifies against the then-current base policy.
 # Server-side enforcement of the HIGH tier. CodeRabbit is label-triggered
 # (.coderabbit.yaml -> auto_review.labels: ["review-high"]), and the only other thing
 # applying that label was a local PR-create hook on one workstation — so a PR that
@@ -21,9 +23,17 @@ name: Review tier
 # code — every read is an API call against the base SHA, and the only writes are
 # label operations. The gate fails this workflow if a checkout ever appears.
 
+# `edited` is in the type list because RETARGETING A PULL REQUEST IS NOT A HEAD CHANGE.
+# Moving a PR's base onto this branch changes both the merge base (so the changed-file
+# set changes) and which policy file is read — and it emits `edited`, never
+# `synchronize`. Without it, a PR retargeted onto a protected branch kept whatever tier
+# it was given against its old base until someone happened to push again. `edited` also
+# fires on title and body edits, which costs one cheap API-only run; the concurrency
+# group below collapses the duplicates. Applying the label emits `labeled`, which is not
+# in this list, so the workflow cannot retrigger itself.
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, edited]
     branches: [main]
 
 permissions:
@@ -33,7 +43,8 @@ permissions:
 
 concurrency:
   group: review-tier-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  # Let the latest PR event finish so an earlier run cannot win the label race.
+  cancel-in-progress: false
 
 jobs:
   tier:
@@ -50,6 +61,16 @@ jobs:
         run: |
           set -euo pipefail
 
+          tier_high_on_failure() {
+            gh label create review-high --repo "$GITHUB_REPOSITORY" --force \
+              --description "HIGH review tier: CodeRabbit review required" >/dev/null 2>&1 || true
+            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label review-high >/dev/null 2>&1 || true
+          }
+          trap tier_high_on_failure ERR
+          # This override is intentionally never removed by this workflow.
+          gh label create review-high-manual --repo "$GITHUB_REPOSITORY" --force \
+            --description "Manual HIGH review override" >/dev/null 2>&1 || true
+
           # Policy from the BASE ref via the API: no checkout at all (nothing from the
           # PR head ever lands on disk), and a head-side policy edit cannot re-tier its
           # own PR. The compare call below is API-based for the same reason.
@@ -58,6 +79,7 @@ jobs:
           # loudly here, not silently.
           if ! policy=$(gh api "repos/$GITHUB_REPOSITORY/contents/.claude/review-policy.json?ref=$BASE_SHA" --jq '.content' 2>/dev/null | base64 --decode) || [ -z "$policy" ]; then
             echo "::error::Could not read .claude/review-policy.json at base $BASE_SHA — refusing to tier. Failing closed."
+            tier_high_on_failure
             exit 1
           fi
 
@@ -72,6 +94,7 @@ jobs:
           # legitimate and still succeeds; what fails now is jq failing.
           if ! patterns=$(jq -r '.high[]' <<< "$policy" 2>/dev/null); then
             echo "::error::.claude/review-policy.json at base $BASE_SHA has no usable .high array — refusing to tier. Failing closed."
+            tier_high_on_failure
             exit 1
           fi
 
@@ -89,16 +112,27 @@ jobs:
           # enumeration falls short for ANY reason -- the endpoint's own 3000-file ceiling,
           # a transient page error -- the pull request is tiered HIGH. An enumeration this
           # job cannot complete resolves to MORE review, never less.
-          expected=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.changed_files')
-          files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
-          retrieved=$(printf '%s\n' "$files" | grep -c . || true)
-          if [ "$retrieved" -ne "$expected" ]; then
+          if ! expected=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.changed_files') || \
+             ! files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)') || \
+             ! retrieved=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' | grep -c .); then
+            echo "::warning::Could not enumerate the complete changed-file list; tiering HIGH rather than under-tiering on an API error."
+            high=true
+            expected=0
+            files=
+            retrieved=0
+          elif [ "$retrieved" -ne "$expected" ]; then
             echo "::warning::Enumerated $retrieved of $expected changed files; tiering HIGH rather than under-tiering on a partial list."
+            high=true
+          elif [ "$retrieved" -ge 3000 ]; then
+            # The files endpoint stops at 3000. Whether changed_files is capped there too is
+            # unverified, and if it is, equal counts at the ceiling would look complete while
+            # HIGH paths past file 3000 go unread. Fail closed at the ceiling regardless.
+            echo "::warning::Enumerated $retrieved changed files, the files endpoint's 3000-file ceiling; tiering HIGH because the list may be truncated."
             high=true
           fi
 
-          # Any high match tiers the PR HIGH (the policy's own rule). bash case patterns
-          # match across '/', which is exactly the policy glob semantics used here.
+          # Any high match tiers the PR HIGH. Bash does not let **/ match a root path,
+          # so try the suffix too; this mirrors the local glob semantics.
           if ! $high; then
             while IFS= read -r file; do
               [ -n "$file" ] || continue
@@ -107,26 +141,30 @@ jobs:
                 case "$file" in
                   $pattern) high=true ;;
                 esac
+                case "$pattern" in
+                  '**/'*) # shellcheck disable=SC2254  # policy patterns intentionally act as globs
+                    case "$file" in ${pattern#\*\*/}) high=true ;; esac ;;
+                esac
               done <<< "$patterns"
               $high && break
             done <<< "$files"
           fi
 
-          labelled=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name' | grep -cx 'review-high' || true)
-
           if $high; then
             echo "HIGH tier: at least one changed path matches the policy's high list."
             gh label create review-high --repo "$GITHUB_REPOSITORY" --force --description "HIGH review tier: CodeRabbit review required" >/dev/null
-            if [ "$labelled" -eq 0 ]; then
-              gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label review-high
-              echo "Applied the review-high label."
-            else
-              echo "The review-high label is already present."
-            fi
+            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label review-high
+            echo "Applied the review-high label."
           else
             echo "Not HIGH: no changed path matches the policy's high list."
-            if [ "$labelled" -gt 0 ]; then
-              gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label review-high
-              echo "Removed the review-high label."
+            if ! labels=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name'); then
+              echo "::warning::Could not read existing labels; preserving HIGH coverage on this PR."
+              tier_high_on_failure
+            else
+              labelled=$(grep -cx 'review-high' <<< "$labels" || true)
+              if [ "$labelled" -gt 0 ]; then
+                gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label review-high
+                echo "Removed the review-high label."
+              fi
             fi
           fi
