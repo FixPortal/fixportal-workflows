@@ -2150,8 +2150,9 @@ def resolve_committed_paths(root, relative):
 
 
 DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|])\s*(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
-# A directory change as a command INSIDE a quoted string, which may span lines.
-SEGMENT_DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|\n])\s*(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
+# A directory change as a command INSIDE a quoted string, which may span lines. An opening
+# `$(` or backtick starts a command too: a substitution runs even inside printed text.
+SEGMENT_DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|\n(`])\s*(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
 # The command a quoted string is an argument to, when that command only prints it.
 MESSAGE_COMMAND = re.compile(
     r"(?:^|[;&|\n])\s*(?:echo|printf|Write-Host|Write-Output|Write-Warning|Write-Error|Write-Verbose)\b[^;&|\n]*$",
@@ -2160,13 +2161,16 @@ MESSAGE_COMMAND = re.compile(
 
 
 def quoted_segments(text):
-    """(start, content) of every quoted span in `text`, by mask_quoted's quoting rules.
+    """(start, content) of every quoted ARGUMENT in `text`, by mask_quoted's quoting rules.
 
-    An unterminated quote runs to the end of the text, as it does in mask_quoted.
+    Spans that touch with nothing between them (`"cd sub; "'python3 x.py'`) are one shell
+    argument, so they are returned as one segment. An unterminated quote runs to the end
+    of the text, as it does in mask_quoted.
     """
     segments = []
     quote = None
     start = 0
+    last_end = -2
     index = 0
     while index < len(text):
         char = text[index]
@@ -2177,7 +2181,13 @@ def quoted_segments(text):
             quote = char
             start = index
         elif quote == char:
-            segments.append((start, text[start + 1:index]))
+            content = text[start + 1:index]
+            if segments and start == last_end + 1:
+                previous_start, previous = segments.pop()
+                segments.append((previous_start, previous + content))
+            else:
+                segments.append((start, content))
+            last_end = index
             quote = None
         index += 1
     if quote is not None:
@@ -2198,7 +2208,17 @@ def changes_directory(body):
     is read as well (it may span lines of a block scalar), and one that both changes
     directory and names a gate script counts -- unless it is only the argument of a
     command that prints it (`echo`, `printf`, `Write-Host`, ...), where the same words are
-    a message. (Review follow-up on the fixportal-agents-skills#265 rollout.)
+    a message. A printed string holding a command substitution (`$(...)` or backticks) is
+    not exempt, because the substitution runs. Adjacent quoted spans are read as the one
+    argument they are. (Review follow-up on the fixportal-agents-skills#265 rollout.)
+
+    THE BOUNDARY, stated so a pass is not read as more than it is: this is a line-level
+    heuristic, not a shell parser. It covers the ways a workflow author ordinarily writes a
+    directory change -- `cd`/`pushd`/`Set-Location` as a command, in a quoted `-c` string,
+    or in a substitution. A deliberately obfuscated one (`eval "c""d sub"`, a variable
+    holding the command, an alias, a nested interpreter reading a file) is out of scope:
+    the workflow change that introduces it is itself HIGH-tier and reviewed, and review is
+    the control for intent. Further spellings of that kind are declined, not chased.
     """
     for line in body:
         if DIRECTORY_CHANGE.search(mask_quoted(line)):
@@ -2208,7 +2228,8 @@ def changes_directory(body):
     for start, content in quoted_segments(text):
         if not (SEGMENT_DIRECTORY_CHANGE.search(content) and GATE_SCRIPT.search(content)):
             continue
-        if MESSAGE_COMMAND.search(masked[:start]):
+        substitution = "$(" in content or "`" in content
+        if MESSAGE_COMMAND.search(masked[:start]) and not substitution:
             continue
         return True
     return False
