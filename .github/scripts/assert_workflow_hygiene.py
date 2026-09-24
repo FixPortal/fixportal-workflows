@@ -637,6 +637,7 @@ def main():
         path
         for pattern in ("*.yml", "*.yaml")
         for path in WORKFLOWS.glob(pattern)
+        if path.is_file()
     )
     for path in paths:
         try:
