@@ -605,6 +605,19 @@ def has_inline_bash_env(lines):
 def writes_bash_env_to_github_env(body):
     assignment = re.compile(r"\bBASH_ENV\s*=", re.IGNORECASE)
     environment_file = re.compile(r"\$(?:\{GITHUB_ENV\}|GITHUB_ENV|env:GITHUB_ENV)", re.IGNORECASE)
+    quoted_output = "__quoted_bash_env_output__"
+    quoted_output_start = re.compile(
+        r'''(^|[;&|(]\s*|\n\s*)(["'])BASH_ENV\s*=(?:(?!\2).)*\2''',
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    def preserve_quoted_powershell_output(source):
+        # POSIX shlex removes quotes. In PowerShell a quoted string at a command or
+        # pipeline boundary is output, while an unquoted NAME=value token can be a
+        # shell assignment prefix. Preserve the quote evidence before tokenization.
+        return quoted_output_start.sub(
+            lambda match: match.group(1) + quoted_output, source
+        )
 
     def split_shell_commands(tokens):
         commands = [[]]
@@ -661,7 +674,7 @@ def writes_bash_env_to_github_env(body):
             name = command_name(stage)
             stage_has_assignment = any(
                 assignment.search(token) for token in stage[command_index(stage) + 1 :]
-            )
+            ) or any(quoted_output in token for token in stage)
             writes_environment = writes_environment_file(stage)
             if writes_environment and (
                 stage_has_assignment
@@ -679,13 +692,15 @@ def writes_bash_env_to_github_env(body):
                 continue
             name = command_name(stage)
             if name not in ("tee", "tee-object", "cat"):
-                output_has_assignment = any(
+                output_has_assignment = any(quoted_output in token for token in stage) or any(
                     assignment.search(token)
                     for token in stage[command_index(stage) + 1 :]
                 )
         return output_has_assignment
 
     def line_writes_environment_file(line):
+        if re.search(r"\$env:GITHUB_ENV", line, re.IGNORECASE):
+            line = preserve_quoted_powershell_output(line)
         try:
             lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|<>")
             lexer.whitespace_split = True
@@ -706,11 +721,13 @@ def writes_bash_env_to_github_env(body):
         if not environment_file.search(destination):
             return False
         try:
+            commands = preserve_quoted_powershell_output(commands)
             lexer = shlex.shlex(commands, posix=True, punctuation_chars=";&|")
             lexer.whitespace_split = True
+            command_list = split_shell_commands(list(lexer))
             return any(
                 pipeline_outputs_assignment(command)
-                for command in split_shell_commands(list(lexer))
+                for command in command_list
             )
         except ValueError:
             return bool(assignment.search(commands))
