@@ -1820,6 +1820,69 @@ def run_payload_indexes(lines):
     return payloads
 
 
+# A `working-directory:` value, including the dash form a step's FIRST key takes
+# (`- working-directory: sub`). Without the optional dash that spelling was invisible, so
+# a gate script under `sub/` resolved against the repository root and went untiered --
+# fail-open on ordinary YAML. (fixportal-agents-skills#263, item 6.)
+WORKDIR = re.compile(r"""^\s*(?:-\s+)?(?:'working-directory'|"working-directory"|working-directory)\s*:\s*['"]?([^\s#'"]+)""")
+# The composite action's own directory, spelled the three ways a run body can reach it.
+ACTION_PATH = re.compile(r"\$\{\{\s*github\.action_path\s*\}\}|\$\{GITHUB_ACTION_PATH\}|\$GITHUB_ACTION_PATH\b")
+STEPS_KEY = re.compile(r"""^(?:'steps'|"steps"|steps)\s*:""")
+
+
+def working_directories(lines):
+    """Every `working-directory:` value in `lines`, normalised to `/` without a trailing one."""
+    found = set()
+    for line in lines:
+        match = WORKDIR.match(strip_comment(line))
+        if match:
+            found.add(match.group(1).replace("\\", "/").rstrip("/"))
+    return found
+
+
+def step_lines(block, run_index, key_indent):
+    """The lines of the step whose `run:` key is at `run_index`.
+
+    Scoping to the step is what keeps a SIBLING step's working-directory out of this
+    step's candidate paths: it never applies here, and an unrelated file that happened to
+    exist at that spelling was being required HIGH. (fixportal-agents-skills#263, item 3.)
+    A run key that is not inside a sequence item falls back to the whole block -- more
+    candidates, never fewer.
+    """
+    span = step_span(block, run_index, key_indent)
+    if span is None:
+        return block
+    start, end = span
+    return block[start:end]
+
+
+def job_level_lines(block, body_indent):
+    """A job's own lines OUTSIDE its `steps:` sequence -- where `defaults.run` lives.
+
+    The sequence may be indented under `steps:` or flush with it (`- run:` at the key's
+    own column), so a dash at exactly `body_indent` still belongs to the steps.
+    """
+    if body_indent is None:
+        return []
+    out = []
+    in_steps = False
+    for line in block:
+        if COMMENT_OR_BLANK.match(line):
+            continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        if indent <= body_indent:
+            if in_steps and indent == body_indent and stripped.startswith("- "):
+                continue
+            in_steps = indent == body_indent and bool(STEPS_KEY.match(stripped))
+            if in_steps:
+                continue
+        elif in_steps:
+            continue
+        out.append(line)
+    return out
+
+
 def delegated_run_bodies(root, ref, visited):
     """Yield run bodies and their action-level working directories."""
     relative = ref[2:]
@@ -1845,23 +1908,37 @@ def delegated_run_bodies(root, ref, visited):
             f"{target}: local action uses runs.using {using}; "
             "gate coverage only follows composite action bodies"
         )
+    # A composite action reaches its OWN files through the action path. Rewriting that
+    # expression to the action's repository-relative directory lets both a run body's
+    # script reference and a `working-directory: ${{ github.action_path }}` resolve to
+    # the file that actually runs, which is then required HIGH like any other gate
+    # script. Before this, `"${{ github.action_path }}/scripts/gate.sh"` resolved against
+    # the repository root and a script beside action.yml went untiered.
+    # (fixportal-agents-skills#263, item 7.)
+    try:
+        action_dir = target.parent.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        action_dir = None
     index = 0
     while index < len(lines):
         match = RUN_KEY.match(lines[index])
         if not match:
             index += 1
             continue
+        run_index = index
         value = strip_inline_comment(match.group(2)).strip()
         if BLOCK_SCALAR.match(value):
             body, index = continuation_lines(lines, index, len(match.group(1)))
         else:
             body, index = ([value] if value else []), index + 1
         if body:
-            directories = set()
-            for line in lines:
-                workdir = re.match(r"^\s*working-directory\s*:\s*['\"]?([^\s#'\"]+)", strip_comment(line))
-                if workdir:
-                    directories.add(workdir.group(1).replace("\\", "/").rstrip("/"))
+            scoped = step_lines(lines, run_index, len(match.group(1)))
+            if action_dir is not None:
+                scoped = [ACTION_PATH.sub(action_dir, line) for line in scoped]
+            directories = working_directories(scoped)
+            if action_dir is not None and any(ACTION_PATH.search(line) for line in body):
+                directories.add(action_dir)
+                body = [ACTION_PATH.sub(action_dir, line) for line in body]
             yield body, directories
     payload_indexes = run_payload_indexes(lines)
     for index, line in enumerate(lines):
@@ -1881,6 +1958,9 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root):
     control behind it.
     """
     job_indent = len(lines[jobs[gate_job]]) - len(lines[jobs[gate_job]].lstrip(" "))
+    # Workflow-level lines end at the first job; only `defaults.run` there can set a
+    # working directory for this job's steps.
+    workflow_directories = working_directories(lines[:min(jobs.values())])
     pending = list(set(needs) | {gate_job})
     seen = set()
     while pending:
@@ -1891,12 +1971,20 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root):
         if job_id not in jobs:
             continue
         block = job_block(lines, jobs, job_id)
+        # Directories that apply to EVERY step of this job: workflow- and job-level
+        # `defaults.run.working-directory`. A step's own value is added per run body
+        # below; a sibling step's is not (fixportal-agents-skills#263, item 3). Computed
+        # once per job rather than once per script match (item 9).
+        job_directories = workflow_directories | working_directories(
+            job_level_lines(block, job_body_indent(lines, jobs, job_id, job_indent))
+        )
         index = 0
         while index < len(block):
             match = RUN_KEY.match(block[index])
             if not match:
                 index += 1
                 continue
+            run_index = index
             # Both tests read the COMMENT-STRIPPED value. `run: | # build log` is a real
             # spelling -- other_block_key_pattern documents it -- and BLOCK_SCALAR is
             # anchored, so testing the raw value made it miss: the else branch then
@@ -1910,8 +1998,11 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root):
                 body, index = continuation_lines(block, index, len(match.group(1)))
             else:
                 body, index = ([value] if value else []), index + 1
+            directories = job_directories | working_directories(
+                step_lines(block, run_index, len(match.group(1)))
+            )
             for body_line in body:
-                yield job_id, body_line, body, set()
+                yield job_id, body_line, body, directories
         payload_indexes = run_payload_indexes(block)
         for index, line in enumerate(block):
             if index in payload_indexes:
@@ -2058,6 +2149,29 @@ def resolve_committed_paths(root, relative):
     return [normalised] if normalised in matches else matches
 
 
+DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|])\s*(?:cd|pushd|Set-Location)\b", re.IGNORECASE)
+# The same, where an opening quote also starts a command: `bash -c "cd sub; ..."`.
+QUOTED_DIRECTORY_CHANGE = re.compile(r"""(?:^|[;&|"'])\s*(?:cd|pushd|Set-Location)\b""", re.IGNORECASE)
+
+
+def changes_directory(body):
+    """True when a run body may change directory before a gate script runs.
+
+    Quoted text is masked first, so `echo "step1; cd scripts is deprecated"` is a message,
+    not a directory change (fixportal-agents-skills#263, item 2). A quoted COMMAND string
+    is different: `bash -c "cd sub; python3 scripts/gate.py"` really does run the script
+    from `sub`, and masking it would resolve the path against the root instead -- the
+    fail-open direction. So a directory change inside quotes still counts when that same
+    line also invokes a gate script.
+    """
+    for line in body:
+        if DIRECTORY_CHANGE.search(mask_quoted(line)):
+            return True
+        if QUOTED_DIRECTORY_CHANGE.search(line) and GATE_SCRIPT.search(line):
+            return True
+    return False
+
+
 def gate_script_paths(lines, jobs, needs, gate_job, root):
     """Repo-local scripts a merge-blocking job runs from the checkout, path -> job id.
 
@@ -2073,26 +2187,16 @@ def gate_script_paths(lines, jobs, needs, gate_job, root):
     disk, by resolve_committed_paths.
     """
     found = {}
-    for job_id, body_line, body, delegated_directories in gated_run_bodies(lines, jobs, needs, gate_job, root):
+    for job_id, body_line, body, directories in gated_run_bodies(lines, jobs, needs, gate_job, root):
         for match in GATE_SCRIPT.finditer(body_line):
             relative = match.group(1).replace("\\", "/")
-            if any(re.search(r"(?:^|[;&|])\s*(?:cd|pushd|Set-Location)\b", line, re.IGNORECASE) for line in body):
+            if changes_directory(body):
                 sys.exit(f"{root}: cannot verify gate script paths after a directory change in job '{job_id}'; use working-directory:")
-            # Resolve a single job/step working-directory declaration. Multiple values
-            # are ambiguous to this line-oriented parser, so fail closed instead of
-            # silently checking the repository-root spelling.
-            block = job_block(lines, jobs, job_id)
-            directories = set()
-            job_start = jobs[job_id]
-            # Workflow-level lines end at the first job. Values in sibling jobs
-            # cannot affect this command; step-level and job-level values inside this
-            # block can, so retain every plausible path spelling.
-            for line in lines[:min(jobs.values())] + block:
-                workdir = re.match(r"^\s*(?:working-directory)\s*:\s*['\"]?([^\s#'\"]+)", strip_comment(line))
-                if workdir:
-                    directories.add(workdir.group(1).replace("\\", "/").rstrip("/"))
+            # Every plausible spelling is kept -- the repository root, and each directory
+            # that applies to this run body (workflow and job defaults, the body's own
+            # step, a composite action's own directory). More scripts required HIGH,
+            # never fewer.
             candidates = {relative} | {directory + "/" + relative for directory in directories if directory}
-            candidates.update(directory + "/" + relative for directory in delegated_directories if directory)
             for candidate in candidates:
                 for committed in resolve_committed_paths(root, candidate):
                     found.setdefault(committed, job_id)
@@ -2237,11 +2341,6 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
 
     with open(workflow_path, encoding="utf-8-sig") as handle:
         lines = handle.readlines()
-    if any(re.match(r"^\s*BASH_ENV\s*:", strip_comment(line)) for line in lines):
-        sys.exit(
-            f"{workflow_path}: BASH_ENV can load shell functions that override the gate's "
-            "accepted exit command. Remove the override or use a separately verified gate shell."
-        )
     jobs, needs, conditional = read_gate_contract(lines, gate_job)
 
     if not jobs:
@@ -2252,6 +2351,21 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
         sys.exit(f"{workflow_path}: no jobs found -- refusing to report coverage over nothing.")
     if gate_job not in jobs:
         return False
+
+    # AFTER the gate-job test: a workflow with no gate job feeds nothing, so in directory
+    # mode a file-exempt release.yml with `env: BASH_ENV:` no longer reddens the whole run
+    # (fixportal-agents-skills#263, item 4). And block-scalar `run:` payloads are skipped:
+    # a heredoc line starting `BASH_ENV:` is shell text, not an env key (item 1).
+    payload_indexes = run_payload_indexes(lines)
+    if any(
+        re.match(r"^\s*BASH_ENV\s*:", strip_comment(line))
+        for index, line in enumerate(lines)
+        if index not in payload_indexes
+    ):
+        sys.exit(
+            f"{workflow_path}: BASH_ENV can load shell functions that override the gate's "
+            "accepted exit command. Remove the override or use a separately verified gate shell."
+        )
 
     gate_line = lines[jobs[gate_job]]
     job_indent = len(gate_line) - len(gate_line.lstrip(" "))
@@ -2273,16 +2387,20 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
     # A feeder can be skipped transitively when it depends on a conditional or
     # explicitly exempt job. Since the gate treats skipped as success, require an
     # always-running condition on that feeder before accepting the chain.
+    def runs_regardless(job_id):
+        """True when the job's own `if:` makes it run even after a skipped dependency."""
+        start = jobs[job_id]
+        end = min((i for i in jobs.values() if i > start), default=len(lines))
+        indent = job_body_indent(lines, jobs, job_id, job_indent)
+        pattern = key_pattern(indent, "if") if indent is not None else None
+        condition = next((normalise_condition(match.group(1))
+                          for i in range(start + 1, end)
+                          if pattern and (match := pattern.match(lines[i].rstrip("\r\n")))), "")
+        return condition in ("always()", "!cancelled()")
+
     unsafe_feeders = set()
     for feeder in set(needs) - {gate_job}:
-        feeder_start = jobs[feeder]
-        feeder_end = min((i for i in jobs.values() if i > feeder_start), default=len(lines))
-        feeder_indent = job_body_indent(lines, jobs, feeder, job_indent)
-        feeder_if = key_pattern(feeder_indent, "if") if feeder_indent is not None else None
-        condition = next((normalise_condition(match.group(1))
-                          for i in range(feeder_start + 1, feeder_end)
-                          if feeder_if and (match := feeder_if.match(lines[i].rstrip("\r\n")))), "")
-        if condition in ("always()", "!cancelled()"):
+        if runs_regardless(feeder):
             continue
         pending = list(job_needs(lines, jobs, feeder, job_indent))
         visited = set()
@@ -2293,6 +2411,12 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             visited.add(dependency)
             if dependency in exempt or dependency in conditional:
                 unsafe_feeders.add(feeder)
+            # An intermediate that runs regardless of its own dependencies stops a skip
+            # from propagating past it, so the chain behind it cannot skip this feeder.
+            # The same always()/!cancelled() the feeder test above already accepts.
+            # (fixportal-agents-skills#263, item 5.)
+            if runs_regardless(dependency):
+                continue
             pending.extend(job_needs(lines, jobs, dependency, job_indent) - visited)
     if unsafe_feeders:
         sys.exit(

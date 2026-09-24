@@ -112,28 +112,43 @@ jobs:
           # enumeration falls short for ANY reason -- the endpoint's own 3000-file ceiling,
           # a transient page error -- the pull request is tiered HIGH. An enumeration this
           # job cannot complete resolves to MORE review, never less.
+          #
+          # ONE paginated call yields both the count and the names: one record per changed
+          # file (`filename<TAB>previous_filename`), so the count is of FILES while the match
+          # list also carries each rename's vacated path. Two separate calls doubled the API
+          # cost and could disagree if the PR moved between them. The count is taken with
+          # `|| true` because grep -c exits 1 on zero, and a PR with no changed files is not
+          # an enumeration failure. (fixportal-agents-skills#264, items 1 and 2.)
           if ! expected=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.changed_files') || \
-             ! files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)') || \
-             ! retrieved=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' | grep -c .); then
+             ! records=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[] | [.filename, (.previous_filename // "")] | @tsv'); then
             echo "::warning::Could not enumerate the complete changed-file list; tiering HIGH rather than under-tiering on an API error."
             high=true
             expected=0
             files=
             retrieved=0
-          elif [ "$retrieved" -ne "$expected" ]; then
-            echo "::warning::Enumerated $retrieved of $expected changed files; tiering HIGH rather than under-tiering on a partial list."
-            high=true
-          elif [ "$retrieved" -ge 3000 ]; then
-            # The files endpoint stops at 3000. Whether changed_files is capped there too is
-            # unverified, and if it is, equal counts at the ceiling would look complete while
-            # HIGH paths past file 3000 go unread. Fail closed at the ceiling regardless.
-            echo "::warning::Enumerated $retrieved changed files, the files endpoint's 3000-file ceiling; tiering HIGH because the list may be truncated."
-            high=true
+          else
+            retrieved=$(printf '%s\n' "$records" | grep -c . || true)
+            files=$(printf '%s\n' "$records" | tr '\t' '\n' | grep -v '^$' || true)
+            if [ "$retrieved" -ne "$expected" ]; then
+              echo "::warning::Enumerated $retrieved of $expected changed files; tiering HIGH rather than under-tiering on a partial list."
+              high=true
+            elif [ "$retrieved" -ge 3000 ]; then
+              # The files endpoint stops at 3000. Whether changed_files is capped there too is
+              # unverified, and if it is, equal counts at the ceiling would look complete while
+              # HIGH paths past file 3000 go unread. Fail closed at the ceiling regardless.
+              echo "::warning::Enumerated $retrieved changed files, the files endpoint's 3000-file ceiling; tiering HIGH because the list may be truncated."
+              high=true
+            fi
           fi
 
-          # Any high match tiers the PR HIGH. Bash does not let **/ match a root path,
-          # so try the suffix too; this mirrors the local glob semantics.
+          # Any high match tiers the PR HIGH. A bash `case` glob lets `*` cross `/`, but
+          # `**/` still demands at least one directory level. So a leading `**/` is also
+          # tried as its suffix (root files), and each mid-pattern `/**/` is also tried as
+          # the extglob `@(/|/*/)` -- zero or more WHOLE directories -- so `dir/**/x`
+          # matches `dir/x` without also matching a sibling like `dirx/`. Both retries only
+          # ADD matches, never remove one. (fixportal-agents-skills#264, item 5.)
           if ! $high; then
+            shopt -s extglob
             while IFS= read -r file; do
               [ -n "$file" ] || continue
               while IFS= read -r pattern; do
@@ -144,6 +159,10 @@ jobs:
                 case "$pattern" in
                   '**/'*) # shellcheck disable=SC2254  # policy patterns intentionally act as globs
                     case "$file" in ${pattern#\*\*/}) high=true ;; esac ;;
+                esac
+                case "$pattern" in
+                  *'/**/'*) # shellcheck disable=SC2254  # policy patterns intentionally act as globs
+                    case "$file" in ${pattern//\/\*\*\//@(\/|\/*\/)}) high=true ;; esac ;;
                 esac
               done <<< "$patterns"
               $high && break
@@ -158,8 +177,12 @@ jobs:
           else
             echo "Not HIGH: no changed path matches the policy's high list."
             if ! labels=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name'); then
-              echo "::warning::Could not read existing labels; preserving HIGH coverage on this PR."
+              # Fail loudly like every other path that could not finish classification: the
+              # HIGH label keeps coverage, and the red job says the decision was not
+              # verified. (fixportal-agents-skills#264, item 3.)
+              echo "::error::Could not read existing labels; preserving HIGH coverage on this PR and failing closed."
               tier_high_on_failure
+              exit 1
             else
               labelled=$(grep -cx 'review-high' <<< "$labels" || true)
               if [ "$labelled" -gt 0 ]; then
