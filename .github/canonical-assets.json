@@ -2,7 +2,7 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "1bc67e406d949ad6fd5969ba1b4555969a5fd9a0",
+    "commit": "dccaf16a9b811f4a647098b7956eb882c425b287",
     "syncedAt": "2026-09-24"
   },
   "assets": [
@@ -13,7 +13,7 @@
     },
     {
       "path": ".github/scripts/assert_gate_coverage.py",
-      "sha256": "d0c97da46e5e640830f2ff4d085a5869133c66fb147a41eeb3765d427e062f83",
+      "sha256": "4cc98d00407e43eea4a64633bb79d6baa0165d9cb3ca8318ecda0cc3108bd96a",
       "verbatim": true
     },
     {
