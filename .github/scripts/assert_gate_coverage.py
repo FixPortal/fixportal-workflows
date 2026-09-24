@@ -2163,7 +2163,9 @@ _KEYWORDS = r"(?:(?:then|do|else|if|elif|while|until|!)\s+)*"
 # any `\b`: `${cd:-x}`, `${cd}` and `{cd,ls}` name a `cd` without running one, and a `{`
 # anchor followed by `\b` read all three as a directory change. A redirection ends the word
 # too (`cd>log` is `cd` to $HOME); `#` does not, since `cd#x` is one word, not a comment.
-_DIRECTORY_COMMAND = r"(?:cd|pushd|Set-Location)(?=[\s;&|()`<>]|$)"
+# A `$` expansion does end it, in effect: `cd$X`, `cd${SUB}` and `cd$(...)` run `cd` when
+# the expansion is empty or begins with whitespace (word splitting), so they fail closed.
+_DIRECTORY_COMMAND = r"(?:cd|pushd|Set-Location)(?=[\s;&|()`<>$]|$)"
 # An unquoted backtick opens a command substitution just as `$(` does, so it anchors too.
 DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|(`{])\s*" + _KEYWORDS + _DIRECTORY_COMMAND, re.IGNORECASE)
 # A directory change as a command INSIDE a quoted string, which may span lines. An opening
