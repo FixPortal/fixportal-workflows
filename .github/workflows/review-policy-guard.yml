@@ -33,6 +33,12 @@ name: Review policy guard
 # first removing the corresponding assertion here.
 
 # Deliberately narrow: pull_request already covers branch commits.
+#
+# `main` is the ONE permitted difference in the byte-comparison audit-ci runs over this
+# file. GitHub does not evaluate ${{ }} expressions inside an `on:` trigger block, so a
+# repo whose mainline is not `main` edits both branch names here and audit-ci normalises
+# that substitution against the repo's own primary-workflow push branch before comparing.
+# Change nothing else.
 on:
   push:
     branches: [main]
@@ -110,12 +116,37 @@ jobs:
           # count here: the list started at three and the hygiene checker took it to six,
           # so a number goes stale and misleads whoever next adjusts it. Adjust the
           # ci.yml path if this repo's main workflow is named differently.
+          #
+          # review-tier.yml joined on 2026-09-22. It is the SERVER-SIDE tier enforcer:
+          # it reads this policy at the base sha and applies the review-high label that
+          # CodeRabbit triggers on. Until then it was tiered by no rule of its own, so an
+          # edit weakening the thing that enforces the tiers got the lighter review —
+          # the control plane's own enforcer sitting outside the control plane. Named
+          # path, same as the rest: it changes a few times a year.
           for required in .claude/review-policy.json .coderabbit.yaml \
             .github/workflows/ci.yml .github/workflows/review-policy-guard.yml \
+            .github/workflows/review-tier.yml \
             .github/scripts/assert_gate_coverage.py \
             .github/scripts/assert_workflow_hygiene.py; do
+            if [ ! -f "$required" ]; then
+              echo "::error file=$required::Required review control-plane file is missing. Restore it and keep it HIGH-tiered."
+              exit 1
+            fi
             if ! jq -e --arg r "$required" '.high | index($r)' "$policy" >/dev/null; then
               echo "::error file=$policy::'$required' is missing from the high list. An edit to it would get the lighter review."
+              exit 1
+            fi
+          done
+
+          # Stack-specific supply-chain and analyzer files are optional across the estate,
+          # but if present they must receive HIGH review.
+          # assert_canonical_assets.py joined on 2026-09-26: gate coverage already refuses a
+          # gate-feeding script that is not HIGH, but the guard should hold that on its own.
+          for required in .claude/ci-budget-approval.json .github/canonical-assets.json \
+            .github/scripts/assert_canonical_assets.py \
+            nuget.config NuGet.config global.json .config/dotnet-tools.json .npmrc Directory.Build.props; do
+            if [ -f "$required" ] && ! jq -e --arg r "$required" '.high | index($r)' "$policy" >/dev/null; then
+              echo "::error file=$policy::'$required' exists but is missing from the high list. An edit to it would get the lighter review."
               exit 1
             fi
           done
@@ -141,11 +172,19 @@ jobs:
       # Optional stricter mode: set TRUSTED_THIRD_PARTY_ACTIONS to a space-separated list
       # of owner/repo entries to additionally require every third-party action to be named
       # there. Off unless set — see the script's header for why it is not a default.
+      #
       # PRIVILEGED_TRIGGER_NO_CHECKOUT names workflows exempt from the target-context
       # trigger refusal because they never check out head code — enforced, not merely
       # granted: the checker fails any exempted workflow that also uses actions/checkout.
       # review-tier.yml only reads the PR via the API against the base ref and writes a
       # label; it never checks out PR content.
+      #
+      # This reached the asset on 2026-09-22, AFTER all 32 consuming repositories already
+      # carried it. The review-tier rollout added the env block repo-locally in each one
+      # and never upstreamed it, so canonical sat behind every consumer and a fresh
+      # scaffold from it would have shipped a guard that fails hygiene on the very
+      # workflow the rollout installs. Exactly the drift shape the divergence gate exists
+      # to surface — in the direction the gate does not watch.
       - name: Workflows must be hygienic (no target-context trigger, no write-all, actions pinned)
         env:
           PRIVILEGED_TRIGGER_NO_CHECKOUT: review-tier.yml
