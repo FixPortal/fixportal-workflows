@@ -25,7 +25,9 @@ reviews:
     # CodeRabbit check registers at all, and pr-review-watch.sh reads a persistently absent
     # check as "not installed" and stops gating on it, letting a HIGH PR through unreviewed.
     enabled: false
-    labels: ["review-high"]
+    # `review-high-manual` is a durable manual override for an otherwise NORMAL PR and is
+    # never removed; review-tier.yml no longer re-applies `review-high` for it.
+    labels: ["review-high", "review-high-manual"]
     drafts: false
     # Still load-bearing under label triggering: once a PR carries the label, every later push
     # re-reviews it and spends from the same pool. CodeRabbit ships 5; its own docs suggest 1-2.
