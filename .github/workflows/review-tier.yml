@@ -3,15 +3,21 @@ name: Review tier
 # Existing open PRs converge on their next event; policy or workflow changes do not
 # sweep them. A later PR event reclassifies against the then-current base policy.
 # Server-side enforcement of the HIGH tier. CodeRabbit is label-triggered
-# (.coderabbit.yaml -> auto_review.labels: ["review-high"]), and the only other thing
-# applying that label was a local PR-create hook on one workstation — so a PR that
-# acquired a HIGH path on a later push was never re-tiered. This workflow classifies the
-# PR's changed paths against .claude/review-policy.json on every head change and applies
-# or removes the label to match.
+# (.coderabbit.yaml -> auto_review.labels: ["review-high", "review-high-manual"] — the
+# manual label works on its own; the config honours either), and the only other thing
+# applying the review-high label was a local PR-create hook on one workstation — so a PR
+# that acquired a HIGH path on a later push was never re-tiered. This workflow classifies
+# the PR's changed paths against .claude/review-policy.json on every head change and
+# applies or removes the review-high label to match.
 #
-# The policy is read at the PR BASE SHA, never the head: a PR that removed an entry
+# The policy is read at the PR BASE REF, never the head: a PR that removed an entry
 # from `high` would otherwise tier itself NORMAL and merge the unguarded path without
-# the review it requires. review-policy-guard.yml keeps the policy file itself
+# the review it requires. The branch ref (`?ref=<base branch>`), not the event's
+# base.sha: the header promise above is "the then-current base policy", and whether
+# base.sha refreshes when the base branch moves between PR events is undocumented —
+# the ref resolves at read time and makes the question moot, exactly as the local
+# tiering hook already reads it (pr-review-policy.sh). Either way the read is of the
+# base, never the PR head. review-policy-guard.yml keeps the policy file itself
 # HIGH-tiered; the base-ref read here is what extends that protection to the policy's
 # contents.
 #
@@ -20,7 +26,7 @@ name: Review tier
 # exemption: fork-originated PRs get a read-only token under plain `pull_request`, so
 # the label write would 403 on exactly the external PRs this workflow exists for.
 # Safety property the exemption rests on: this job never checks out or executes PR
-# code — every read is an API call against the base SHA, and the only writes are
+# code — every read is an API call against the base ref, and the only writes are
 # label operations. The gate fails this workflow if a checkout ever appears.
 
 # `edited` is in the type list because RETARGETING A PULL REQUEST IS NOT A HEAD CHANGE.
@@ -37,7 +43,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read        # read .claude/review-policy.json at the PR base SHA
+  contents: read        # read .claude/review-policy.json at the PR base ref
   issues: write         # gh label create --force calls the repository labels API
   pull-requests: write  # add/remove the review-high label on the pull request
 
@@ -48,6 +54,14 @@ concurrency:
 
 jobs:
   tier:
+    # NAME IS LOAD-BEARING. Only a branch-ruleset entry requiring "Apply review tier
+    # label" makes this job's fail-closed exits merge-blocking — a job in another
+    # workflow can never be a dependency of ci-gate, so without that ruleset entry the
+    # red job below blocks nothing. Renaming the job silently detaches the requirement:
+    # the rule waits for a context that no longer reports, and the old name never
+    # arrives. Change the name only alongside a deliberate ruleset update everywhere.
+    # (fixportal-workflows review 20260929T021338Z, CX-3 — the same contract
+    # review-policy-guard.yml documents for "Review policy intact".)
     name: Apply review tier label
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -56,10 +70,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
+
+          # Dependency PRs are out of AI review by policy (CodeRabbit refuses bot
+          # authors outright), so classification buys nothing on one — and if GitHub
+          # hands a Dependabot pull_request_target run a read-only token, the label
+          # writes below 403 and redden the job over a label that adds no review.
+          # Skip BEFORE the ERR trap is armed; a notice, not silence.
+          # (fixportal-workflows review 20260929T021338Z, CX-2.)
+          if [ "$ACTOR" = "dependabot[bot]" ]; then
+            echo "::notice::Dependency PRs are out of AI review by policy; skipping review tier classification."
+            exit 0
+          fi
 
           tier_high_on_failure() {
             gh label create review-high --repo "$GITHUB_REPOSITORY" --force \
@@ -73,12 +98,12 @@ jobs:
 
           # Policy from the BASE ref via the API: no checkout at all (nothing from the
           # PR head ever lands on disk), and a head-side policy edit cannot re-tier its
-          # own PR. The compare call below is API-based for the same reason.
-          # Fail CLOSED when the policy cannot be read at the base SHA (renamed, deleted,
+          # own PR.
+          # Fail CLOSED when the policy cannot be read at the base ref (renamed, deleted,
           # or the API errors): an unclassifiable PR keeps no label only if we say so
           # loudly here, not silently.
-          if ! policy=$(gh api "repos/$GITHUB_REPOSITORY/contents/.claude/review-policy.json?ref=$BASE_SHA" --jq '.content' 2>/dev/null | base64 --decode) || [ -z "$policy" ]; then
-            echo "::error::Could not read .claude/review-policy.json at base $BASE_SHA — refusing to tier. Failing closed."
+          if ! policy=$(gh api "repos/$GITHUB_REPOSITORY/contents/.claude/review-policy.json?ref=$BASE_REF" --jq '.content' 2>/dev/null | base64 --decode) || [ -z "$policy" ]; then
+            echo "::error::Could not read .claude/review-policy.json at base $BASE_REF — refusing to tier. Failing closed."
             tier_high_on_failure
             exit 1
           fi
@@ -93,7 +118,7 @@ jobs:
           # patterns read 0, high false, script still running. An empty `high: []` remains
           # legitimate and still succeeds; what fails now is jq failing.
           if ! patterns=$(jq -r '.high[]' <<< "$policy" 2>/dev/null); then
-            echo "::error::.claude/review-policy.json at base $BASE_SHA has no usable .high array — refusing to tier. Failing closed."
+            echo "::error::.claude/review-policy.json at base $BASE_REF has no usable .high array — refusing to tier. Failing closed."
             tier_high_on_failure
             exit 1
           fi
@@ -129,50 +154,73 @@ jobs:
           else
             retrieved=$(printf '%s\n' "$records" | grep -c . || true)
             files=$(printf '%s\n' "$records" | tr '\t' '\n' | grep -v '^$' || true)
-            if [ "$retrieved" -ne "$expected" ]; then
-              echo "::warning::Enumerated $retrieved of $expected changed files; tiering HIGH rather than under-tiering on a partial list."
-              high=true
-            elif [ "$retrieved" -ge 3000 ]; then
-              # The files endpoint stops at 3000. Whether changed_files is capped there too is
-              # unverified, and if it is, equal counts at the ceiling would look complete while
-              # HIGH paths past file 3000 go unread. Fail closed at the ceiling regardless.
-              echo "::warning::Enumerated $retrieved changed files, the files endpoint's 3000-file ceiling; tiering HIGH because the list may be truncated."
-              high=true
-            fi
+            # A non-numeric changed_files (`null` included) makes the -ne test below
+            # return 2 -- which inside an `if` condition counts as FALSE, so neither
+            # `set -e` nor the ERR trap fires and the completeness check silently does
+            # nothing. Guard the comparison; a count this job cannot read resolves to
+            # MORE review, never less. (fixportal-workflows review 20260929T021338Z, CX-4.)
+            case "$expected" in
+              ''|*[!0-9]*)
+                echo "::warning::changed_files came back non-numeric ('$expected'); tiering HIGH rather than trusting the enumeration."
+                high=true
+                ;;
+              *)
+                if [ "$retrieved" -ne "$expected" ]; then
+                  echo "::warning::Enumerated $retrieved of $expected changed files; tiering HIGH rather than under-tiering on a partial list."
+                  high=true
+                elif [ "$retrieved" -ge 3000 ]; then
+                  # The files endpoint stops at 3000. Whether changed_files is capped there too is
+                  # unverified, and if it is, equal counts at the ceiling would look complete while
+                  # HIGH paths past file 3000 go unread. Fail closed at the ceiling regardless.
+                  echo "::warning::Enumerated $retrieved changed files, the files endpoint's 3000-file ceiling; tiering HIGH because the list may be truncated."
+                  high=true
+                fi
+                ;;
+            esac
           fi
 
-          # Any high match tiers the PR HIGH. A bash `case` glob lets `*` cross `/`, but
-          # `**/` still demands at least one directory level. So a leading `**/` is also
-          # tried as its suffix (root files), and each mid-pattern `/**/` is also tried as
-          # the extglob `@(/|/*/)` -- zero or more WHOLE directories -- so `dir/**/x`
-          # matches `dir/x` without also matching a sibling like `dirx/`. Both retries only
-          # ADD matches, never remove one. (fixportal-agents-skills#264, item 5.)
+          # Any high match tiers the PR HIGH. Patterns are matched the way the LOCAL
+          # tiering hook matches them (~/.claude/hooks/pr-review-policy.sh): each glob is
+          # translated to an anchored ERE, so `*`/`?` match within one path segment and
+          # `**` is the cross-directory form. The bash `case` glob this replaced let a
+          # lone `*` cross `/` -- `infra/*` matched `infra/a/b.bicep` -- so the server
+          # DISAGREED with both the hook and assert_gate_coverage.py's copy of the same
+          # translation, always in the over-tier direction.
+          # (fixportal-workflows review 20260929T021338Z, F1; glob semantics from
+          # fixportal-agents-skills#264, item 5.)
           if ! $high; then
-            shopt -s extglob
+            # Translate a gitignore-style glob to an anchored ERE.
+            #   **/  -> (.*/)?     **  -> .*     *  -> [^/]*     ?  -> [^/]
+            #
+            # Two-pass via control-character placeholders. A single pass is WRONG and fails
+            # silently: substituting `**/` -> `(.*/)?` first means the very next rule (`*` ->
+            # `[^/]*`) rewrites the `*` that rule just emitted, yielding `(.[^/]*/)?` — which
+            # still looks like a regex and still matches things, so nothing errors; the glob
+            # just quietly stops matching nested paths and every migration tiers as NORMAL.
+            # Placeholders keep emitted output out of reach of later rules.
+            # Copied verbatim from ~/.claude/hooks/pr-review-policy.sh; the two must agree
+            # exactly. Defined INSIDE this block so the block stays self-contained.
+            glob_to_regex() {
+              printf '%s' "$1" | sed -E '
+                s/[][(){}.+^$|\\]/\\&/g
+                s#\*\*/#\x01#g
+                s#\*\*#\x02#g
+                s#\*#\x03#g
+                s#\?#\x04#g
+                s#\x01#(.*/)?#g
+                s#\x02#.*#g
+                s#\x03#[^/]*#g
+                s#\x04#[^/]#g'
+            }
             while IFS= read -r file; do
               [ -n "$file" ] || continue
               while IFS= read -r pattern; do
-                # shellcheck disable=SC2254  # the pattern comes from the policy file by design
-                case "$file" in
-                  $pattern) high=true ;;
-                esac
-                # Each leading `**/` is stripped in turn (a doubled `**/**/x` included), and
-                # every suffix gets the mid-pattern retry too, so `**/a/**/b` also matches
-                # `a/b` with zero directories at BOTH gaps.
-                rest=$pattern
-                while case "$rest" in '**/'*) true ;; *) false ;; esac; do
-                  rest=${rest#\*\*/}
-                  # shellcheck disable=SC2254  # policy patterns intentionally act as globs
-                  case "$file" in $rest) high=true ;; esac
-                  case "$rest" in
-                    *'/**/'*) # shellcheck disable=SC2254  # policy patterns intentionally act as globs
-                      case "$file" in ${rest//\/\*\*\//@(\/|\/*\/)}) high=true ;; esac ;;
-                  esac
-                done
-                case "$pattern" in
-                  *'/**/'*) # shellcheck disable=SC2254  # policy patterns intentionally act as globs
-                    case "$file" in ${pattern//\/\*\*\//@(\/|\/*\/)}) high=true ;; esac ;;
-                esac
+                [ -n "$pattern" ] || continue
+                re=$(glob_to_regex "$pattern")
+                if printf '%s\n' "$file" | grep -qE "^${re}$"; then
+                  high=true
+                  break
+                fi
               done <<< "$patterns"
               $high && break
             done <<< "$files"
