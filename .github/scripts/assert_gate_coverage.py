@@ -1470,11 +1470,12 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
     if body_indent is None:
         sys.exit(f"{workflow_path}: '{gate_job}' has an empty body -- it asserts nothing.")
     # The effective `defaults.run.shell` for the gate job's steps: the job's own first,
-    # then the workflow's. Workflow-level lines end at the first job -- the same slice
-    # gated_run_bodies reads for default working directories.
+    # then the workflow's. The workflow-level slice is every top-level line outside the
+    # jobs mapping -- `defaults:` may sit after `jobs:`, and missing it there re-opens
+    # the X1 noexec-shell bypass one key lower in the file.
     default_shell = default_run_shell(job_level_lines(block, body_indent))
     if default_shell is None:
-        default_shell = default_run_shell(lines[: min(jobs.values())])
+        default_shell = default_run_shell(workflow_level_lines(lines))
     job_if_value = key_pattern(body_indent, "if")
 
     condition = None
@@ -1984,11 +1985,11 @@ def working_directories(lines):
     `${{ github.workspace }}` is honoured only at the START of the value -- the one
     position where it names the checkout root this checker resolves against. A
     mid-string occurrence is left in place so the generic expression sentinel below
-    refuses it. And a workspace-rooted value whose `..` segments climb above the root
-    is refused with its own sentinel: gate_script_paths joins directories to script
-    candidates lexically, and a climb above the root resolves outside the checkout,
-    where nothing can be tiered HIGH. An interior `..` that never climbs past the root
-    (`sub/../other`) stays allowed.
+    refuses it. And a relative value whose `..` segments climb above the root --
+    workspace-rooted or plain -- is refused with its own sentinel: gate_script_paths
+    joins directories to script candidates lexically, and a climb above the root
+    resolves outside the checkout, where nothing can be tiered HIGH. An interior `..`
+    that never climbs past the root (`sub/../other`) stays allowed.
     """
     found = set()
     payloads = run_payload_indexes(lines)
@@ -2019,18 +2020,21 @@ def working_directories(lines):
                 found.add(f"!unsupported absolute working-directory: {value}")
                 continue
             value = value.strip("/")
-            if workspace_rooted:
-                depth = 0
-                for segment in value.split("/"):
-                    if segment == "..":
-                        depth -= 1
-                    elif segment and segment != ".":
-                        depth += 1
-                    if depth < 0:
-                        break
+            # Every RELATIVE value gets the climb check, not only workspace-rooted
+            # ones: a plain `..` resolves against the workspace and escapes the
+            # checkout by the same lexical join, and the bare-candidate suspension
+            # in gate_script_paths would let the script that runs go unchecked.
+            depth = 0
+            for segment in value.split("/"):
+                if segment == "..":
+                    depth -= 1
+                elif segment and segment != ".":
+                    depth += 1
                 if depth < 0:
-                    found.add(f"!unsupported working-directory climbing above the workspace root: {value}")
-                    continue
+                    break
+            if depth < 0:
+                found.add(f"!unsupported working-directory climbing above the workspace root: {value}")
+                continue
             if value:
                 found.add(value.rstrip("/"))
             continue
@@ -2079,6 +2083,32 @@ def job_level_lines(block, body_indent):
             continue
         out.append(line)
     return out
+
+
+def workflow_level_lines(lines):
+    """Top-level lines OUTSIDE the `jobs:` mapping, before or after it.
+
+    YAML does not fix the order of top-level keys, and GitHub accepts a
+    `defaults:` block after `jobs:`. Slicing at the first job line drops such a
+    block, and a dropped workflow-level default is invisible to the shell and
+    working-directory lookups that depend on it -- the X1 noexec-shell bypass
+    moves one key lower in the file. The jobs mapping ends exactly where
+    read_gate_contract ends it: the first later line that is not blank, not a
+    comment, and not indented.
+    """
+    start = next(
+        (i for i, line in enumerate(lines) if JOBS_KEY.match(strip_comment(line).rstrip())),
+        len(lines),
+    )
+    end = next(
+        (
+            i
+            for i in range(start + 1, len(lines))
+            if lines[i].strip() and not lines[i].startswith((" ", "#"))
+        ),
+        len(lines),
+    )
+    return lines[:start] + lines[end:]
 
 
 def _flow_entry_raw(text, wanted):
@@ -2333,7 +2363,7 @@ def delegated_workflow_run_bodies(root, ref, visited, include_directories=True):
         return
     first_job = min(jobs.values())
     job_indent = len(lines[first_job]) - len(lines[first_job].lstrip(" "))
-    workflow_directories = working_directories(lines[:first_job]) if include_directories else set()
+    workflow_directories = working_directories(workflow_level_lines(lines)) if include_directories else set()
     for job_id in jobs:
         block = job_block(lines, jobs, job_id)
         job_directories = set(workflow_directories)
@@ -2381,9 +2411,9 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root, include_directories=Tru
     control behind it.
     """
     job_indent = len(lines[jobs[gate_job]]) - len(lines[jobs[gate_job]].lstrip(" "))
-    # Workflow-level lines end at the first job; only `defaults.run` there can set a
-    # working directory for this job's steps.
-    workflow_directories = working_directories(lines[:min(jobs.values())]) if include_directories else set()
+    # Only workflow-level `defaults.run` -- outside the jobs mapping, before or after
+    # it -- can set a working directory for this job's steps.
+    workflow_directories = working_directories(workflow_level_lines(lines)) if include_directories else set()
     pending = list(set(needs) | {gate_job})
     seen = set()
     while pending:
