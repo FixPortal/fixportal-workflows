@@ -71,7 +71,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
-          ACTOR: ${{ github.actor }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -euo pipefail
 
@@ -79,9 +79,14 @@ jobs:
           # authors outright), so classification buys nothing on one — and if GitHub
           # hands a Dependabot pull_request_target run a read-only token, the label
           # writes below 403 and redden the job over a label that adds no review.
+          # Key on the pull request AUTHOR, not the event actor: a human re-run or
+          # edit of a Dependabot PR makes github.actor the human, and classifying
+          # then could pin review-high on a pull request CodeRabbit will never
+          # review -- and every later run on that PR would skip, never removing it.
           # Skip BEFORE the ERR trap is armed; a notice, not silence.
-          # (fixportal-workflows review 20260929T021338Z, CX-2.)
-          if [ "$ACTOR" = "dependabot[bot]" ]; then
+          # (fixportal-workflows review 20260929T021338Z, CX-2; author-keying is
+          # CodeRabbit Major on fixportal-workflows PR #54.)
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
             echo "::notice::Dependency PRs are out of AI review by policy; skipping review tier classification."
             exit 0
           fi
