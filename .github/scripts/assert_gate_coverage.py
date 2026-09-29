@@ -96,6 +96,7 @@ _REDIR = r"(?:\s*[12]?>>?\s*(?:&[12]|[^\s;|&]+))*"
 # command itself is still required separately by _FAIL.
 _ECHO = rf"(?:{_REDIR}\s*)?(?:echo|printf)\s+[^\n|&;<>]*{_REDIR}"
 _NONZERO_STATUS = r"0*(?:[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])"
+_FAIL_EXIT = rf"exit\s+{_NONZERO_STATUS}{_REDIR}\s*;?"
 _FAIL = rf"(?:exit\s+{_NONZERO_STATUS}|false){_REDIR}\s*;?"
 ACCEPTED_FAILING_FORMS = tuple(
     re.compile(pattern)
@@ -113,23 +114,42 @@ ACCEPTED_FAILING_FORMS = tuple(
         #
         # echo "..." ; exit 1     (message then failure, either separator style)
         rf"{_ECHO}\s*(?:;|&&)\s*{_FAIL}",
-        # PowerShell. `shell: pwsh` gate steps are house style in the .NET repos and
-        # `throw 'upstream failed'` is how one fails, so rejecting it was a false RED
-        # on a correct gate - the direction that gets a working control deleted to make
-        # CI green. The trailing message is optional because mask_quoted has already
-        # blanked the string by the time these patterns run. Admitting `throw` costs
-        # nothing under bash either: it is not a builtin there, so the step still exits
-        # non-zero (127), which is exactly what this function is asserting.
-        # UNCONDITIONAL only. `if ($false) { throw "failed" }` was accepted and does not
-        # throw, so the step exits 0 - the same fail-open as the `||` forms above.
-        # THE TAIL CANNOT CARRY A SEPARATOR: `.*` would let mask_quoted's blanked message
-        # admit `throw "upstream failed" || true`, normalising to `throw || true`, which
-        # fullmatches - but under bash `-e` does not fire on a command whose status
-        # `||` consumes, so the step exits 0. Excluding | & ; < > from the tail keeps the
-        # message arm and refuses every guarded form, exactly as the block above does.
-        r"throw(?:\s+[^|&;<>]*)?",
     )
 )
+# `false`, alone of the accepted failing forms, is not a builtin under BOTH
+# candidate shells: under bash it is one, but under pwsh it is not a keyword,
+# cmdlet, or alias, so it resolves through PATH -- the same GITHUB_PATH attack
+# _THROW documents for `throw` under bash, with the shells swapped. With no
+# readable shell the runner default may be pwsh on Windows, so a caller that has
+# NOT resolved the effective shell drops every `false` arm and vouches for
+# `exit` 1-255 alone, which is a builtin under either candidate.
+ACCEPTED_FAILING_FORMS_NO_FALSE = tuple(
+    re.compile(pattern)
+    for pattern in (
+        _FAIL_EXIT,
+        rf"{_ECHO}\s*(?:;|&&)\s*{_FAIL_EXIT}",
+    )
+)
+# `throw`, alone of the accepted failing forms, is not a bash builtin: bash resolves it
+# through PATH, and PATH is writable from an earlier step in the same job (GITHUB_PATH),
+# so a committed executable named `throw` that exits 0 turns a vouched gate green. The
+# old defence -- "not a builtin, so exits 127" -- covers only the no-executable case
+# (adversarial review 20260929T030431Z, X2). It is therefore accepted ONLY where it is a
+# language keyword, which is when the EFFECTIVE shell is pwsh: a step-level
+# `shell: pwsh`, or `defaults.run.shell` resolving to pwsh. With no shell key anywhere
+# the runner default is bash off Windows, so `throw` stays refused there too -- use
+# `exit 1-255`, or declare the shell. `shell: pwsh` gate steps are house style in the
+# .NET repos and `throw 'upstream failed'` is how one fails, so it remains accepted
+# there; the trailing message is optional because mask_quoted has already blanked the
+# string by the time the pattern runs.
+# UNCONDITIONAL only. `if ($false) { throw "failed" }` was accepted and does not
+# throw, so the step exits 0 - the same fail-open as the `||` forms above.
+# THE TAIL CANNOT CARRY A SEPARATOR: `.*` would let mask_quoted's blanked message
+# admit `throw "upstream failed" || true`, normalising to `throw || true`, which
+# fullmatches - but under bash `-e` does not fire on a command whose status
+# `||` consumes, so the step exits 0. Excluding | & ; < > from the tail keeps the
+# message arm and refuses every guarded form, exactly as the block above does.
+_THROW = re.compile(r"throw(?:\s+[^|&;<>]*)?")
 # A MESSAGE line is the only thing a failing command may follow. It writes output
 # and cannot re-decide the step's exit status, so vouching for it as a prefix does
 # not vouch for a command that could make the step succeed. This is _ECHO with the
@@ -507,7 +527,20 @@ def conditional_jobs(lines, jobs, job_indent):
         job_if = key_pattern(indent, "if")
         for i in range(start + 1, end):
             match = job_if.match(lines[i].rstrip("\r\n"))
-            if match and normalise_condition(match.group(1)) not in ("always()", "!cancelled()"):
+            if not match:
+                continue
+            # A block-scalar or empty `if:` (`if: >` then the expression on the next
+            # lines) matched the header and read as an opaque condition -- the job was
+            # counted conditional on the HEADER alone, so `if: >` / `always()` marked
+            # an unconditional feeder conditional (a false RED), and worse, a folded
+            # condition that is genuinely restrictive was never unfolded either.
+            # Unfold exactly the way tolerant_jobs and assert_gate_semantics already do
+            # for the same shapes.
+            value = strip_comment(match.group(1)).strip()
+            if not value or is_block_scalar_header(value):
+                body, _ = continuation_lines(lines, i, indent)
+                value = " ".join(strip_comment(line).strip() for line in body)
+            if normalise_condition(value) not in ("always()", "!cancelled()"):
                 conditional.add(job_id)
     return conditional
 
@@ -1076,7 +1109,7 @@ def mask_quoted(line, *, powershell=False):
     return "".join(out)
 
 
-def ends_non_zero(body):
+def ends_non_zero(body, *, allow_throw=False, allow_false=True):
     """True when the gate body is a RECOGNISED failing form, as a WHOLE.
 
     Splitting a de-quoted, de-commented line on command separators and accepting
@@ -1104,6 +1137,14 @@ def ends_non_zero(body):
     must fullmatch an accepted form. Anything else is refused rather than parsed.
 
     `body` is the joined run: body, with backslash continuations already folded.
+    `allow_throw` admits `_THROW` as a final form, and is for the caller that has
+    RESOLVED the effective shell to pwsh -- the only place `throw` is a keyword
+    rather than a PATH lookup (see _THROW). `allow_false=False` likewise drops
+    every `false` arm for the caller that has NOT resolved the effective shell:
+    `false` is a builtin only under bash, and an unknown shell may be pwsh on
+    Windows, where it resolves through PATH (see ACCEPTED_FAILING_FORMS_NO_FALSE).
+    `exit` 1-255 is a builtin under both candidate shells and stays accepted
+    either way.
     """
     # A COMMAND SUBEXPRESSION CAN EXIT THE STEP BEFORE THE FAILING COMMAND RUNS. Under
     # `shell: pwsh`, `echo "$(exit 0)"` exits ZERO during expansion, and mask_quoted
@@ -1137,29 +1178,39 @@ def ends_non_zero(body):
     for segment in segments[:-1]:
         if not (_MESSAGE.fullmatch(segment) or _SHELL_OPTION.fullmatch(segment)):
             return False
-    return any(form.fullmatch(segments[-1]) for form in ACCEPTED_FAILING_FORMS)
+    base = ACCEPTED_FAILING_FORMS if allow_false else ACCEPTED_FAILING_FORMS_NO_FALSE
+    forms = base + ((_THROW,) if allow_throw else ())
+    return any(form.fullmatch(segments[-1]) for form in forms)
 
 
-def powershell_ends_non_zero(body, windows_runner=False):
-    """Recognise a final PowerShell `throw`/nonzero `exit` after inert message lines."""
+def powershell_ends_non_zero(body, *, throw=True):
+    """Recognise a final PowerShell `throw`/nonzero `exit` after inert message lines.
+
+    The accepted `exit` range is 1-255 on EVERY job, with no Windows arm. There was
+    one, fed by a literal `runs-on:` scan, and it was wrong in both directions. The
+    range itself matters: under pwsh on Linux `exit 256` exits ZERO (the status is
+    truncated to 8 bits), so a body vouched for on a Windows assumption can succeed
+    on the runner that actually executes it -- pwsh on ubuntu-latest is an ordinary,
+    supported spelling. And the runner read was untrustworthy anyway:
+    `runs-on: ${{ matrix.os }}` is invisible to a literal scan, and a
+    `runs-on: windows-latest` line inside a `run:` payload is shell text, not a YAML
+    key. The only sound direction is the range that is nonzero under pwsh on every
+    OS, which is _NONZERO_STATUS -- the same 1-255 ends_non_zero accepts for bash.
+
+    `throw=False` drops the bare-`throw` arm for a body whose shell is UNKNOWN (no
+    step-level key, no `defaults.run.shell`): the runner default is bash off
+    Windows, and under bash `throw` resolves through PATH -- see _THROW. `exit`
+    1-255 is a builtin under both candidate shells and stays accepted either way.
+    """
     string = r"(?:'(?:[^'\n]|'')*'|\"(?:[^`\"\n]|`.)*\")"
     message = re.compile(rf"(?:Write-Host|Write-Output|Write-Information)(?:\s+{string})?", re.IGNORECASE)
-    status = r"[1-9][0-9]*" if windows_runner else _NONZERO_STATUS
-    failure = re.compile(rf"(?:throw(?:\s+{string})?|exit\s+{status})\s*", re.IGNORECASE)
+    final = rf"throw(?:\s+{string})?|" if throw else ""
+    failure = re.compile(rf"(?:{final}exit\s+{_NONZERO_STATUS})\s*", re.IGNORECASE)
     lines = [line.strip().rstrip(";").strip() for line in body.splitlines() if line.strip()]
     return bool(lines) and all(message.fullmatch(line) for line in lines[:-1]) and bool(failure.fullmatch(lines[-1]))
 
 
-def job_uses_windows_runner(block):
-    """Use Windows exit-code semantics only when the job declares a literal Windows runner."""
-    for line in block:
-        match = re.match(r"^\s*(?:'runs-on'|\"runs-on\"|runs-on)\s*:\s*(.*?)\s*$", strip_comment(line))
-        if match and re.search(r"(?i)(?<![A-Za-z0-9_])windows(?:-|\]|$)", match.group(1)):
-            return True
-    return False
-
-
-def step_can_fail(block, span, key_indent):
+def step_can_fail(block, span, key_indent, default_shell=None):
     """(ok, reason) for the step spanning `span`: can it actually fail its job?
 
     A condition proves only that the aggregation step is REACHED. `continue-on-error:
@@ -1176,6 +1227,14 @@ def step_can_fail(block, span, key_indent):
     What is refused here is the shapes a neutering diff actually takes: delete the
     exit, swap in `true`, or add continue-on-error. Inert TEXT is not accepted --
     see ends_non_zero.
+
+    `default_shell` is the job/workflow `defaults.run.shell` the caller resolved.
+    It applies when the step carries no `shell:` of its own, and it is held to the
+    SAME allowlist a step-level spelling is: a default this checker does not
+    recognise (`bash -n {0}` runs noexec -- the body is READ, never EXECUTED, and
+    exits 0 over a visible `exit 1`) must be refused, not assumed away. Reading only
+    the step key vouched for plain bash while the runner's actual shell did
+    something else entirely (adversarial review 20260929T030431Z, X1).
     """
     start, end = span
     # Keys are matched at the step's OWN column, so a `continue-on-error: true` line
@@ -1199,14 +1258,25 @@ def step_can_fail(block, span, key_indent):
         if value not in ("false", "") and static_truth(value) is not False:
             return False, "carries `continue-on-error`, so it cannot fail the job"
 
-    shell = "bash"
+    # None means NO `shell:` key, which is not the same as `shell: bash`: the runner
+    # default is bash off Windows and pwsh on Windows, and `runs-on:` cannot be read
+    # reliably (an expression value is invisible to a literal scan, and a `run:`
+    # payload line can merely look like the key). A no-key body is therefore vouched
+    # under EITHER shell's rules below -- accepted when bash or pwsh recognises it,
+    # refused when neither does. A `defaults.run.shell` the caller resolved overrides
+    # the runner default and is held to the same allowlist as a step-level spelling.
+    shell = None
     shell_key = step_key_pattern(key_indent, "shell")
     for i in range(start, end):
         match = shell_key.match(block[i])
         if match and len(match.group(1)) == key_indent:
             shell = decode_yaml_scalar(strip_inline_comment(match.group(2)).strip()).strip()
             break
-    if shell not in (
+    shell_from_default = False
+    if shell is None and default_shell is not None:
+        shell = default_shell
+        shell_from_default = True
+    if shell is not None and shell not in (
         "bash",
         "bash {0}",
         "bash --noprofile --norc -eo pipefail {0}",
@@ -1215,7 +1285,8 @@ def step_can_fail(block, span, key_indent):
         "pwsh -command . '{0}'",
         'pwsh -command ". \'{0}\'"',
     ):
-        return False, f"uses unsupported shell `{shell}`"
+        where = " from `defaults.run.shell`" if shell_from_default else ""
+        return False, f"uses unsupported shell `{shell}`{where}"
 
     run_key = step_key_pattern(key_indent, "run")
     for i in range(start, end):
@@ -1250,7 +1321,7 @@ def step_can_fail(block, span, key_indent):
         # backslash-continued echo read as failable commands.
         joined = "\n".join(body)
         joined = re.sub(r"\\\n\s*", " ", joined)
-        if shell.startswith("pwsh"):
+        if shell is None or shell.startswith("pwsh"):
             # STRIP COMMENTS BEFORE THE FULLMATCH, the way the bash path already does.
             # `continuation_lines` keeps comments intact deliberately, and ends_non_zero
             # masks then strips them (below). This arm did neither, so a pwsh
@@ -1270,20 +1341,55 @@ def step_can_fail(block, span, key_indent):
             for comment in reversed(list(re.finditer(r"(?m)(?<!\S)#[^\n]*", masked))):
                 probe = probe[: comment.start()] + probe[comment.end() :]
             if "$(" in probe or "${{" in probe:
-                return False, "uses pwsh with a command subexpression or GitHub expression the checker cannot verify"
-            if powershell_ends_non_zero(probe, job_uses_windows_runner(block)):
+                return False, "carries a command subexpression or GitHub expression the checker cannot verify"
+            if powershell_ends_non_zero(probe, throw=shell is not None):
                 return True, ""
-            return False, "uses pwsh; only inert Write-Host/Write-Output/Write-Information lines followed by throw or nonzero exit are supported"
-        if ends_non_zero(joined):
+            if shell is not None:
+                where = " (from `defaults.run.shell`)" if shell_from_default else ""
+                return False, (
+                    f"uses pwsh{where}; only inert Write-Host/Write-Output/Write-Information "
+                    "lines followed by throw or `exit` 1-255 are supported"
+                )
+            # No `shell:` key, and pwsh does not recognise the body: bash may. The
+            # accepted pwsh forms bar `throw` fail under bash as well -- measured with
+            # `bash --noprofile --norc -eo pipefail` (the runner's bash wrapper): a
+            # Write-Host/Write-Output/Write-Information line is `command not found`
+            # (127) and `-e` ends the step there, and a bare `exit N` exits N. So an
+            # accept above is never a body bash would pass, and falling through here
+            # cannot vouch for a step that succeeds. `throw` itself is the exception
+            # and was excluded above: bash resolves it through PATH, and an earlier
+            # step in this job can write PATH (GITHUB_PATH), so a committed executable
+            # named `throw` that exits 0 would turn the gate green -- it is accepted
+            # only when the effective shell is explicitly pwsh (see _THROW).
+        # `false` is the mirror image, excluded under an UNKNOWN shell: it is a
+        # builtin only under bash, and with no shell key the runner may be pwsh on
+        # Windows, where `false` resolves through the same writable PATH. It is
+        # therefore admitted only once the allowlist above has resolved the shell
+        # to a POSIX spelling -- explicit pwsh never reaches this line (it returns
+        # from the probe arm), so `shell is not None` here means bash.
+        if ends_non_zero(
+            joined,
+            allow_throw=shell is not None and shell.startswith("pwsh"),
+            allow_false=shell is not None,
+        ):
             return True, ""
+        where = f" The effective shell `{shell}` came from `defaults.run.shell`." if shell_from_default else ""
         return False, (
             "its `run:` body is not a recognised failing form, so this checker will not "
-            "vouch for it. Under bash use `exit 1`; `false`; or `echo \"...\"; exit 1`. "
-            "Under `shell: pwsh`, use an unconditional `throw`. Each may carry a trailing "
-            "redirection, and may be preceded by message lines (`echo`/`printf`) and "
-            "`set` shell-option lines only. A command subexpression `$(...)` anywhere "
-            "in the body is refused: under pwsh it can exit the step before the failing "
-            "command runs. "
+            "vouch for it." + where + " Under bash use `exit 1`; `false`; or `echo \"...\"; exit 1`. "
+            "Under `shell: pwsh` use inert Write-Host/Write-Output/Write-Information "
+            "lines followed by an unconditional `throw` or `exit` 1-255. With no "
+            "`shell:` key the body must satisfy one of those two minus `throw` and "
+            "`false`, because the runner default is bash off Windows and pwsh on "
+            "Windows, `runs-on:` cannot be read reliably, and each is only a builtin "
+            "under one of the two candidate shells -- under the other it resolves "
+            "through PATH, which an earlier step in the job can write via GITHUB_PATH. "
+            "Declare `shell: pwsh` to use `throw`, or `shell: bash` to use `false`. "
+            "Each bash form may "
+            "carry a trailing redirection, and may be "
+            "preceded by message lines (`echo`/`printf`) and `set` shell-option lines "
+            "only. A command subexpression `$(...)` anywhere in the body is refused: "
+            "under pwsh it can exit the step before the failing command runs. "
             "A gate step is not the place for shell this checker has to guess about, "
             "and a body guarded by its own `||`/`&&`/`if` test is refused because it "
             "exits ZERO on the other branch"
@@ -1363,6 +1469,12 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
     body_indent = job_body_indent(lines, jobs, gate_job, job_indent)
     if body_indent is None:
         sys.exit(f"{workflow_path}: '{gate_job}' has an empty body -- it asserts nothing.")
+    # The effective `defaults.run.shell` for the gate job's steps: the job's own first,
+    # then the workflow's. Workflow-level lines end at the first job -- the same slice
+    # gated_run_bodies reads for default working directories.
+    default_shell = default_run_shell(job_level_lines(block, body_indent))
+    if default_shell is None:
+        default_shell = default_run_shell(lines[: min(jobs.values())])
     job_if_value = key_pattern(body_indent, "if")
 
     condition = None
@@ -1487,7 +1599,7 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
         span = step_span(block, index, len(match.group(1)))
         if span is None:
             continue
-        ok, reason = step_can_fail(block, span, len(match.group(1)))
+        ok, reason = step_can_fail(block, span, len(match.group(1)), default_shell)
         if not ok:
             continue
         for job_id, outcomes in coverage:
@@ -1560,8 +1672,14 @@ GATE_SCRIPT = re.compile(
     # review before wiring it into a merge barrier. Spelled as character classes rather
     # than an inline `(?i:...)` group, which needs Python 3.11 -- this asset runs on
     # whatever python3 a consuming repository's runner provides.
+    #
+    # `.mjs`/`.js` are admitted on review evidence: a JavaScript gate script
+    # (`node scripts/gate.mjs`) matched nothing here, so gate_script_paths never saw
+    # it and the script stayed editable in a NORMAL-tier pull request. Widening here
+    # widens DETECTION only -- more scripts required HIGH, never fewer. The trailing
+    # `\b` is what keeps `.jsx` out: `js` followed by a word character never matches.
     r"""(?<![\w.-])(?:\.[\\/])?[\\/]?((?:[\w.-]+[\\/])*(?:\.github[\\/]scripts|scripts|build|tools)[\\/]"""
-    r"""[\w.\\/-]*\.(?:[Pp][Ss]1|[Pp][Yy]|[Ss][Hh]))\b"""
+    r"""[\w.\\/-]*\.(?:[Pp][Ss]1|[Pp][Yy]|[Ss][Hh]|[Mm][Jj][Ss]|[Jj][Ss]))\b"""
 )
 # A `run:` key at any depth. Group 1 is everything before the key, so its LENGTH is the
 # key's own column -- which is what continuation_lines needs to find a block scalar's
@@ -1854,10 +1972,31 @@ STEPS_KEY = re.compile(r"""^(?:'steps'|"steps"|steps)\s*:""")
 
 
 def working_directories(lines):
-    """Every working directory, resolving github.workspace and refusing unknown expressions."""
+    """Every working directory, resolving github.workspace and refusing unknown expressions.
+
+    `run:` block-scalar payload lines are skipped via run_payload_indexes: a
+    `working-directory:` line inside a heredoc or embedded script is shell text, not a
+    YAML key, and reading it reddened a correct workflow over an expression it never
+    executes as a directory -- and an `!unsupported ...` entry exits HARD, so that read
+    was a false RED on the control this function feeds. Same distinction the LOCAL_USES
+    scans draw, for the same reason.
+
+    `${{ github.workspace }}` is honoured only at the START of the value -- the one
+    position where it names the checkout root this checker resolves against. A
+    mid-string occurrence is left in place so the generic expression sentinel below
+    refuses it. And a workspace-rooted value whose `..` segments climb above the root
+    is refused with its own sentinel: gate_script_paths joins directories to script
+    candidates lexically, and a climb above the root resolves outside the checkout,
+    where nothing can be tiered HIGH. An interior `..` that never climbs past the root
+    (`sub/../other`) stays allowed.
+    """
     found = set()
+    payloads = run_payload_indexes(lines)
     index = 0
     while index < len(lines):
+        if index in payloads:
+            index += 1
+            continue
         line = lines[index]
         match = WORKDIR.match(strip_comment(line))
         if match:
@@ -1869,8 +2008,9 @@ def working_directories(lines):
             else:
                 index += 1
             value = value.strip().strip("'\"")
-            workspace_rooted = bool(re.search(r"\$\{\{\s*github\.workspace\s*\}\}", value, re.IGNORECASE))
-            value = re.sub(r"\$\{\{\s*github\.workspace\s*\}\}", "", value, flags=re.IGNORECASE)
+            workspace_rooted = bool(re.match(r"\$\{\{\s*github\.workspace\s*\}\}", value, re.IGNORECASE))
+            if workspace_rooted:
+                value = re.sub(r"\$\{\{\s*github\.workspace\s*\}\}", "", value, count=1, flags=re.IGNORECASE)
             if "${{" in value:
                 found.add(f"!unsupported working-directory expression: {value}")
                 continue
@@ -1879,6 +2019,18 @@ def working_directories(lines):
                 found.add(f"!unsupported absolute working-directory: {value}")
                 continue
             value = value.strip("/")
+            if workspace_rooted:
+                depth = 0
+                for segment in value.split("/"):
+                    if segment == "..":
+                        depth -= 1
+                    elif segment and segment != ".":
+                        depth += 1
+                    if depth < 0:
+                        break
+                if depth < 0:
+                    found.add(f"!unsupported working-directory climbing above the workspace root: {value}")
+                    continue
             if value:
                 found.add(value.rstrip("/"))
             continue
@@ -1927,6 +2079,178 @@ def job_level_lines(block, body_indent):
             continue
         out.append(line)
     return out
+
+
+def _flow_entry_raw(text, wanted):
+    """The RAW depth-1 value text for `wanted` in a `{...}` flow mapping, or None.
+
+    parse_flow_mapping drops a nested mapping's value (its callers need scalars
+    only); this walk keeps the raw span, braces included, so the caller can descend
+    into it. Quote- and depth-aware in exactly parse_flow_mapping's way: a quoted
+    span is data, and `#` opens a comment only outside quotes.
+    """
+    length = len(text)
+
+    def skip_gap(i):
+        while i < length:
+            if text[i] in " \t\r\n":
+                i += 1
+            elif text[i] == "#":
+                newline = text.find("\n", i)
+                i = length if newline == -1 else newline + 1
+            else:
+                break
+        return i
+
+    def read_quoted(i):
+        quote = text[i]
+        i += 1
+        while i < length:
+            char = text[i]
+            if quote == '"' and char == BACKSLASH and i + 1 < length:
+                i += 2
+                continue
+            if char == quote:
+                if quote == "'" and text[i + 1 : i + 2] == "'":
+                    i += 2
+                    continue
+                return i + 1
+            i += 1
+        return i
+
+    index = skip_gap(0)
+    if index >= length or text[index] != "{":
+        return None
+    depth = 1
+    index += 1
+    while index < length and depth > 0:
+        index = skip_gap(index)
+        if index >= length:
+            break
+        char = text[index]
+        if char == "{":
+            depth += 1
+            index += 1
+            continue
+        if char == "}":
+            depth -= 1
+            index += 1
+            continue
+        if char == ",":
+            index += 1
+            continue
+        if depth != 1:
+            if char in "'\"":
+                index = read_quoted(index)
+            else:
+                index += 1
+            continue
+        if char in "'\"":
+            key_end = read_quoted(index)
+            key = text[index + 1 : key_end - 1]
+            index = key_end
+        else:
+            start = index
+            while index < length and text[index] not in ",{}: \t\r\n":
+                index += 1
+            key = text[start:index]
+        index = skip_gap(index)
+        if index >= length or text[index] != ":":
+            continue
+        index = skip_gap(index + 1)
+        start = index
+        if index < length and text[index] in "'\"":
+            index = read_quoted(index)
+        elif index < length and text[index] == "{":
+            nested = 0
+            while index < length:
+                char = text[index]
+                if char in "'\"":
+                    index = read_quoted(index)
+                    continue
+                if char == "{":
+                    nested += 1
+                elif char == "}":
+                    nested -= 1
+                    if nested == 0:
+                        index += 1
+                        break
+                index += 1
+        else:
+            while index < length and text[index] not in ",} \t\r\n":
+                index += 1
+        if key == wanted:
+            return text[start:index].strip()
+    return None
+
+
+def _block_entry(lines, index, base, wanted):
+    """(raw value, line index, line indent) of `wanted` among the block children of the
+    mapping whose key sits at indent `base` on `lines[index]`; (None, None, None)
+    when absent.
+
+    The first child fixes the mapping's indent; a `wanted:` at any deeper indent
+    belongs to a nested mapping and is not read -- which is what scopes a
+    `defaults:` -> `run:` -> `shell:` descent to that one path.
+    """
+    key = re.compile(rf"^(?:'{wanted}'|\"{wanted}\"|{wanted})\s*:\s*(.*)$")
+    child_indent = None
+    for follow in range(index + 1, len(lines)):
+        line = lines[follow]
+        if COMMENT_OR_BLANK.match(line):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent <= base:
+            break
+        if child_indent is None:
+            child_indent = indent
+        if indent != child_indent:
+            continue
+        match = key.match(line.strip())
+        if match:
+            return match.group(1), follow, indent
+    return None, None, None
+
+
+def _nested_entry(lines, index, indent, inline, wanted):
+    """(raw value, line index, line indent) of `wanted` one mapping level below the key
+    on `lines[index]` (itself at `indent`, with inline text `inline`) -- from its
+    block children, or from its flow mapping. (None, None, None) when the key's
+    value is not a mapping or has no such entry. A flow value is read with the rest
+    of the file as its continuation, as resolve_runs_using does for `runs:`."""
+    if inline.lstrip().startswith("{"):
+        return _flow_entry_raw("\n".join([inline] + list(lines[index + 1:])), wanted), index, indent
+    if strip_inline_comment(inline).strip():
+        return None, None, None
+    return _block_entry(lines, index, indent, wanted)
+
+
+def default_run_shell(lines):
+    """The `shell:` value nested under `defaults:` -> `run:` in `lines`, or None.
+
+    Scoped to that one path: a bare `shell:` anywhere else (an environment variable
+    named shell, say) is NOT the runner's default shell, and reading it as one
+    vouches for pwsh-only forms under a bash that never runs. Both spellings are
+    resolved: the ordinary block form, descended by indentation, and the flow form
+    (`defaults: {run: {shell: bash}}`), whose nested braces are walked with quotes
+    honoured so a `}` inside a value cannot end the read early. `run:` also appears
+    as a STEP key; the scoped descent is why a step's own `run:` is never read here.
+    (Adversarial review 20260929T030431Z, X1.)
+    """
+    defaults_key = re.compile(r"""^\s*(?:'defaults'|"defaults"|defaults)\s*:\s*(.*)$""")
+    for index, line in enumerate(lines):
+        match = defaults_key.match(line)
+        if not match:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        run, run_index, run_indent = _nested_entry(lines, index, indent, match.group(1), "run")
+        if run is None:
+            continue
+        shell, _, _ = _nested_entry(lines, run_index, run_indent, run, "shell")
+        if shell is None:
+            continue
+        return decode_yaml_scalar(strip_inline_comment(shell).strip()).strip()
+    return None
 
 
 def delegated_run_bodies(root, ref, visited, include_directories=True):
@@ -2120,7 +2444,7 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root, include_directories=Tru
         pending.extend(job_needs(lines, jobs, job_id, job_indent) - seen)
 
 
-def resolve_committed_paths(root, relative):
+def resolve_committed_paths(root, relative, allow_outside_repository=False):
     """The COMMITTED spelling(s) of `relative` under `root`; empty when it resolves to
     no file at all.
 
@@ -2151,6 +2475,12 @@ def resolve_committed_paths(root, relative):
 
     The cost is one `iterdir` per path segment per gate script found, and a repository
     has a handful of gate scripts at most.
+
+    `allow_outside_repository` suspends the outside-repository exit for a candidate
+    that is only a SPECULATIVE spelling of a reference a working directory already
+    anchored -- see gate_script_paths. A resolved-outside file is then simply not
+    returned (nothing outside the checkout can be tiered HIGH), and the exit keeps
+    its force for the only spelling there is.
     """
     # NORMALISE DOT COMPONENTS FIRST. `iterdir()` never yields `.` or `..`, so walking
     # them literally matches nothing and drops the candidate -- fail-open. The exact
@@ -2234,7 +2564,7 @@ def resolve_committed_paths(root, relative):
             spelled = real.relative_to(root.resolve()).as_posix()
             if spelled not in matches:
                 resolved_matches.append(spelled)
-        elif real.is_file():
+        elif real.is_file() and not allow_outside_repository:
             sys.exit(f"{root}: gate script resolves outside the repository: {relative}")
     except (OSError, ValueError):
         # A broken or circular link cannot be read by the runner either. Keep the
@@ -2268,17 +2598,18 @@ _KEYWORDS = r"(?:(?:then|do|else|if|elif|while|until|!)\s+)*"
 # too (`cd>log` is `cd` to $HOME); `#` does not, since `cd#x` is one word, not a comment.
 # A `$` expansion does end it, in effect: `cd$X`, `cd${SUB}` and `cd$(...)` run `cd` when
 # the expansion is empty or begins with whitespace (word splitting), so they fail closed.
-_ASSIGNMENT_WORD = r"[A-Za-z_][A-Za-z0-9_]*=(?:'(?:[^']|'')*'|\"(?:\\.|[^\"])*\"|[^\s;&|]+)"
+# An assignment prefix. The BARE value alternative admits EMPTY (`*`, not `+`):
+# mask_quoted blanks a quoted value to spaces, so `A="x y" B=1 cd sub` reads as
+# `A=      B=1 cd sub` in the masked copy DIRECTORY_CHANGE runs against -- with `+`
+# the first assignment failed to parse there, the whole prefix chain collapsed, and
+# the directory change was missed. Empty is also REAL shell: `A= cd sub` runs cd with
+# A empty. The masked read now covers every spelling, so the raw-line second pattern
+# that used to paper over this (QUOTED_ASSIGNMENT_DIRECTORY_CHANGE) is gone -- keeping
+# two patterns in agreement was a cost with no coverage behind it.
+_ASSIGNMENT_WORD = r"[A-Za-z_][A-Za-z0-9_]*=(?:'(?:[^']|'')*'|\"(?:\\.|[^\"])*\"|[^\s;&|]*)"
 _DIRECTORY_COMMAND = r"(?:(?:command|builtin)\s+|" + _ASSIGNMENT_WORD + r"\s+)*(?P<directory>cd|pushd|Push-Location|Set-Location)(?=[\s;&|()`<>$]|$)"
 # An unquoted backtick opens a command substitution just as `$(` does, so it anchors too.
 DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|(`{])\s*" + _KEYWORDS + _DIRECTORY_COMMAND, re.IGNORECASE)
-_QUOTED_ASSIGNMENT_WORD = r"[A-Za-z_][A-Za-z0-9_]*=(?:'(?:[^']|'')*'|\"(?:\\.|[^\"])*\")"
-QUOTED_ASSIGNMENT_DIRECTORY_CHANGE = re.compile(
-    r"(?:^|[;&|(`{])\s*" + _KEYWORDS +
-    r"(?:(?:command|builtin)\s+)*(?:" + _QUOTED_ASSIGNMENT_WORD + r"\s+)+"
-    r"(?P<directory>cd|pushd|Push-Location|Set-Location)(?=[\s;&|()`<>$]|$)",
-    re.IGNORECASE,
-)
 # A directory change as a command INSIDE a quoted string, which may span lines. An opening
 # `$(` or backtick starts a command too: a substitution runs even inside printed text.
 SEGMENT_DIRECTORY_CHANGE = re.compile(
@@ -2294,7 +2625,7 @@ MESSAGE_COMMAND = re.compile(
 )
 
 
-def quoted_segments(text):
+def quoted_segments(text, powershell=False):
     """(start, end, content) of every quoted ARGUMENT in `text`, by mask_quoted's rules.
 
     `start` is the opening quote's index and `end` the closing quote's.
@@ -2302,6 +2633,12 @@ def quoted_segments(text):
     Spans that touch with nothing between them (`"cd sub; "'python3 x.py'`) are one shell
     argument, so they are returned as one segment. An unterminated quote runs to the end
     of the text, as it does in mask_quoted.
+
+    The escape rules are mask_quoted's and must stay in step with it: in PowerShell
+    mode a backtick escapes inside `"..."` and a doubled `''` escapes inside `'...'`;
+    in bash mode a backslash escapes anywhere outside single quotes. The caller cuts
+    `before`/`after` spans out of mask_quoted's output at THESE offsets, so a drift
+    between the two would cut the original at the wrong place.
     """
     segments = []
     quote = None
@@ -2310,7 +2647,13 @@ def quoted_segments(text):
     index = 0
     while index < len(text):
         char = text[index]
-        if quote != "'" and char == BACKSLASH and index + 1 < len(text):
+        if powershell and quote == "'" and char == "'" and text[index + 1:index + 2] == "'":
+            index += 2
+            continue
+        if (
+            (powershell and quote == '"' and char == "`")
+            or (not powershell and quote != "'" and char == BACKSLASH)
+        ) and index + 1 < len(text):
             index += 2
             continue
         if quote is None and char in "'\"":
@@ -2361,6 +2704,15 @@ def changes_directory(body):
     (`echo "cd sub; ..." | bash`) -- each of those runs the text. Adjacent quoted spans
     are read as the one argument they are.
 
+    BOTH quoting disciplines are tried, bash and PowerShell, and either verdict counts.
+    Which shell runs a body is not reliably known here -- a step with no `shell:` key
+    runs bash off Windows and pwsh on it -- and the disciplines differ exactly where it
+    matters: pwsh does not treat `\"` as an escape, so bash masking never closes
+    `Write-Host "cache: C:\" ; Set-Location sub` and the real directory change after the
+    string stays masked. Testing both can only ADD a detection; a wrong positive costs a
+    refused workflow while a wrong negative costs an untiered gate script, and those are
+    not symmetric.
+
     THE BOUNDARY, stated so a pass is not read as more than it is: this is a line-level
     heuristic, not a shell parser. It covers the ways a workflow author ordinarily writes a
     directory change -- `cd`/`pushd`/`Set-Location` as a command, in a quoted `-c` string,
@@ -2371,37 +2723,66 @@ def changes_directory(body):
     """
     # Backtick pairs are counted across the whole body, not per line: a substitution may
     # close on a later line, and its closing backtick must not read as an opening one.
-    unquoted = opening_backticks_only("\n".join(mask_quoted(line) for line in body))
-    for line, visible in zip(body, unquoted.split("\n")):
-        if DIRECTORY_CHANGE.search(visible):
-            return True
-        # Also inspect the original line so quoted assignment values such as
-        # `X="1 2" cd sub` remain parseable. Require the quoted assignment prefix so
-        # a backtick inside a printed message cannot become a synthetic command boundary.
-        for match in QUOTED_ASSIGNMENT_DIRECTORY_CHANGE.finditer(line):
-            command = match.span("directory")
-            if visible[command[0]:command[1]].casefold() == match.group("directory").casefold():
+    for powershell in (False, True):
+        unquoted = opening_backticks_only(
+            "\n".join(mask_quoted(line, powershell=powershell) for line in body)
+        )
+        for visible in unquoted.split("\n"):
+            if DIRECTORY_CHANGE.search(visible):
                 return True
     text = "\n".join(body)
-    masked = mask_quoted(text)
-    for start, end, content in quoted_segments(text):
-        if not (SEGMENT_DIRECTORY_CHANGE.search(opening_backticks_only(content)) and GATE_SCRIPT.search(content)):
-            continue
-        line_start = text.rfind("\n", 0, start) + 1
-        line_end = text.find("\n", end)
-        # MASKED, so an earlier string that already closed on this line (`echo "$(date)";`)
-        # cannot leak its `$(` into this one's test; an unquoted `$(` stays visible.
-        before = masked[line_start:start]
-        after = masked[end + 1:line_end if line_end != -1 else len(text)]
-        executed = (
-            "$(" in content or "`" in content          # a substitution inside the string
-            or "$(" in before or "`" in before         # the string sits inside a substitution
-            or PIPE.search(after) is not None          # the string is piped onward
-        )
-        if MESSAGE_COMMAND.search(masked[:start]) and not executed:
-            continue
-        return True
+    for powershell in (False, True):
+        masked = mask_quoted(text, powershell=powershell)
+        for start, end, content in quoted_segments(text, powershell=powershell):
+            if not (SEGMENT_DIRECTORY_CHANGE.search(opening_backticks_only(content)) and GATE_SCRIPT.search(content)):
+                continue
+            line_start = text.rfind("\n", 0, start) + 1
+            line_end = text.find("\n", end)
+            # MASKED, so an earlier string that already closed on this line (`echo "$(date)";`)
+            # cannot leak its `$(` into this one's test; an unquoted `$(` stays visible.
+            before = masked[line_start:start]
+            after = masked[end + 1:line_end if line_end != -1 else len(text)]
+            executed = (
+                "$(" in content or "`" in content          # a substitution inside the string
+                or "$(" in before or "`" in before         # the string sits inside a substitution
+                or PIPE.search(after) is not None          # the string is piped onward
+            )
+            if MESSAGE_COMMAND.search(masked[:start]) and not executed:
+                continue
+            return True
     return False
+
+
+def _recognised_suffixes(relative):
+    """Every suffix of `relative` starting at a segment GATE_SCRIPT recognises.
+
+    GATE_SCRIPT's prefix classes are greedy, so a reference like
+    `$GITHUB_WORKSPACE/scripts/gate.py` is captured WITH its prefix
+    (`GITHUB_WORKSPACE/scripts/gate.py`), and finditer never retries inside a consumed
+    match -- the suffix that actually exists in the checkout is never seen, and the
+    prefixed spelling resolves to nothing and is dropped. Yielding each suffix that
+    begins at a `scripts`/`build`/`tools` segment (or a `.github` segment followed by
+    `scripts`, mirroring the regex) recovers it. More candidates, never fewer.
+
+    A prefix that CLIMBS disqualifies the suffix: `scripts/../../scripts/probe.ps1`
+    escapes the checkout, and its `scripts/probe.ps1` suffix is a DIFFERENT file at
+    run time -- one the repository may legitimately carry. Asserting it would redden
+    the checkout over a script that never runs, which is the false-RED direction.
+    Cancelled climbs are not recovered here because they need no recovery: the full
+    relative is always a candidate and resolve_committed_paths reduces it lexically.
+    """
+    segments = relative.split("/")
+    climbed = False
+    for index, segment in enumerate(segments):
+        if segment == "..":
+            climbed = True
+            continue
+        if climbed:
+            continue
+        if segment in ("scripts", "build", "tools") or (
+            segment == ".github" and segments[index + 1:index + 2] == ["scripts"]
+        ):
+            yield "/".join(segments[index:])
 
 
 def gate_script_paths(lines, jobs, needs, gate_job, root):
@@ -2427,16 +2808,33 @@ def gate_script_paths(lines, jobs, needs, gate_job, root):
                 sys.exit(f"{root}: {unsupported[1:]}")
             if changes_directory(body):
                 sys.exit(f"{root}: cannot verify gate script paths after a directory change in job '{job_id}'; use working-directory:")
+            relatives = {relative} | set(_recognised_suffixes(relative))
             # Every plausible spelling is kept -- the repository root, and each directory
             # that applies to this run body (workflow and job defaults, the body's own
             # step, a composite action's own directory). More scripts required HIGH,
             # never fewer.
-            candidates = {relative} | {
-                directory + "/" + relative for directory in directories
+            qualified = {
+                directory + "/" + suffix
+                for directory in directories
                 if directory and not directory.startswith("!unsupported ")
+                for suffix in relatives
             }
-            for candidate in candidates:
+            # A BARE candidate is the same reference read from the repository root. When
+            # a working directory anchors the reference the qualified candidates are the
+            # real resolution and the bare one is speculative -- a `..` in it can then
+            # resolve outside the checkout with nothing being wrong (`working-directory:
+            # sub` plus `run: python3 ../scripts/gate.py`), so the outside-repository
+            # exit is suspended for it. With NO working directory the bare spelling is
+            # the only evidence there is and the exit still fires -- fail-closed exactly
+            # where it matters.
+            allow_outside = bool(qualified)
+            for candidate in qualified:
                 for committed in resolve_committed_paths(root, candidate):
+                    found.setdefault(committed, job_id)
+            for candidate in relatives:
+                for committed in resolve_committed_paths(
+                    root, candidate, allow_outside_repository=allow_outside
+                ):
                     found.setdefault(committed, job_id)
     # Local actions and reusable workflows execute from the PR checkout too. Their
     # own files therefore need HIGH coverage even when their run bodies contain no
@@ -2597,41 +2995,89 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
     root = policy_root(workflow_path) or Path(workflow_path).resolve().parent.parent.parent
     # Quoted keys admitted, as for every other key this checker reads: `"BASH_ENV":` is the
     # same env key, and missing it let the override through.
+    #
+    # A bare `BASH_ENV:` line is an env assignment ONLY when it sits inside an `env:`
+    # block. Matching it file-wide flagged any nested key that happens to share the
+    # name -- an action's `with:` input, a matrix value -- and reddened workflows that
+    # set no environment variable at all (adversarial review 20260929T030431Z, F7b).
+    # So the open `env:` block is tracked by indentation: its children sit deeper than
+    # the `env` key's own column (for the `- env:` sequence spelling that column is
+    # past the dash), and the first non-blank line at or before the column ends it.
+    # Block-scalar VALUES inside the block (`SCRIPT: |`) are string content, not
+    # keys, and their payload lines are skipped over.
     bash_env_key = False
+    env_block_indent = None
+    env_scalar_indent = None
     for index, line in enumerate(lines):
         if index in payload_indexes:
             continue
         stripped = strip_comment(line)
-        if re.match(r"""^\s*(?:'BASH_ENV'|"BASH_ENV"|BASH_ENV)\s*:""", stripped):
-            bash_env_key = True
-            break
-        env = re.match(r"""^\s*(?:'env'|"env"|env)\s*:\s*(.*)$""", stripped)
-        if env and env.group(1).lstrip().startswith("{"):
-            entries = parse_flow_mapping(env.group(1).strip())
+        text = stripped.strip()
+        indent = len(line) - len(line.lstrip(" "))
+        if env_block_indent is not None:
+            if not text:
+                continue
+            if env_scalar_indent is not None:
+                if indent > env_scalar_indent:
+                    continue
+                env_scalar_indent = None
+            if indent <= env_block_indent:
+                env_block_indent = None
+            else:
+                if re.match(r"""(?:'BASH_ENV'|"BASH_ENV"|BASH_ENV)\s*:""", stripped.lstrip()):
+                    bash_env_key = True
+                    break
+                if re.match(r"""^\s*(?:'[^'\n]+'|"[^"\n]+"|[A-Za-z0-9_.-]+)\s*:\s*[|>]""", stripped):
+                    env_scalar_indent = indent
+                continue
+        # The env value is read off the RAW line, not the comment-stripped one: a `#`
+        # inside a quoted value is data, and cutting there left an unterminated
+        # fragment that raised on valid YAML -- the same false RED resolve_runs_using's
+        # flow-mapping arm documents. The dash allowance admits `- env: {…}`, the
+        # spelling the key takes when it opens a step's sequence item; without it that
+        # inline mapping was never read at all.
+        env = re.match(r"""^(\s*)(?:-(\s+))?(?:'env'|"env"|env)\s*:\s*(.*)$""", line)
+        if not env:
+            continue
+        if env.group(3).lstrip().startswith("{"):
+            # A flow mapping may span lines, so the rest of the file is handed over as
+            # the continuation -- the same call shape resolve_runs_using uses. The
+            # parser itself tracks quotes and comments, so trailing text is safe.
+            entries = parse_flow_mapping("\n".join([env.group(3)] + list(lines[index + 1:])))
             if entries is None:
                 sys.exit(f"{workflow_path}: cannot parse an inline env mapping; refusing to verify BASH_ENV.")
             if any(key.strip("'\"") == "BASH_ENV" for key, _ in entries):
                 bash_env_key = True
                 break
+        elif not strip_comment(env.group(3)).strip():
+            env_block_indent = len(env.group(1)) + (1 + len(env.group(2)) if env.group(2) else 0)
     if not bash_env_key:
         seen_run_bodies = set()
         for job_id, _, body, _ in gated_run_bodies(
             lines, jobs, needs, gate_job, root, include_directories=False
         ):
+            # GITHUB_ENV is per-JOB, so a feeder's BASH_ENV override never reaches the
+            # gate job's shell -- scanning feeder bodies reddened harmless text, and
+            # the gate job's bodies are the only ones whose later steps run under the
+            # override. Delegated action bodies arrive under the CALLING job's id, so
+            # the gate job's own local actions stay in scope.
+            if job_id != gate_job:
+                continue
             body_key = (job_id, tuple(body))
             if body_key in seen_run_bodies:
                 continue
             seen_run_bodies.add(body_key)
             body_text = "\n".join(body)
-            # Fail closed across the whole run body: heredoc payloads split the
-            # BASH_ENV assignment from the GITHUB_ENV redirection onto separate lines.
-            # This intentionally may reject an unrelated assignment plus env write in
-            # one step; parsing arbitrary shell/heredoc semantics is out of scope.
-            if (
-                re.search(r"(?i)\bBASH_ENV\s*=", body_text)
-                and re.search(r"(?i)(?:>>?|\btee\b)", body_text)
-                and re.search(r"(?i)\$\{?GITHUB_ENV\}?", body_text)
-            ):
+            # The bare token, refused outright. The conjunction this replaces -- an
+            # assignment AND a redirection AND a `$GITHUB_ENV` spelling -- missed real
+            # overrides: `echo "BASH_ENV<<EOF" >> "$GITHUB_ENV"` writes heredoc syntax
+            # THROUGH the env file and carries no `=`, and pwsh's
+            # `Out-File -FilePath $env:GITHUB_ENV -Append` matches neither the
+            # redirection nor the `$GITHUB_ENV` spelling. What the override attacks is
+            # the gate's accepted failing forms, so ANY mention is refused here, even
+            # in an echo: a gate step is not the place for text this checker has to
+            # classify.
+            if re.search(r"(?i)\bBASH_ENV\b", body_text):
                 bash_env_key = True
                 break
     if bash_env_key:
@@ -2665,11 +3111,24 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
         start = jobs[job_id]
         end = min((i for i in jobs.values() if i > start), default=len(lines))
         indent = job_body_indent(lines, jobs, job_id, job_indent)
-        pattern = key_pattern(indent, "if") if indent is not None else None
-        condition = next((normalise_condition(match.group(1))
-                          for i in range(start + 1, end)
-                          if pattern and (match := pattern.match(lines[i].rstrip("\r\n")))), "")
-        return condition in ("always()", "!cancelled()")
+        if indent is None:
+            return False
+        pattern = key_pattern(indent, "if")
+        for i in range(start + 1, end):
+            match = pattern.match(lines[i].rstrip("\r\n"))
+            if not match:
+                continue
+            # Unfold a block-scalar or empty `if:` before judging it, the same
+            # unfold conditional_jobs above and assert_gate_semantics both do: an
+            # `if: >` whose folded text is `always()` otherwise normalises from the
+            # bare header to something unrecognised and the feeder is treated as
+            # skippable -- a false RED on a chain that does run regardless.
+            value = strip_comment(match.group(1)).strip()
+            if not value or is_block_scalar_header(value):
+                body, _ = continuation_lines(lines, i, indent)
+                value = " ".join(strip_comment(line).strip() for line in body)
+            return normalise_condition(value) in ("always()", "!cancelled()")
+        return False
 
     unsafe_feeders = set()
     for feeder in set(needs) - {gate_job}:
@@ -2757,7 +3216,16 @@ def main(argv):
         # returning would let a workflow with jobs and NO gate job exit 0 in silence --
         # renaming or deleting the gate job would leave the check that exists to notice
         # saying nothing. Fail-OPEN, on the assertion that decides what can merge.
-        if check_file(target, gate_job, exempt, conditional_exempt) is False:
+        # A ValueError out of the local-action follow (a non-composite action, or a
+        # `runs:` mapping with no readable `using:`) is a REFUSAL, not a crash: it says
+        # coverage cannot be verified over this file. Exit with its message -- a bare
+        # traceback reads as a broken checker, and a broken checker is what gets a
+        # working control deleted to make CI green.
+        try:
+            no_gate = check_file(target, gate_job, exempt, conditional_exempt) is False
+        except ValueError as error:
+            sys.exit(str(error))
+        if no_gate:
             sys.exit(
                 f"{target}: no '{gate_job}' job, so none of its jobs are merge-blocking. "
                 f"Give the file a '{gate_job}' job wired to aggregate its needs, or point "
@@ -2795,7 +3263,12 @@ def main(argv):
 
     gated = 0
     for workflow_path in files:
-        result = check_file(workflow_path, gate_job, exempt, conditional_exempt, on_empty="skip")
+        # Same ValueError-to-refusal translation as file mode: a delegated action the
+        # checker cannot classify must redden the run with a message, not a traceback.
+        try:
+            result = check_file(workflow_path, gate_job, exempt, conditional_exempt, on_empty="skip")
+        except ValueError as error:
+            sys.exit(str(error))
         if result is None:
             print(f"{workflow_path}: no jobs -- not a workflow, skipped.")
             continue
