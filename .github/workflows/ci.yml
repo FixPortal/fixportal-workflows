@@ -59,7 +59,9 @@ jobs:
           # review-tier.yml is neither of those: a job in another workflow can never be
           # a dependency of ci-gate, so the branch ruleset's required "Apply review tier
           # label" context is what makes that check merge-blocking instead.
-          GATE_FILE_EXEMPT: '.github/workflows/review-policy-guard.yml .github/workflows/review-tier.yml'
+          # ai-smells.yml is advisory by design: it posts review threads and is never a
+          # required check, so it must stay out of ci-gate.
+          GATE_FILE_EXEMPT: '.github/workflows/review-policy-guard.yml .github/workflows/review-tier.yml .github/workflows/ai-smells.yml'
         run: python3 .github/scripts/assert_gate_coverage.py .github/workflows
 
       - name: Assert canonical asset copies match the committed manifest
