@@ -1,0 +1,8 @@
+rules:
+  - id: S13-ts
+    languages: [typescript, javascript]
+    severity: INFO
+    message: Empty catch block swallows the exception
+    pattern-either:
+      - pattern: 'try { ... } catch ($E) { }'
+      - pattern: 'try { ... } catch { }'

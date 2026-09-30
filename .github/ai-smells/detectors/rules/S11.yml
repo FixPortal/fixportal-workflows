@@ -1,0 +1,11 @@
+rules:
+  - id: S11
+    languages: [generic]
+    severity: INFO
+    message: Comment narrates the change or cites a plan or review id
+    # Source comments only: in markdown the '#' marker matches headings, and plan and
+    # review documents cite stages and finding ids by design.
+    paths:
+      exclude:
+        - '*.md'
+    pattern-regex: '(?i)(//|#|/\*|^\s*\*)[^\n]*(\b(now (uses|does|returns|handles)|previously|used to|no longer|changed (to|from)|as requested|per (the )?(review|plan|spec|feedback)|stage \d+ of|step \d+ of|(finding|review|batch) [A-Z]?\d+|\b[A-Z]\d{1,2}[a-z]?\b (fix|regression|hardening)|(low|medium|high|critical) \d+:)|\([A-Z]\d{1,2}[a-z]?(\s*/\s*[A-Z]\d{1,2}[a-z]?)*\))'

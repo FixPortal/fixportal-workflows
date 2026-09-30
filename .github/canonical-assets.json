@@ -2,10 +2,105 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "c85af4a1f73381597ffe99b7d0ecfb98b23ef5ba",
-    "syncedAt": "2026-09-29"
+    "commit": "16706094bc8ccfd4bd618bd08536bfee1e819924",
+    "syncedAt": "2026-09-30"
   },
   "assets": [
+    {
+      "path": ".github/ai-smells/detect.ps1",
+      "sha256": "171d01a209e8c84a1f255d33269bded2101be8ed572df2e19b3b9b88df910429",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/rules/S10.yml",
+      "sha256": "abad2739cad36cf2194927e52ec21e6403bfa5e6764d3f9b818586f01d0122ab",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/rules/S11.yml",
+      "sha256": "14fc3aae45d339f363fa7147517c7e8fd0bd6969fd6383df6e4bdc91701d5c2a",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/rules/S13-py.yml",
+      "sha256": "597586024e453f527265884c9a1b5c46f3c10f1a700028c1fcbcffa5e03b69e9",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/rules/S13-ts.yml",
+      "sha256": "16f921ffc8904fb726880047299291abd49a489b5ee293cb9bee07fc1e610395",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/rules/S13.yml",
+      "sha256": "df300fe33c88c5eb890e19f7989f02665a3031f336f486455bf97c294ba79df3",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/rules/S20.yml",
+      "sha256": "48b2e17bdf891153404c08050f02ea063338e98dc97a0933fc81b0811b961443",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/rules/S21.yml",
+      "sha256": "914d9e7c3ef52cc5931004420d50036128b62781ca0be8d0a14f96ebe395b5ff",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/rules/S26.yml",
+      "sha256": "8ab1e8650b7af6eaa18758e89f2dadb720f3329c991a948b53e138682ef9d045",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/rules/S39.yml",
+      "sha256": "b27a5f59ddbcacf44057f2d2bb1a6a080ff0ec5d5933ea66635c44a960cfbf92",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/rules/S47.yml",
+      "sha256": "5493d50782e79c25ea8b9b94ebabd3d3deec9aa13166ea486e87d99b7a64c23a",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/scripts/comment_density.py",
+      "sha256": "f08397ce71075e266b378d2dae9cd322f7c748b88c3736f662ac01ed80500f54",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/scripts/jscpd.json",
+      "sha256": "1c73fb7eae9595c92cb2f7661e3422340406f157c840d3e2720c4bbf96af7f7a",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/scripts/registry_check.py",
+      "sha256": "f3b4b3f943299c221b402e288db3d7490b3eba1f1767c5153f1f12e557cb073a",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/detectors/scripts/size_outliers.py",
+      "sha256": "31536e7e1e8a518f2e1cb90a41991ac3537c8fb75a7a74e9cfcd28b12fe987e6",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/post-smell-threads.ps1",
+      "sha256": "b8bfe1bc93a05a260472d05377b0b5382a6c10f1185e2b8655c6849c93bf10df",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/pr-detect.ps1",
+      "sha256": "4800ea20fd58a5cb5c2ad56697a7e3426cdd8d2ba9cef7faf65b9fc19a9e0b1e",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/pr-scope.ps1",
+      "sha256": "8d22a3b7144f65ce50f5fd015b9fe6a00db79c1b5fbf6149efd29aa5a5f83229",
+      "verbatim": true
+    },
+    {
+      "path": ".github/ai-smells/smells.json",
+      "sha256": "a7c2c9735efe7be7c96c291b87b0211575c3a78633ec9657bdb998785c907ca9",
+      "verbatim": true
+    },
     {
       "path": ".github/scripts/assert_canonical_assets.py",
       "sha256": "4ceb9b3d9645a9bc93b0500e47d4edd1ea19843ddc89b0b81ac8fb68183db185",
@@ -20,6 +115,11 @@
       "path": ".github/scripts/assert_workflow_hygiene.py",
       "sha256": "0739463ff00ef0e86221136c9061e80ab81f87aa0e5e18707da0f56c14a68ca1",
       "verbatim": true
+    },
+    {
+      "path": ".github/workflows/ai-smells.yml",
+      "sha256": "05d86d3aba444c358a37b7e1b5f55abaf58f56ef099d5c91a90254c12942515a",
+      "verbatim": false
     },
     {
       "path": ".github/workflows/review-policy-guard.yml",

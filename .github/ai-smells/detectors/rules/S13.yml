@@ -1,0 +1,10 @@
+rules:
+  - id: S13
+    languages: [csharp]
+    severity: INFO
+    message: Empty catch block swallows the exception
+    patterns:
+      - pattern-either:
+          - pattern: 'try { ... } catch { }'
+          - pattern: 'try { ... } catch ($T $E) { }'
+          - pattern: 'try { ... } catch ($T) { }'
