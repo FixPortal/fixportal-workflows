@@ -1,0 +1,6 @@
+rules:
+  - id: S39
+    languages: [generic]
+    severity: INFO
+    message: Invisible or replacement unicode artefact
+    pattern-regex: '[\x{200B}-\x{200D}\x{2060}\x{FEFF}\x{00A0}\x{FFFD}]'

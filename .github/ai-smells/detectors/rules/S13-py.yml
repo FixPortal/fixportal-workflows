@@ -1,0 +1,21 @@
+rules:
+  - id: S13-py
+    languages: [python]
+    severity: INFO
+    message: No-op exception handler swallows the exception
+    pattern-either:
+      - pattern: |
+          try:
+            ...
+          except $E:
+            pass
+      - pattern: |
+          try:
+            ...
+          except:
+            pass
+      - pattern: |
+          try:
+            ...
+          except $E as $VAR:
+            pass

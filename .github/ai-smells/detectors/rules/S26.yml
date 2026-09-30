@@ -1,0 +1,6 @@
+rules:
+  - id: S26
+    languages: [generic]
+    severity: INFO
+    message: Hedge-word or marketing identifier
+    pattern-regex: '\b(class|interface|function|def|const|let|var|void|public|private|internal)\b[^\n(=]*\b\w*(Enhanced|Robust|Comprehensive|Seamless|Ultimate|Advanced|Improved|Optimized|Intelligent)\w*\b'

@@ -1,0 +1,53 @@
+name: AI smells
+
+# Per-PR half of audit-ai-quality: scripted detectors over the lines this PR adds, each new
+# hit posted as a review thread for the author to fix or decline. Never a required check,
+# and hits never fail it; a red run means the detection could not run.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-smells-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ai-smells:
+    name: ai-smells
+    # Fork PRs get a read-only token, so the post step could never succeed there.
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.user.login != 'renovate[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The PR head, not the merge ref: hit lines must be head lines for the review
+          # comment to land. Full history, because the diff is taken from the merge-base.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install semgrep
+        run: |
+          python3 -m pip install --user semgrep==1.163.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Detect smells on added lines
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./.github/ai-smells/pr-detect.ps1 -RepoPath . -Base $env:BASE_SHA -Head $env:HEAD_SHA -OutFile "$env:RUNNER_TEMP/ai-smells.json"
+
+      - name: Post new hits as review threads
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./.github/ai-smells/post-smell-threads.ps1 -HitsPath "$env:RUNNER_TEMP/ai-smells.json" -Repo $env:GITHUB_REPOSITORY -Pr $env:PR_NUMBER -HeadSha $env:HEAD_SHA

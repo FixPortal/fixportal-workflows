@@ -1,0 +1,6 @@
+rules:
+  - id: S21
+    languages: [generic]
+    severity: INFO
+    message: Silent empty default hides a missing value
+    pattern-regex: '\?\?\s*(""|''''|string\.Empty|0|\[\]|\{\}|Array\.Empty<[^>]+>\(\))\s*[;,)]'

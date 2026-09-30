@@ -1,0 +1,141 @@
+{
+  "catalogueVersion": 2,
+  "smells": [
+    {
+      "id": "S10",
+      "name": "Emoji in code/comments/commits/docs",
+      "languages": [
+        "any"
+      ],
+      "detector": {
+        "kind": "regex",
+        "rule": "detectors/rules/S10.yml"
+      }
+    },
+    {
+      "id": "S11",
+      "name": "Comment narrates before/after change or references an internal \"plan\"",
+      "languages": [
+        "any"
+      ],
+      "detector": {
+        "kind": "regex",
+        "rule": "detectors/rules/S11.yml"
+      }
+    },
+    {
+      "id": "S13",
+      "name": "Empty / pass-through catch blocks",
+      "languages": [
+        "csharp",
+        "typescript",
+        "javascript",
+        "python",
+        "powershell"
+      ],
+      "detector": {
+        "kind": "semgrep",
+        "rule": "detectors/rules/S13.yml"
+      }
+    },
+    {
+      "id": "S14",
+      "name": "Duplicated helper/utility implementations across files",
+      "languages": [
+        "any"
+      ],
+      "detector": {
+        "kind": "clone",
+        "rule": "detectors/scripts/jscpd.json"
+      }
+    },
+    {
+      "id": "S19",
+      "name": "Hallucinated package / dependency name",
+      "languages": [
+        "any"
+      ],
+      "detector": {
+        "kind": "script",
+        "rule": "detectors/scripts/registry_check.py"
+      }
+    },
+    {
+      "id": "S20",
+      "name": "Placeholder secrets / inline credentials from \"end-to-end\" examples",
+      "languages": [
+        "any"
+      ],
+      "detector": {
+        "kind": "regex",
+        "rule": "detectors/rules/S20.yml"
+      }
+    },
+    {
+      "id": "S21",
+      "name": "Excessive/unwarranted defensive fallbacks and null-coalescing",
+      "languages": [
+        "any"
+      ],
+      "detector": {
+        "kind": "regex",
+        "rule": "detectors/rules/S21.yml"
+      }
+    },
+    {
+      "id": "S26",
+      "name": "Enterprise-jargon / hedge-word naming",
+      "languages": [
+        "any"
+      ],
+      "detector": {
+        "kind": "regex",
+        "rule": "detectors/rules/S26.yml"
+      }
+    },
+    {
+      "id": "S30",
+      "name": "Oversized function/file doing too many things (God function)",
+      "languages": [
+        "any"
+      ],
+      "detector": {
+        "kind": "script",
+        "rule": "detectors/scripts/size_outliers.py"
+      }
+    },
+    {
+      "id": "S39",
+      "name": "Unicode / formatting artifacts from generation",
+      "languages": [
+        "any"
+      ],
+      "detector": {
+        "kind": "regex",
+        "rule": "detectors/rules/S39.yml"
+      }
+    },
+    {
+      "id": "S41",
+      "name": "Hyper-specific/exhaustive line-by-line commenting style overall",
+      "languages": [
+        "any"
+      ],
+      "detector": {
+        "kind": "script",
+        "rule": "detectors/scripts/comment_density.py"
+      }
+    },
+    {
+      "id": "S47",
+      "name": "Generic templated README structure with unused boilerplate sections",
+      "languages": [
+        "any"
+      ],
+      "detector": {
+        "kind": "regex",
+        "rule": "detectors/rules/S47.yml"
+      }
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+rules:
+  - id: S47
+    languages: [generic]
+    severity: INFO
+    message: Unfilled README template placeholder
+    paths:
+      include: ['README*', 'readme*', '*.md']
+    pattern-regex: '(?i)(your[-_]username|your[-_]project|\[project[ -]name\]|lorem ipsum|todo: add|insert (description|screenshot) here|<your[^>]*>)'

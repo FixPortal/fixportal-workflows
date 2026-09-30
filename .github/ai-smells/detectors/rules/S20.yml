@@ -1,0 +1,6 @@
+rules:
+  - id: S20
+    languages: [generic]
+    severity: INFO
+    message: Placeholder secret or inline credential
+    pattern-regex: '(?i)(api[_-]?key|secret|token|password|passwd)\s*["'']?\s*[:=]\s*["''](your[_-]|xxx|changeme|replace[_-]?me|<[^>]+>|sk-[a-z0-9]{8,}|test[_-]?key)'
