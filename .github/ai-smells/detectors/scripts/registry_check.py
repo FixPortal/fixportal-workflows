@@ -6,6 +6,7 @@ packageSourceMapping, or a root .npmrc scoped registry -- is skipped, not looked
 public registry cannot know it, so its absence there says nothing."""
 import argparse, json, os, pathlib, re, urllib.request, urllib.error
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 try:
     import tomllib
 except ImportError:
@@ -117,7 +118,7 @@ def main():
     root = pathlib.Path(a.root)
     fx_path = os.environ.get("AAQ_REGISTRY_FIXTURE")
     fixture = json.loads(pathlib.Path(fx_path).read_text(encoding="utf-8")) if fx_path else None
-    hits, failed, seen, skipped = [], [], {}, set()
+    hits, failed, skipped, public = [], [], set(), []
     parse_error = None
     try:
         nuget_map, npm_scopes = private_sources(root)
@@ -136,17 +137,31 @@ def main():
         for eco, pkg, line in decls:
             if is_private(eco, pkg, nuget_map, npm_scopes):
                 skipped.add(f"{eco}:{pkg}")
-                continue
-            key = (eco, pkg.lower())
-            if key not in seen:
-                try:
-                    seen[key] = exists(eco, pkg, fixture)
-                except (urllib.error.URLError, TimeoutError, OSError):
-                    seen[key] = None
-            if seen[key] is None:
-                failed.append(f"{eco}:{pkg}")
-            elif not seen[key]:
-                hits.append({"file": rel, "line": line, "text": f"{eco} package '{pkg}' not found in the public registry"})
+            else:
+                public.append((rel, eco, pkg, line))
+
+    # Lookups are network-bound and independent, so they run concurrently: a manifest with
+    # many dependencies costs about one round trip, not the sum of them. The first spelling
+    # of each (ecosystem, lower-cased id) is the one looked up, as before.
+    # ponytail: fixed pool of 8; raise it only if a large manifest still nears the job timeout.
+    first = {}
+    for _, eco, pkg, _ in public:
+        first.setdefault((eco, pkg.lower()), pkg)
+
+    def lookup(key):
+        try:
+            return exists(key[0], first[key], fixture)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        seen = dict(zip(first, pool.map(lookup, first)))
+    for rel, eco, pkg, line in public:
+        found = seen[(eco, pkg.lower())]
+        if found is None:
+            failed.append(f"{eco}:{pkg}")
+        elif not found:
+            hits.append({"file": rel, "line": line, "text": f"{eco} package '{pkg}' not found in the public registry"})
     if parse_error:
         status, reason = "not assessed", parse_error
     elif failed:

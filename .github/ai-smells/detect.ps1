@@ -123,7 +123,8 @@ function Invoke-SmellDetectors {
         }
         foreach ($s in $semgrepSmells) {
             $langs = @($s.languages)
-            if ($langs -contains 'any') { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = '' }); continue }
+            # No files scanned means nothing assessed: add no entry, as for a language that is not present.
+            if ($langs -contains 'any') { if ($files.Count) { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = '' }) }; continue }
             foreach ($l in $present) {
                 if ($s.id -eq 'S13' -and $l -eq 'powershell') { continue } # Assessed by the PowerShell parser below.
                 if ($langs -contains $l) { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = $l }) }
