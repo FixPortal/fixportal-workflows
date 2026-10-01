@@ -2,8 +2,8 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "b5ff5eaa22e297f0dde5913abeb453894656aff0",
-    "syncedAt": "2026-09-30"
+    "commit": "c6cfe842c5181837a35cb7418ab89d5ee325c25a",
+    "syncedAt": "2026-10-01"
   },
   "assets": [
     {
@@ -78,7 +78,7 @@
     },
     {
       "path": ".github/ai-smells/detectors/scripts/size_outliers.py",
-      "sha256": "d0e80de04e5921bc91c5641c556ac71100b6dd13edc52a4dd93abec7e24f6b86",
+      "sha256": "aefc2931713bac3968627d873c57c64c4f77bf9b77ff24524562e9753d6eb7a6",
       "verbatim": true
     },
     {

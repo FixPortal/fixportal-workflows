@@ -1,15 +1,26 @@
 """S30: oversized file or function. File > 800 lines, or a function spanning > 120 lines,
-is a hit: a brace-delimited block opened by a method/function signature, or a Python def
-measured by indentation. Brace counting never sees a Python body open, so without the
-indentation path it scanned to end of file for every def and flagged none."""
-import argparse, json, pathlib, re
+is a hit: a brace-delimited block opened by a method/function signature, or a Python
+function measured by its syntax tree. Brace counting never sees a Python body open, and
+indentation scanning is fooled by wrapped signatures and column-0 string content, so
+Python goes through ast instead."""
+import argparse, ast, json, pathlib, re
 
 FILE_MAX, FUNC_MAX = 800, 120
 SIGNATURE = re.compile(r"^\s*(public|private|protected|internal|static|async|export|function|def)\b[^;=]*\([^;]*\)\s*(\{|=>|:)?\s*$")
-PY_DEF = re.compile(r"^\s*(async\s+)?def\s")
 
-def indent_of(line):
-    return len(line) - len(line.lstrip())
+def python_hits(rel, source):
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []  # Unparseable: the file-size check above still applies.
+    lines = source.splitlines()
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            span = node.end_lineno - node.lineno + 1
+            if span > FUNC_MAX:
+                hits.append({"file": rel, "line": node.lineno, "text": f"function spans {span} lines: {lines[node.lineno - 1].strip()[:80]}"})
+    return hits
 
 def main():
     ap = argparse.ArgumentParser()
@@ -21,22 +32,16 @@ def main():
         rel = rel.strip()
         if not rel or not rel.endswith((".cs", ".ts", ".tsx", ".js", ".jsx", ".py")):
             continue
-        lines = (root / rel).read_bytes().decode("utf-8", errors="replace").splitlines()
+        source = (root / rel).read_bytes().decode("utf-8", errors="replace")
+        lines = source.splitlines()
         if len(lines) > FILE_MAX:
             hits.append({"file": rel, "line": 1, "text": f"file is {len(lines)} lines"})
+        if rel.endswith(".py"):
+            hits += python_hits(rel, source)
+            continue
         i = 0
         while i < len(lines):
-            if rel.endswith(".py") and PY_DEF.match(lines[i]):
-                # The body is every following line indented deeper, blank lines included;
-                # trailing blanks belong to whatever comes next.
-                j = i + 1
-                while j < len(lines) and (not lines[j].strip() or indent_of(lines[j]) > indent_of(lines[i])):
-                    j += 1
-                while j > i + 1 and not lines[j - 1].strip():
-                    j -= 1
-                if j - i > FUNC_MAX:
-                    hits.append({"file": rel, "line": i + 1, "text": f"function spans {j - i} lines: {lines[i].strip()[:80]}"})
-            elif SIGNATURE.match(lines[i]):
+            if SIGNATURE.match(lines[i]):
                 depth, j, opened = 0, i, False
                 while j < len(lines):
                     depth += lines[j].count("{") - lines[j].count("}")
