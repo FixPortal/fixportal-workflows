@@ -32,7 +32,8 @@ def main():
         rel = rel.strip()
         if not rel or not rel.endswith((".cs", ".ts", ".tsx", ".js", ".jsx", ".py")):
             continue
-        source = (root / rel).read_bytes().decode("utf-8", errors="replace")
+        # utf-8-sig drops a leading BOM, which ast.parse would otherwise reject as U+FEFF.
+        source = (root / rel).read_bytes().decode("utf-8-sig", errors="replace")
         lines = source.splitlines()
         if len(lines) > FILE_MAX:
             hits.append({"file": rel, "line": 1, "text": f"file is {len(lines)} lines"})
