@@ -49,7 +49,8 @@ def is_private(eco, pkg, nuget, npm):
     return bool(best and best[1])
 
 def declared(root, rel):
-    text = (root / rel).read_bytes().decode("utf-8", errors="replace")
+    # utf-8-sig drops a leading BOM, which json.loads and tomllib would otherwise reject.
+    text = (root / rel).read_bytes().decode("utf-8-sig", errors="replace")
     name = pathlib.PurePosixPath(rel).name.lower()
     out = []
     if name.endswith(".csproj") or name in ("directory.packages.props", "packages.props"):
