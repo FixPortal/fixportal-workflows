@@ -100,6 +100,8 @@ def exists(eco, pkg, fixture):
         v = fixture.get(f"{eco}:{pkg}")
         if v == "error" or v is None:
             raise urllib.error.URLError("fixture")
+        if v == "crash":
+            raise ValueError("fixture")
         return bool(v)
     url = {"nuget": f"https://api.nuget.org/v3-flatcontainer/{pkg.lower()}/index.json",
            "npm": f"https://registry.npmjs.org/{pkg.replace('/', '%2F')}",
@@ -150,17 +152,21 @@ def main():
         first.setdefault((eco, pkg.lower()), pkg)
 
     def lookup(key):
+        # Any lookup failure (RemoteDisconnected, IncompleteRead, a malformed URL's ValueError)
+        # stays local to its package as 'not assessed': pool.map would otherwise re-raise it
+        # and abort the run before the JSON is printed. The exception is returned, not
+        # logged: detect.ps1 merges stderr into this script's JSON output.
         try:
             return exists(key[0], first[key], fixture)
-        except (urllib.error.URLError, TimeoutError, OSError):
-            return None
+        except Exception as e:
+            return e
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         seen = dict(zip(first, pool.map(lookup, first)))
     for rel, eco, pkg, line in public:
         found = seen[(eco, pkg.lower())]
-        if found is None:
-            failed.append(f"{eco}:{pkg}")
+        if isinstance(found, Exception):
+            failed.append(f"{eco}:{pkg} ({type(found).__name__})")
         elif not found:
             hits.append({"file": rel, "line": line, "text": f"{eco} package '{pkg}' not found in the public registry"})
     if parse_error:

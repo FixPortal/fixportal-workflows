@@ -2,7 +2,7 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "be667c6845993830c30127389cce91cd17a98633",
+    "commit": "32ffdcce1b24e7514e6ae5a3f93a7f2b37cdae41",
     "syncedAt": "2026-10-01"
   },
   "assets": [
@@ -73,7 +73,7 @@
     },
     {
       "path": ".github/ai-smells/detectors/scripts/registry_check.py",
-      "sha256": "b42e59259582ecf30f275c406b97e5708149523ff0b245613d2d9fbbedf48990",
+      "sha256": "17a803b846004267c90455b28d84f4cccbceb00cce09e66cf23e6c9772ef6566",
       "verbatim": true
     },
     {
