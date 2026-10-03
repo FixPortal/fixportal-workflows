@@ -509,6 +509,13 @@ def read_gate_contract(lines, gate_job):
     return jobs, [], conditional_jobs(lines, jobs, job_indent)
 
 
+def runs_unconditionally(condition):
+    return condition == "!cancelled()" or (
+        re.search(r"\balways\(\s*\)", mask_quoted(condition)) is not None
+        and static_truth(condition) is True
+    )
+
+
 def conditional_jobs(lines, jobs, job_indent):
     """The ids of jobs carrying a job-level `if:` condition.
 
@@ -540,7 +547,7 @@ def conditional_jobs(lines, jobs, job_indent):
             if not value or is_block_scalar_header(value):
                 body, _ = continuation_lines(lines, i, indent)
                 value = " ".join(strip_comment(line).strip() for line in body)
-            if normalise_condition(value) not in ("always()", "!cancelled()"):
+            if not runs_unconditionally(normalise_condition(value)):
                 conditional.add(job_id)
     return conditional
 
@@ -867,31 +874,34 @@ def github_equal(left, right):
     return not (math.isnan(left_number) or math.isnan(right_number)) and left_number == right_number
 
 
-def static_truth(condition):
+def static_truth(condition, _nested=False):
     """Fold only literal boolean branches; unknown GitHub context/function values stay unknown."""
-    expression = decode_yaml_scalar(strip_comment(condition).strip()).strip()
+    expression = (condition if _nested else decode_yaml_scalar(strip_comment(condition).strip())).strip()
     if expression.startswith("${{") and expression.endswith("}}"):
         expression = expression[3:-2].strip()
     expression = strip_outer_parentheses(expression)
 
     parts = split_top_level(expression, "||")
     if len(parts) > 1:
-        values = [static_truth(part) for part in parts]
+        values = [static_truth(part, True) for part in parts]
         if any(value is True for value in values):
             return True
         return False if all(value is False for value in values) else _UNKNOWN
 
     parts = split_top_level(expression, "&&")
     if len(parts) > 1:
-        values = [static_truth(part) for part in parts]
+        values = [static_truth(part, True) for part in parts]
         if any(value is False for value in values):
             return False
         return True if all(value is True for value in values) else _UNKNOWN
 
     expression = strip_outer_parentheses(expression)
     if expression.startswith("!"):
-        value = static_truth(expression[1:])
+        value = static_truth(expression[1:], True)
         return not value if value is True or value is False else _UNKNOWN
+    if expression.startswith(("'", '"')) and re.fullmatch(_LITERAL, expression):
+        literal = literal_value(expression)
+        return bool(literal) if isinstance(literal, str) else _UNKNOWN
     if expression.lower() == "true":
         return True
     if expression.lower() == "false":
@@ -945,7 +955,7 @@ def failure_atoms(normalised):
     `!= 'skipped'` guards about the SAME job. That is the house shape for a conditional
     feeder -- `needs.secrets.result != 'success' && needs.secrets.result != 'skipped'` --
     and it covers exactly {failure, cancelled} for that job, which is what the atom
-    already claims. Refusing it rejected fixportal-initiator's correct gate outright.
+    already claims. Refusing it rejected a consumer's correct gate outright.
     """
     residual = [
         part
@@ -1092,7 +1102,7 @@ def mask_quoted(line, *, powershell=False):
             (powershell and quote == '"' and char == "`")
             or (not powershell and quote != "'" and char == BACKSLASH)
         ) and index + 1 < len(line):
-            out.append("  ")
+            out.append(" \n" if line[index + 1] == "\n" else "  ")
             index += 2
             continue
         if quote is None and char in "'\"":
@@ -1102,7 +1112,7 @@ def mask_quoted(line, *, powershell=False):
             quote = None
             out.append(" ")
         elif quote is not None:
-            out.append(" ")
+            out.append("\n" if char == "\n" else " ")
         else:
             out.append(char)
         index += 1
@@ -1939,7 +1949,8 @@ def run_payload_indexes(lines):
     the workflow never executes as a step. That is a false RED on a correct workflow --
     the direction that gets a working control deleted to make CI green.
 
-    Only BLOCK-SCALAR payloads are indexed. A single-line `run: foo` carries its command
+    Block-scalar and plain multiline STEP payloads are indexed. A defaults.run mapping
+    remains YAML metadata. A single-line `run: foo` carries its command
     on the `run:` line itself, which starts with the key and so cannot match LOCAL_USES.
     The value test reads the COMMENT-STRIPPED value, exactly as the run-body loops in
     delegated_run_bodies and gated_run_bodies do -- `run: | # build log` is a real
@@ -1949,11 +1960,11 @@ def run_payload_indexes(lines):
     index = 0
     while index < len(lines):
         match = RUN_KEY.match(lines[index])
-        if not match:
+        if not match or step_span(lines, index, len(match.group(1))) is None:
             index += 1
             continue
         value = strip_inline_comment(match.group(2)).strip()
-        if BLOCK_SCALAR.match(value):
+        if not value or BLOCK_SCALAR.match(value):
             _, following = continuation_lines(lines, index, len(match.group(1)))
             payloads.update(range(index + 1, following))
             index = following
@@ -2319,14 +2330,18 @@ def delegated_run_bodies(root, ref, visited, include_directories=True):
     except ValueError:
         action_dir = None
     index = 0
+    payload_indexes = run_payload_indexes(lines)
     while index < len(lines):
+        if index in payload_indexes:
+            index += 1
+            continue
         match = RUN_KEY.match(lines[index])
         if not match:
             index += 1
             continue
         run_index = index
         value = strip_inline_comment(match.group(2)).strip()
-        if BLOCK_SCALAR.match(value):
+        if not value or BLOCK_SCALAR.match(value):
             body, index = continuation_lines(lines, index, len(match.group(1)))
         else:
             body, index = ([value] if value else []), index + 1
@@ -2380,7 +2395,7 @@ def delegated_workflow_run_bodies(root, ref, visited, include_directories=True):
                 continue
             run_index = index
             value = strip_inline_comment(match.group(2)).strip()
-            if BLOCK_SCALAR.match(value):
+            if not value or BLOCK_SCALAR.match(value):
                 body, index = continuation_lines(block, index, len(match.group(1)))
             else:
                 body, index = ([value] if value else []), index + 1
@@ -2433,8 +2448,12 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root, include_directories=Tru
             job_directories |= working_directories(
                 job_level_lines(block, job_body_indent(lines, jobs, job_id, job_indent))
             )
+        payload_indexes = run_payload_indexes(block)
         index = 0
         while index < len(block):
+            if index in payload_indexes:
+                index += 1
+                continue
             match = RUN_KEY.match(block[index])
             if not match:
                 index += 1
@@ -2449,7 +2468,7 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root, include_directories=Tru
             # function exists to feed. strip_inline_comment is the same helper
             # step_can_fail uses, so the two paths agree.
             value = strip_inline_comment(match.group(2)).strip()
-            if BLOCK_SCALAR.match(value):
+            if not value or BLOCK_SCALAR.match(value):
                 body, index = continuation_lines(block, index, len(match.group(1)))
             else:
                 body, index = ([value] if value else []), index + 1
@@ -2755,7 +2774,7 @@ def changes_directory(body):
     # close on a later line, and its closing backtick must not read as an opening one.
     for powershell in (False, True):
         unquoted = opening_backticks_only(
-            "\n".join(mask_quoted(line, powershell=powershell) for line in body)
+            mask_quoted("\n".join(body), powershell=powershell)
         )
         for visible in unquoted.split("\n"):
             if DIRECTORY_CHANGE.search(visible):
@@ -2838,7 +2857,20 @@ def gate_script_paths(lines, jobs, needs, gate_job, root):
                 sys.exit(f"{root}: {unsupported[1:]}")
             if changes_directory(body):
                 sys.exit(f"{root}: cannot verify gate script paths after a directory change in job '{job_id}'; use working-directory:")
-            relatives = {relative} | set(_recognised_suffixes(relative))
+            full_references = {relative} | {
+                directory + "/" + relative
+                for directory in directories
+                if directory and not directory.startswith("!unsupported ")
+            }
+            direct = any(
+                resolve_committed_paths(root, candidate, allow_outside_repository=True)
+                for candidate in full_references
+            )
+            # Recover prefixed spellings only if the complete reference is absent.
+            # Otherwise a nested script also captures an unrelated root suffix.
+            relatives = {relative}
+            if not direct:
+                relatives.update(_recognised_suffixes(relative))
             # Every plausible spelling is kept -- the repository root, and each directory
             # that applies to this run body (workflow and job defaults, the body's own
             # step, a composite action's own directory). More scripts required HIGH,
@@ -2934,7 +2966,7 @@ def assert_gate_scripts(workflow_path, lines, jobs, needs, gate_job):
     follows from what the workflow actually invokes, so a gate script added to a
     repository years after it was scaffolded is covered on the day it is wired in.
 
-    Verified in the field, not hypothesised: fixportal-fixatdl added
+    Verified in the field: a consumer added
     `scripts/assert-coverage-floor.ps1` as a merge gate on 2026-08-24 and it sat outside
     both the policy and the guard until an adversarial review found it on 2026-09-08 --
     the third recurrence of this class in that repository, after the same hole had been
@@ -3157,7 +3189,7 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             if not value or is_block_scalar_header(value):
                 body, _ = continuation_lines(lines, i, indent)
                 value = " ".join(strip_comment(line).strip() for line in body)
-            return normalise_condition(value) in ("always()", "!cancelled()")
+            return runs_unconditionally(normalise_condition(value))
         return False
 
     unsafe_feeders = set()
@@ -3206,6 +3238,34 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             f"{', '.join(tolerant)}.\n"
             "A tolerated job cannot provide a required check or serve as the aggregate gate."
         )
+
+    for feeder in set(needs) - {gate_job}:
+        block = job_block(lines, jobs, feeder)
+        payloads = run_payload_indexes(block)
+        executable = re.compile(r"""^(\s*(?:-\s+)?)(?:'run'|"run"|run|'uses'|"uses"|uses)\s*:""")
+        seen = set()
+        for index, line in enumerate(block):
+            match = executable.match(line) if index not in payloads else None
+            if not match:
+                continue
+            indent = len(match.group(1))
+            span = step_span(block, index, indent)
+            if span is None or span in seen:
+                continue
+            seen.add(span)
+            for key, message in (("continue-on-error", "tolerated run step"), ("if", "always-skipped run step")):
+                pattern = step_key_pattern(indent, key)
+                for offset in range(*span):
+                    entry = pattern.match(block[offset]) if offset not in payloads else None
+                    if not entry:
+                        continue
+                    value = strip_comment(entry.group(2)).strip()
+                    if not value or is_block_scalar_header(value):
+                        body, _ = continuation_lines(block, offset, indent)
+                        value = " ".join(strip_comment(part).strip() for part in body)
+                    truth = static_truth(value)
+                    if (key == "continue-on-error" and truth is not False) or (key == "if" and truth is False):
+                        sys.exit(f"{workflow_path}: feeder '{feeder}' has a {message}.")
 
     assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs)
     assert_gate_scripts(workflow_path, lines, jobs, needs, gate_job)

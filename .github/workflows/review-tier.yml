@@ -60,8 +60,7 @@ jobs:
     # red job below blocks nothing. Renaming the job silently detaches the requirement:
     # the rule waits for a context that no longer reports, and the old name never
     # arrives. Change the name only alongside a deliberate ruleset update everywhere.
-    # (fixportal-workflows review 20260929T021338Z, CX-3 — the same contract
-    # review-policy-guard.yml documents for "Review policy intact".)
+    # The same required-name contract applies to "Review policy intact".
     name: Apply review tier label
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -84,8 +83,6 @@ jobs:
           # then could pin review-high on a pull request CodeRabbit will never
           # review -- and every later run on that PR would skip, never removing it.
           # Skip BEFORE the ERR trap is armed; a notice, not silence.
-          # (fixportal-workflows review 20260929T021338Z, CX-2; author-keying is
-          # CodeRabbit Major on fixportal-workflows PR #54.)
           if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
             echo "::notice::Dependency PRs are out of AI review by policy; skipping review tier classification."
             exit 0
@@ -148,7 +145,7 @@ jobs:
           # list also carries each rename's vacated path. Two separate calls doubled the API
           # cost and could disagree if the PR moved between them. The count is taken with
           # `|| true` because grep -c exits 1 on zero, and a PR with no changed files is not
-          # an enumeration failure. (fixportal-agents-skills#264, items 1 and 2.)
+          # an enumeration failure. (canonical review, items 1 and 2.)
           if ! expected=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.changed_files') || \
              ! records=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate --jq '.[] | [.filename, (.previous_filename // "")] | @tsv'); then
             echo "::warning::Could not enumerate the complete changed-file list; tiering HIGH rather than under-tiering on an API error."
@@ -163,7 +160,7 @@ jobs:
             # return 2 -- which inside an `if` condition counts as FALSE, so neither
             # `set -e` nor the ERR trap fires and the completeness check silently does
             # nothing. Guard the comparison; a count this job cannot read resolves to
-            # MORE review, never less. (fixportal-workflows review 20260929T021338Z, CX-4.)
+            # MORE review, never less.
             case "$expected" in
               ''|*[!0-9]*)
                 echo "::warning::changed_files came back non-numeric ('$expected'); tiering HIGH rather than trusting the enumeration."
@@ -191,8 +188,6 @@ jobs:
           # lone `*` cross `/` -- `infra/*` matched `infra/a/b.bicep` -- so the server
           # DISAGREED with both the hook and assert_gate_coverage.py's copy of the same
           # translation, always in the over-tier direction.
-          # (fixportal-workflows review 20260929T021338Z, F1; glob semantics from
-          # fixportal-agents-skills#264, item 5.)
           if ! $high; then
             # Translate a gitignore-style glob to an anchored ERE.
             #   **/  -> (.*/)?     **  -> .*     *  -> [^/]*     ?  -> [^/]
@@ -241,7 +236,7 @@ jobs:
             if ! labels=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name'); then
               # Fail loudly like every other path that could not finish classification: the
               # HIGH label keeps coverage, and the red job says the decision was not
-              # verified. (fixportal-agents-skills#264, item 3.)
+              # verified. (canonical review, item 3.)
               echo "::error::Could not read existing labels; preserving HIGH coverage on this PR and failing closed."
               tier_high_on_failure
               exit 1
