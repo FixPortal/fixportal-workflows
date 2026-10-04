@@ -18,14 +18,42 @@ $script:LanguageByExtension = @{
     '.rs' = 'rust'; '.rb' = 'ruby'; '.kt' = 'kotlin'; '.swift' = 'swift'; '.cpp' = 'cpp'; '.c' = 'c'; '.ps1' = 'powershell'; '.psm1' = 'powershell'
 }
 
+function Split-ByLength([string[]] $Items, [int] $Budget) {
+    # Windows caps a command line at 32K characters; a real repository's file list overflows it.
+    $batches = [System.Collections.Generic.List[object]]::new()
+    $batch = [System.Collections.Generic.List[string]]::new(); $length = 0
+    foreach ($t in $Items) {
+        if ($batch.Count -gt 0 -and $length + $t.Length + 3 -gt $Budget) { $batches.Add($batch.ToArray()); $batch.Clear(); $length = 0 }
+        $batch.Add($t); $length += $t.Length + 3
+    }
+    if ($batch.Count -gt 0) { $batches.Add($batch.ToArray()) }
+    return $batches.ToArray()
+}
+
 function Get-ScanFiles {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $TreePath, [string[]] $Pathspec)
-    $gitArgs = @('-C', $TreePath, 'ls-files', '-z')
-    if ($Pathspec) { $gitArgs += @('--') + $Pathspec }
-    $raw = & git @gitArgs 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        $files = @(($raw -join '') -split "`0" | Where-Object { $_ })
+    # Batched: pr-detect passes every file a PR touches, and ~1000 paths overflowed the
+    # command line before git started. Exclude pathspecs go in every batch, or a batch
+    # holding only includes would list the excluded files.
+    $excludeMagic = '^:(!|\^|\([^)]*\bexclude\b)'
+    $exclude = @($Pathspec | Where-Object { $_ -match $excludeMagic })
+    $include = @($Pathspec | Where-Object { $_ -and $_ -notmatch $excludeMagic })
+    $budget = 24000 - (($exclude | ForEach-Object { $_.Length + 3 } | Measure-Object -Sum).Sum)
+    $batches = @(Split-ByLength $include $budget)
+    if (-not $batches.Count) { $batches = @('') }
+    $listed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $ok = $true
+    foreach ($b in $batches) {
+        $spec = @(@($b) + $exclude | Where-Object { $_ })
+        $gitArgs = @('-C', $TreePath, 'ls-files', '-z')
+        if ($spec) { $gitArgs += @('--') + $spec }
+        $raw = & git @gitArgs 2>$null
+        if ($LASTEXITCODE -ne 0) { $ok = $false; break }
+        foreach ($f in (($raw -join '') -split "`0")) { if ($f) { [void]$listed.Add($f) } }
+    }
+    if ($ok) {
+        $files = @($listed)
     }
     elseif (-not (Test-Path -LiteralPath (Join-Path $TreePath '.git'))) {
         # Not a git tree (contract-test fixtures): enumerate the filesystem instead.
@@ -101,14 +129,7 @@ function Invoke-SmellDetectors {
         # because one invocation over a real repository overflows the Windows 32K
         # command line ("The filename or extension is too long" on a large repository).
         $budget = 24000 - (($configArgs | ForEach-Object { $_.Length + 3 } | Measure-Object -Sum).Sum)
-        $batches = [System.Collections.Generic.List[object]]::new()
-        $batch = [System.Collections.Generic.List[string]]::new(); $length = 0
-        foreach ($t in $targets) {
-            if ($batch.Count -gt 0 -and $length + $t.Length + 3 -gt $budget) { $batches.Add($batch.ToArray()); $batch.Clear(); $length = 0 }
-            $batch.Add($t); $length += $t.Length + 3
-        }
-        if ($batch.Count -gt 0) { $batches.Add($batch.ToArray()) }
-        foreach ($b in $batches) {
+        foreach ($b in @(Split-ByLength $targets $budget)) {
             $json = & $SemgrepCommand scan @configArgs --json --metrics=off --quiet --no-git-ignore --disable-version-check @b 2>$null | Out-String
             foreach ($r in @((ConvertFrom-Json $json).results)) {
                 $rel = [IO.Path]::GetRelativePath($TreePath, $r.path).Replace('\', '/')
