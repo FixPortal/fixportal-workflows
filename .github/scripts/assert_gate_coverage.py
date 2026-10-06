@@ -468,6 +468,35 @@ def read_gate_contract(lines, gate_job):
             )
         jobs[_first_group(match)] = i
 
+    # A flow mapping on a later line keeps the job header parseable, but its
+    # fields are not block keys. Refuse it before scans can miss a job-level if.
+    starts = sorted(jobs.values())
+    for job_id, start in jobs.items():
+        end = min((i for i in starts if i > start), default=jobs_end)
+        for line in lines[start + 1 : end]:
+            value = strip_inline_comment(line.strip()).strip()
+            if not value:
+                continue
+            # YAML node properties can precede the value on this or their own
+            # line. They must not hide a flow map from this block-only scanner.
+            while value.startswith(("&", "!")):
+                property_token = re.match(
+                    r"^(?:&[^\s{}\[\],]+|!<[^>\r\n]+>|![^\s{}\[\],]*)(?:\s+|$)",
+                    value,
+                )
+                if property_token is None:
+                    sys.exit(f"unsupported YAML node property for job '{job_id}'")
+                value = value[property_token.end() :].strip()
+            if not value:
+                continue
+            if value.startswith("{"):
+                sys.exit(
+                    f"unsupported flow mapping value for job '{job_id}'\n"
+                    "This gate refuses to report coverage it cannot verify. "
+                    "Use a block mapping for the job."
+                )
+            break
+
     if gate_job not in jobs:
         return jobs, [], set()
 
@@ -934,6 +963,72 @@ def static_truth(condition, _nested=False):
             ">=": left >= right,
         }[operation]
     return _UNKNOWN
+
+
+def status_reachable_atoms(condition):
+    """Adverse needs coverage independent of the current gate job's status.
+
+    Step status functions read current job status, not upstream needs results.
+    House policy requires the failing step to cover adverse needs while this job
+    is Success, Failure or Cancelled: cancellation must not mask an upstream bad
+    result. An explicit status function is a defensive override contract, not
+    evidence that default success suppresses upstream failures on a healthy job.
+    """
+    normalised = normalise_condition(condition)
+    unquoted = re.sub(_LITERAL, "''", normalised)
+    status = r"\b(always|success|failure|cancelled)\(\s*\)"
+    if not re.search(status, unquoted, re.IGNORECASE):
+        return None
+    def simplify(expression):
+        expression = strip_outer_parentheses(expression)
+        for operator in ("||", "&&"):
+            parts = split_top_level(expression, operator)
+            if len(parts) < 2:
+                continue
+            parts = [simplify(part) for part in parts]
+            absorbing = operator == "||"
+            if any(static_truth(part) is absorbing for part in parts):
+                return str(absorbing).lower()
+            parts = [part for part in parts if static_truth(part) is not (not absorbing)]
+            if not parts:
+                return str(not absorbing).lower()
+            return operator.join(f"({part})" for part in parts)
+        return expression
+
+    projections = []
+    for current_status in ("success", "failure", "cancelled"):
+        values = {"always": True, "success": current_status == "success",
+                  "failure": current_status == "failure",
+                  "cancelled": current_status == "cancelled"}
+        # Preserve literals; project actual calls using current-job state only.
+        tokens = re.split(f"({_LITERAL})", normalised)
+        for index in range(0, len(tokens), 2):
+            tokens[index] = re.sub(
+                status, lambda match: str(values[match.group(1).lower()]).lower(),
+                tokens[index], flags=re.IGNORECASE,
+            )
+        simplified = simplify("".join(tokens))
+        truth = static_truth(simplified)
+        if truth is True:
+            # success() is the healthy-run state: a step unconditional there fires on
+            # every green run and aggregates nothing. failure()/cancelled() projections
+            # are unreachable on a healthy run, so they cannot restrict coverage.
+            if current_status == "success":
+                return None
+            continue
+        if truth is False:
+            return None
+        matches = failure_atoms(simplified)
+        if matches is None:
+            return None
+        projections.append(matches)
+    # Require dependency-sensitive evidence; an always-true step aggregates nothing.
+    if not projections:
+        return None
+    common = set(match.groups() for match in projections[0])
+    for matches in projections[1:]:
+        common.intersection_update(match.groups() for match in matches)
+    return [match for match in projections[0] if match.groups() in common]
 
 
 def failure_atoms(normalised):
@@ -1544,23 +1639,29 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
         # well-formed its atoms look, so it cannot count toward coverage.
         if static_truth(condition) is False:
             continue
-        matches = failure_atoms(normalise_condition(condition))
+        coverage = []
+        matches = status_reachable_atoms(condition)
         if matches is None:
             continue
-        coverage = []
-        for match in matches:
-            job_id = match.group(1) or match.group(3)
-            outcome = match.group(2) or match.group(4)
-            outcomes = {outcome} if outcome else {"failure", "cancelled"}
-            referenced.setdefault(job_id, set()).update(outcomes)
-            coverage.append((job_id, outcomes))
-        failing.append((condition, index, coverage))
+        for adverse in ("failure", "cancelled"):
+            for match in matches:
+                job_id = match.group(1) or match.group(3)
+                outcome = match.group(2) or match.group(4)
+                if outcome and outcome != adverse:
+                    continue
+                outcomes = {adverse}
+                referenced.setdefault(job_id, set()).update(outcomes)
+                coverage.append((job_id, outcomes))
+        if coverage:
+            failing.append((condition, index, coverage))
 
     if not referenced:
         sys.exit(
             f"{workflow_path}: '{gate_job}' has no step whose `if:` references a "
-            "`needs.<job>.result`.\n"
-            "The gate aggregates nothing and reports success unconditionally. A "
+            "reachable `needs.<job>.result` for an adverse outcome.\n"
+            "Use an explicit status override such as `always() && (...)`; implicit "
+            "or explicit success() can mask failure/cancellation. The gate otherwise "
+            "aggregates nothing and reports success unconditionally. A "
             "`needs.*.result` appearing only in a `run:` body -- an echo of the upstream "
             "results, say -- gates nothing."
         )
