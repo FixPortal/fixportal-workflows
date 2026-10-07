@@ -103,7 +103,10 @@ function Invoke-SmellDetectors {
         [string[]] $Pathspec,
         [string] $SemgrepCommand = 'semgrep',
         [AllowEmptyCollection()] [string[]] $JscpdCommand = @('npx', '--yes', 'jscpd@4.0.5'),
-        [string] $PythonCommand = (@('python3', 'python') | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1)
+        [string] $PythonCommand = (@('python3', 'python') | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1),
+        # Tree-relative globs jscpd must ignore. jscpd scans the whole tree, not $files, so a
+        # caller that excludes paths (pr-detect -Exclude) has to say so here too.
+        [string[]] $JscpdExclude = @()
     )
     New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
     $TreePath = (Resolve-Path -LiteralPath $TreePath).Path
@@ -129,26 +132,66 @@ function Invoke-SmellDetectors {
         # because one invocation over a real repository overflows the Windows 32K
         # command line ("The filename or extension is too long" on a large repository).
         $budget = 24000 - (($configArgs | ForEach-Object { $_.Length + 3 } | Measure-Object -Sum).Sum)
+        # A semgrep run that did not finish cleanly proves nothing about the files it was
+        # given: a non-zero exit, unparseable output, an `errors` entry, or a path it skipped
+        # because analysis failed are all coverage gaps, never a clean 'assessed'.
+        $semgrepFailure = [System.Collections.Generic.List[string]]::new()
+        $skippedRel = [System.Collections.Generic.List[string]]::new()
         foreach ($b in @(Split-ByLength $targets $budget)) {
             $json = & $SemgrepCommand scan @configArgs --json --metrics=off --quiet --no-git-ignore --disable-version-check @b 2>$null | Out-String
-            foreach ($r in @((ConvertFrom-Json $json).results)) {
+            $semgrepExit = $LASTEXITCODE
+            $parsed = $null
+            try { $parsed = ConvertFrom-Json $json -ErrorAction Stop } catch { $parsed = $null }
+            if ($semgrepExit -ne 0) { $semgrepFailure.Add("semgrep exited $semgrepExit") }
+            if ($null -eq $parsed) { if ($semgrepExit -eq 0) { $semgrepFailure.Add('semgrep wrote no parseable JSON') }; continue }
+            $errs = @($parsed.errors | Where-Object { $_ })
+            if ($errs.Count) { $semgrepFailure.Add("semgrep reported $($errs.Count) error(s): $((([string]$errs[0].message).Trim() -split "`n")[0])") }
+            foreach ($sk in @($parsed.paths.skipped | Where-Object { $_ })) {
+                if ($sk -and [string]$sk.reason -match 'error|fail|size|time|big') { $skippedRel.Add([IO.Path]::GetRelativePath($TreePath, [string]$sk.path).Replace('\', '/')) }
+            }
+            foreach ($r in @($parsed.results | Where-Object { $_ })) {
                 $rel = [IO.Path]::GetRelativePath($TreePath, $r.path).Replace('\', '/')
                 $text = ([string]$r.extra.lines).Trim()
+                $end = if ($r.end.line) { [int]$r.end.line } else { [int]$r.start.line }
                 # Logged-out semgrep masks the matched lines as "requires login"; read them from the file.
                 if ($text -eq 'requires login') {
-                    $end = if ($r.end.line) { [int]$r.end.line } else { [int]$r.start.line }
                     $text = (([IO.File]::ReadAllLines($r.path))[([int]$r.start.line - 1)..($end - 1)] -join "`n").Trim()
                 }
-                $raw.Add([pscustomobject]@{ smell = (Get-SmellIdFromCheck $r.check_id); file = $rel; line = [int]$r.start.line; text = $text; detector = "semgrep@$($tools['semgrep'])" })
+                $smellId = Get-SmellIdFromCheck $r.check_id
+                # S13 matches a whole try statement, but only its catch/except clause is the
+                # smell: scopeStart is the first line of the last catch/except clause, so an edit elsewhere in the try
+                # does not make the PR the author of an old empty catch.
+                $scope = [int]$r.start.line
+                if ($smellId -eq 'S13') {
+                    $textLines = @($text -split "`r?`n")
+                    for ($k = $textLines.Count - 1; $k -ge 0; $k--) { if ($textLines[$k] -match '\b(catch|except)\b') { $scope = [int]$r.start.line + $k; break } }
+                }
+                $raw.Add([pscustomobject]@{ smell = $smellId; file = $rel; line = [int]$r.start.line; endLine = $end; scopeStart = $scope; text = $text; detector = "semgrep@$($tools['semgrep'])" })
             }
         }
+        $failureText = ($semgrepFailure | Select-Object -Unique) -join '; '
         foreach ($s in $semgrepSmells) {
             $langs = @($s.languages)
+            if ($failureText) {
+                # The run cannot be attributed to a language: every semgrep smell is a gap.
+                if ($files.Count) { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = $failureText }) }
+                continue
+            }
             # No files scanned means nothing assessed: add no entry, as for a language that is not present.
-            if ($langs -contains 'any') { if ($files.Count) { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = '' }) }; continue }
+            if ($langs -contains 'any') {
+                if ($files.Count) {
+                    if ($skippedRel.Count) { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = "semgrep skipped $($skippedRel.Count) path(s): $(($skippedRel | Select-Object -First 3) -join ', ')" }) }
+                    else { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = '' }) }
+                }
+                continue
+            }
             foreach ($l in $present) {
                 if ($s.id -eq 'S13' -and $l -eq 'powershell') { continue } # Assessed by the PowerShell parser below.
-                if ($langs -contains $l) { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = $l }) }
+                if ($langs -contains $l) {
+                    $gap = @($skippedRel | Where-Object { $script:LanguageByExtension[[IO.Path]::GetExtension($_).ToLowerInvariant()] -eq $l })
+                    if ($gap.Count) { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = "semgrep skipped $($gap.Count) $l path(s): $(($gap | Select-Object -First 3) -join ', ')" }) }
+                    else { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = $l }) }
+                }
                 else { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = "no rule for $l" }) }
             }
         }
@@ -164,7 +207,7 @@ function Invoke-SmellDetectors {
             if ($parseErrors.Count) { $parseFailures.Add($rel); continue }
             foreach ($clause in @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CatchClauseAst] }, $true))) {
                 if ($clause.Body.Statements.Count -or $clause.Body.Traps.Count) { continue }
-                $raw.Add([pscustomobject]@{ smell = 'S13'; file = $rel; line = $clause.Extent.StartLineNumber; text = $clause.Extent.Text.Trim(); detector = "powershell-parser@$($PSVersionTable.PSVersion)" })
+                $raw.Add([pscustomobject]@{ smell = 'S13'; file = $rel; line = $clause.Extent.StartLineNumber; endLine = $clause.Extent.EndLineNumber; scopeStart = $clause.Extent.StartLineNumber; text = $clause.Extent.Text.Trim(); detector = "powershell-parser@$($PSVersionTable.PSVersion)" })
             }
         }
         $tools['powershell-parser'] = [string]$PSVersionTable.PSVersion
@@ -183,7 +226,7 @@ function Invoke-SmellDetectors {
         # every file when the audit ran from a worktree checkout.
         # ponytail: tree path is not glob-escaped; a root containing [ ] { } * ? would misparse.
         $treeGlob = $TreePath.Replace('\', '/').TrimEnd('/')
-        $ignore = (@($ignoreDirs | ForEach-Object { "**/$_/**" }) + @($script:ExcludeGlobs | ForEach-Object { "**/$_" }) + @('**/docs/sources/**', '**/.claude/worktrees/**') | ForEach-Object { "$treeGlob/$_" }) -join ','
+        $ignore = (@($ignoreDirs | ForEach-Object { "**/$_/**" }) + @($script:ExcludeGlobs | ForEach-Object { "**/$_" }) + @('**/docs/sources/**', '**/.claude/worktrees/**') + @($JscpdExclude | Where-Object { $_ } | ForEach-Object { $_.TrimStart('/') -replace '^\./', '' }) | ForEach-Object { "$treeGlob/$_" }) -join ','
         $formats = ($script:LanguageByExtension.Values | Sort-Object -Unique) -join ','
         # jscpd's Windows glob finds zero files when the root uses backslashes.
         & $JscpdCommand[0] @($JscpdCommand | Select-Object -Skip 1) --silent --reporters json --output ($report.Replace('\', '/')) --min-lines 8 --max-lines 10000 --max-size 1mb --format $formats --ignore $ignore ($TreePath.Replace('\', '/')) 2>$null | Out-Null
@@ -196,7 +239,8 @@ function Invoke-SmellDetectors {
             if ($d.firstFile.name -eq $d.secondFile.name) { continue } # S14 is cross-file duplication.
             $first = [IO.Path]::GetRelativePath($TreePath, $d.firstFile.name).Replace('\', '/')
             $second = [IO.Path]::GetRelativePath($TreePath, $d.secondFile.name).Replace('\', '/')
-            $raw.Add([pscustomobject]@{ smell = $s.id; file = $first; line = [int]$d.firstFile.start; text = "duplicates ${second}:$($d.secondFile.start) ($($d.lines) lines)"; detector = "jscpd@$($tools['jscpd'])" })
+            $firstEnd = if ($d.firstFile.end) { [int]$d.firstFile.end } else { [int]$d.firstFile.start + [int]$d.lines - 1 }
+            $raw.Add([pscustomobject]@{ smell = $s.id; file = $first; line = [int]$d.firstFile.start; endLine = $firstEnd; scopeStart = [int]$d.firstFile.start; text ="duplicates ${second}:$($d.secondFile.start) ($($d.lines) lines)"; detector = "jscpd@$($tools['jscpd'])" })
         }
         $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = '' })
     }
@@ -207,10 +251,22 @@ function Invoke-SmellDetectors {
         if (-not $PythonCommand) { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = 'python unavailable' }); continue }
         $listPath = Join-Path $OutDir "files-$($s.id).txt"
         Set-Content -LiteralPath $listPath -Value $files -Encoding utf8NoBOM
-        $out = & $PythonCommand $scriptPath --root $TreePath --files $listPath --smell $s.id 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0) { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = "script exited ${LASTEXITCODE}: $($out.Trim() -split "`n" | Select-Object -Last 1)" }); continue }
-        $result = $out | ConvertFrom-Json
-        foreach ($h in @($result.hits)) { $raw.Add([pscustomobject]@{ smell = $s.id; file = $h.file; line = [int]$h.line; text = [string]$h.text; detector = "script:$(Split-Path -Leaf $scriptPath)" }) }
+        # stderr goes to its own file, never into stdout: a Python SyntaxWarning (ast.parse on a
+        # source file with an invalid escape sequence) would otherwise land inside the JSON.
+        $errPath = Join-Path $OutDir "stderr-$($s.id).txt"
+        $out = & $PythonCommand $scriptPath --root $TreePath --files $listPath --smell $s.id 2>$errPath | Out-String
+        $scriptExit = $LASTEXITCODE
+        $err = if (Test-Path -LiteralPath $errPath) { (Get-Content -LiteralPath $errPath -Raw) } else { '' }
+        if ($scriptExit -ne 0) {
+            $detail = if ($err -and $err.Trim()) { $err } else { $out }
+            $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = "script exited ${scriptExit}: $($detail.Trim() -split "`n" | Select-Object -Last 1)" }); continue
+        }
+        try { $result = $out | ConvertFrom-Json -ErrorAction Stop }
+        catch { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = "script wrote no parseable JSON: $($out.Trim() -split "`n" | Select-Object -First 1)" }); continue }
+        foreach ($h in @($result.hits)) {
+            $hitEnd = if ($h.endLine) { [int]$h.endLine } else { [int]$h.line }
+            $raw.Add([pscustomobject]@{ smell = $s.id; file = $h.file; line = [int]$h.line; endLine = $hitEnd; scopeStart = [int]$h.line; text = [string]$h.text; detector = "script:$(Split-Path -Leaf $scriptPath)" })
+        }
         $coverage.Add([pscustomobject]@{ smell = $s.id; status = $result.status; reason = [string]$result.reason })
     }
 
@@ -220,7 +276,7 @@ function Invoke-SmellDetectors {
 
     $sorted = @($raw | Sort-Object smell, file, line, text)
     $i = 0
-    $hits = @(foreach ($h in $sorted) { $i++; [pscustomobject][ordered]@{ id = ('h{0:D4}' -f $i); smell = $h.smell; file = $h.file; line = $h.line; text = $h.text; detector = $h.detector } })
+    $hits = @(foreach ($h in $sorted) { $i++; [pscustomobject][ordered]@{ id = ('h{0:D4}' -f $i); smell = $h.smell; file = $h.file; line = $h.line; endLine = $h.endLine; scopeStart = $h.scopeStart; text = $h.text; detector = $h.detector } })
     $lines = @($hits | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 3 })
     [IO.File]::WriteAllText((Join-Path $OutDir 'hits.jsonl'), (($lines -join "`n") + $(if ($lines) { "`n" } else { '' })))
     $coverage | ConvertTo-Json -Depth 3 -AsArray | Set-Content -LiteralPath (Join-Path $OutDir 'coverage.json') -Encoding utf8NoBOM

@@ -2,13 +2,13 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "3c6b9f71d066faa517a7551a89c24d651609d36d",
+    "commit": "35368c8c4142b4035b8f59e2f8043f4eeb1148a5",
     "syncedAt": "2026-10-07"
   },
   "assets": [
     {
       "path": ".github/ai-smells/detect.ps1",
-      "sha256": "25590e779ba72d1345c67ec4fa6362dfb9347982cb141d68886728acb2c2009e",
+      "sha256": "7c365eb7337250d66bbbbae9d2cdca6c16b269bd2414e5cdbf5339d492a1ae4a",
       "verbatim": true
     },
     {
@@ -63,7 +63,7 @@
     },
     {
       "path": ".github/ai-smells/detectors/scripts/comment_density.py",
-      "sha256": "f08397ce71075e266b378d2dae9cd322f7c748b88c3736f662ac01ed80500f54",
+      "sha256": "645fdb57c04afafac5fa612754591e6e7904c6a082fe6edfebbb92fed856a6fb",
       "verbatim": true
     },
     {
@@ -73,12 +73,12 @@
     },
     {
       "path": ".github/ai-smells/detectors/scripts/registry_check.py",
-      "sha256": "17a803b846004267c90455b28d84f4cccbceb00cce09e66cf23e6c9772ef6566",
+      "sha256": "e1b879d9b29835fe0fc613338af7d9d87497cce258507d8b3c090289b9bbf043",
       "verbatim": true
     },
     {
       "path": ".github/ai-smells/detectors/scripts/size_outliers.py",
-      "sha256": "bd51e8b6f81f608bc0dc0fbe9e516f484af891f4d3febf7a5d0ad8e106b3793a",
+      "sha256": "14a69b50a337cc976facb101cdee526f60863690eb3a32fad19e5b686f99c5b8",
       "verbatim": true
     },
     {
@@ -88,12 +88,12 @@
     },
     {
       "path": ".github/ai-smells/pr-detect.ps1",
-      "sha256": "4800ea20fd58a5cb5c2ad56697a7e3426cdd8d2ba9cef7faf65b9fc19a9e0b1e",
+      "sha256": "eeaada2f7a1cc3bfc74d89f10885d58860e8d55e063d8629520c4782e0c0ba0c",
       "verbatim": true
     },
     {
       "path": ".github/ai-smells/pr-scope.ps1",
-      "sha256": "8d22a3b7144f65ce50f5fd015b9fe6a00db79c1b5fbf6149efd29aa5a5f83229",
+      "sha256": "ddab3fe4a9f49064b414525d8c306cd66432870de2bc784c1fc09959e47fb289",
       "verbatim": true
     },
     {
@@ -123,12 +123,12 @@
     },
     {
       "path": ".github/workflows/review-policy-guard.yml",
-      "sha256": "25f78ca2eda1878b5a3d0dee28f4fb1ce6b7c2618f46ae48f5dda5053c0f0ff3",
+      "sha256": "0248bdedca5b7c26f316ca373c1b6c8c47ba9080b7b2feda109e1d5d2f2c7ab2",
       "verbatim": false
     },
     {
       "path": ".github/workflows/review-tier.yml",
-      "sha256": "61babae7f27076c27d81ec29c10aaae8cc1547009e7babdc35f6b036652a887a",
+      "sha256": "c54b26304367f8b811d79ab23864995240145e8d5aa3c6c3e9339675eddda472",
       "verbatim": false
     }
   ]

@@ -26,8 +26,10 @@ name: Review tier
 # exemption: fork-originated PRs get a read-only token under plain `pull_request`, so
 # the label write would 403 on exactly the external PRs this workflow exists for.
 # Safety property the exemption rests on: this job never checks out or executes PR
-# code — every read is an API call against the base ref, and the only writes are
-# label operations. The gate fails this workflow if a checkout ever appears.
+# code. Nothing from the PR head ever lands on disk: the POLICY is read from the base
+# ref, the PR's own metadata (changed-file list, labels, author) is read through the API,
+# and the only writes are label operations. The gate fails this workflow if a checkout
+# ever appears.
 
 # `edited` is in the type list because RETARGETING A PULL REQUEST IS NOT A HEAD CHANGE.
 # Moving a PR's base onto this branch changes both the merge base (so the changed-file
@@ -83,8 +85,16 @@ jobs:
           # then could pin review-high on a pull request CodeRabbit will never
           # review -- and every later run on that PR would skip, never removing it.
           # Skip BEFORE the ERR trap is armed; a notice, not silence.
-          if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+          #
+          # renovate[bot] is skipped with dependabot[bot]: the .coderabbit.yaml ignore list
+          # names both, so a Renovate PR could otherwise be pinned review-high by a
+          # reviewer that will refuse it. The skip also REMOVES a review-high label already
+          # on the PR (a HIGH path touched earlier, or the label applied before the author
+          # was recognised) -- exiting first left that label in place forever, because every
+          # later run skips too. review-high-manual is never touched.
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ] || [ "$PR_AUTHOR" = "renovate[bot]" ]; then
             echo "::notice::Dependency PRs are out of AI review by policy; skipping review tier classification."
+            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label review-high >/dev/null 2>&1 || true
             exit 0
           fi
 
@@ -125,6 +135,16 @@ jobs:
             exit 1
           fi
 
+          # The translation below escapes `[` and `]`, so a bracket-class glob (`src/[ab].cs`)
+          # would match the literal text and under-tier the paths it meant to catch; `{a,b}`
+          # alternation is likewise unsupported. review-policy-guard.yml rejects such entries
+          # at PR time; this refuses to tier against one that is already on the base ref.
+          if grep -q '[[{]' <<< "$patterns"; then
+            echo "::error::.claude/review-policy.json at base $BASE_REF has a high entry containing '[' or '{', which this tiering does not support (it would match literally and under-tier). Failing closed."
+            tier_high_on_failure
+            exit 1
+          fi
+
           high=false
 
           # Changed files via the PULL REQUEST endpoint under --paginate, not compare.
@@ -153,9 +173,13 @@ jobs:
             expected=0
             files=
             retrieved=0
+            paths=0
           else
             retrieved=$(printf '%s\n' "$records" | grep -c . || true)
             files=$(printf '%s\n' "$records" | tr '\t' '\n' | grep -v '^$' || true)
+            # Paths AFTER rename expansion: each rename contributes its vacated path too, so
+            # this can reach twice `retrieved`. The ceiling guard below counts these.
+            paths=$(printf '%s\n' "$files" | grep -c . || true)
             # A non-numeric changed_files (`null` included) makes the -ne test below
             # return 2 -- which inside an `if` condition counts as FALSE, so neither
             # `set -e` nor the ERR trap fires and the completeness check silently does
@@ -170,11 +194,13 @@ jobs:
                 if [ "$retrieved" -ne "$expected" ]; then
                   echo "::warning::Enumerated $retrieved of $expected changed files; tiering HIGH rather than under-tiering on a partial list."
                   high=true
-                elif [ "$retrieved" -ge 3000 ]; then
+                elif [ "$retrieved" -ge 3000 ] || [ "$paths" -ge 3000 ]; then
                   # The files endpoint stops at 3000. Whether changed_files is capped there too is
                   # unverified, and if it is, equal counts at the ceiling would look complete while
                   # HIGH paths past file 3000 go unread. Fail closed at the ceiling regardless.
-                  echo "::warning::Enumerated $retrieved changed files, the files endpoint's 3000-file ceiling; tiering HIGH because the list may be truncated."
+                  # The guard also counts PATHS after rename expansion: that is the size of the
+                  # list the matcher walks, and 1,500 renames are 3,000 paths.
+                  echo "::warning::Enumerated $retrieved changed files ($paths paths after rename expansion), at the 3000 ceiling; tiering HIGH because the list may be truncated or too large to classify."
                   high=true
                 fi
                 ;;
@@ -212,18 +238,32 @@ jobs:
                 s#\x03#[^/]*#g
                 s#\x04#[^/]#g'
             }
-            while IFS= read -r file; do
-              [ -n "$file" ] || continue
+            # Each glob is translated ONCE and grepped against the WHOLE path list in one
+            # call, so the cost is one grep per glob rather than one sed+grep per path x
+            # glob pair. The pair loop this replaced started up to ~180k processes on a PR
+            # that matches nothing (the NORMAL case runs to completion) and a container test
+            # hit the 5-minute timeout. The path list goes in as a here-string, not a pipe:
+            # with `pipefail`, `printf | grep -q` reports failure when grep exits early and
+            # printf takes the SIGPIPE, which would read a match as no match.
+            if [ -n "$files" ]; then
               while IFS= read -r pattern; do
                 [ -n "$pattern" ] || continue
                 re=$(glob_to_regex "$pattern")
-                if printf '%s\n' "$file" | grep -qE "^${re}$"; then
+                # grep exits 1 for no match and 2+ for an error (a regex it cannot compile).
+                # An `if grep` reads both as "no match", which would tier a PR NORMAL on a
+                # broken pattern, so anything above 1 fails closed to HIGH instead.
+                rc=0
+                grep -qE -e "^${re}$" <<< "$files" || rc=$?
+                if [ "$rc" -eq 0 ]; then
+                  high=true
+                  break
+                elif [ "$rc" -ne 1 ]; then
+                  echo "::warning::Policy glob '$pattern' could not be matched (grep exit $rc); failing closed to HIGH."
                   high=true
                   break
                 fi
               done <<< "$patterns"
-              $high && break
-            done <<< "$files"
+            fi
           fi
 
           if $high; then

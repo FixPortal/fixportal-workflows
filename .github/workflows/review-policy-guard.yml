@@ -100,6 +100,14 @@ jobs:
             echo "::error file=$policy::Review policy has no 'high' array. Nothing can tier HIGH, so the policy is inert."
             exit 1
           fi
+          # Entries are globs with `*`, `**` and `?` only. review-tier.yml and the local hook
+          # escape `[`, `]`, `{` and `}`, so `src/[ab].cs` would match that literal text and
+          # silently under-tier the files it was written for. Reject them where the policy is
+          # edited rather than letting the server tier NORMAL.
+          if ! jq -e '[(.high // [])[], (.low // [])[] | select(type == "string" and test("[\\[{]"))] | length == 0' "$policy" >/dev/null; then
+            echo "::error file=$policy::A high/low entry contains '[' or '{'. Tier globs support only *, ** and ?; a bracket class or brace alternation would match literally and under-tier. Write one entry per path."
+            exit 1
+          fi
           # The review control plane must stay HIGH in every repo: this file decides which
           # reviewers a PR needs, and .coderabbit.yaml can silence a reviewer outright.
           #
