@@ -46,19 +46,25 @@ from pathlib import Path
 
 TEACHING = """
 A listed asset diverges from the committed canonical-asset manifest. Each listed
-file is a copy of a canonical scaffold-ci asset.
+file is a copy of a CI asset that FixPortal maintains upstream and syncs into
+this repository, so an edit made here alone cannot be merged.
 
-  Deliberate change? Regenerate the manifest and commit it IN THIS PR -- the
-  generator lives in the canonical skills checkout:
-    pwsh ~/.agents/skills/scaffold-ci/scripts/sync-canonical-asset-manifest.ps1 -RepoRoot .
-  The manifest diff tells the reviewer the divergence is intentional. Consider
-  upstreaming the improvement to fixportal-agents-skills.
+  Contributing from outside FixPortal? Revert your edit to the listed file(s)
+  and describe the change you need in your pull request description or in an
+  issue. A maintainer will make it upstream and sync it here.
 
-  Accidental? Restore the file from canonical (scaffold-ci/assets/ in the skills
-  checkout) or revert the edit.
+  FixPortal maintainer:
+    Deliberate change? Regenerate the manifest and commit it IN THIS PR -- the
+    generator lives in the canonical skills checkout:
+      pwsh ~/.agents/skills/scaffold-ci/scripts/sync-canonical-asset-manifest.ps1 -RepoRoot .
+    The manifest diff tells the reviewer the divergence is intentional. Consider
+    upstreaming the improvement to fixportal-agents-skills.
 
-  Canonical moved? Re-sync the asset from scaffold-ci and regenerate the manifest
-  in the same PR.
+    Accidental? Restore the file from canonical (scaffold-ci/assets/ in the
+    skills checkout) or revert the edit.
+
+    Canonical moved? Re-sync the asset from scaffold-ci and regenerate the
+    manifest in the same PR.
 """
 
 
@@ -79,14 +85,16 @@ def main() -> int:
     if not manifest_path.is_file():
         print(f"ERROR: {manifest_path} not found.")
         print("This repository's CI runs the canonical-asset gate, so the manifest must")
-        print("be committed. Restore it, or regenerate it from the canonical checkout:")
+        print("be committed. Restore it from the default branch. A FixPortal maintainer")
+        print("can instead regenerate it from the canonical checkout:")
         print("  pwsh ~/.agents/skills/scaffold-ci/scripts/sync-canonical-asset-manifest.ps1 -RepoRoot .")
         return 2
     try:
         manifest = json.loads(manifest_path.read_bytes().decode("utf-8-sig"))
     except (OSError, ValueError, UnicodeDecodeError) as exc:
         print(f"ERROR: {manifest_path} is not valid JSON: {exc}")
-        print("The manifest may carry a hand-edit; fix it or regenerate it (see above).")
+        print("The manifest may carry a hand-edit. Restore it from the default branch; a")
+        print("FixPortal maintainer can regenerate it with sync-canonical-asset-manifest.ps1.")
         return 2
     if not isinstance(manifest, dict) or manifest.get("schema") != 1:
         print(f"ERROR: unsupported manifest schema {manifest.get('schema') if isinstance(manifest, dict) else type(manifest).__name__!r};")

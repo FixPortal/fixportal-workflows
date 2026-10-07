@@ -2,8 +2,8 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "aded26495d4ae2deef2e20989ef9a34ea47ba873",
-    "syncedAt": "2026-10-06"
+    "commit": "3c6b9f71d066faa517a7551a89c24d651609d36d",
+    "syncedAt": "2026-10-07"
   },
   "assets": [
     {
@@ -103,7 +103,7 @@
     },
     {
       "path": ".github/scripts/assert_canonical_assets.py",
-      "sha256": "4ceb9b3d9645a9bc93b0500e47d4edd1ea19843ddc89b0b81ac8fb68183db185",
+      "sha256": "e6491c2a54d45b57656cfc832a3e1940529c97e3735aa4831e38105472e99f1e",
       "verbatim": true
     },
     {
