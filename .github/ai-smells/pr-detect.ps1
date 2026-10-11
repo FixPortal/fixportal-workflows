@@ -67,7 +67,8 @@ if ($files.Count) {
                     $content = & git -C $RepoPath -c core.quotepath=false show "$($info.MergeBase):$old" 2>$null
                 }
                 finally { [Console]::OutputEncoding = $consoleEncoding }
-                if ($LASTEXITCODE -ne 0) { continue } # absent at the merge-base: the PR created it
+                $showExit = $LASTEXITCODE
+                if ($showExit -ne 0) { continue } # absent at the merge-base: the PR created it
                 $dest = Join-Path $baseTree $file
                 New-Item -ItemType Directory -Force (Split-Path -Parent $dest) | Out-Null
                 [IO.File]::WriteAllText($dest, ((@($content) -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
@@ -97,3 +98,7 @@ if ($files.Count) {
 }
 $json = [ordered]@{ hits = $hits; coverage = $coverage } | ConvertTo-Json -Depth 5
 [IO.File]::WriteAllText($OutFile, $json, [Text.UTF8Encoding]::new($false))
+# Hits never fail the step; a failure to detect throws above. Exit explicitly so a native exit
+# code left by a tolerated git call does not become the step result: the Actions pwsh wrapper
+# ends every script with `exit $LASTEXITCODE`.
+exit 0

@@ -124,7 +124,7 @@ function Invoke-SmellDetectors {
         if (-not (Get-Command $SemgrepCommand -ErrorAction SilentlyContinue)) {
             throw "semgrep ('$SemgrepCommand') is required and was not found. Install it (pip install semgrep) - regex and AST smells cannot be assessed without it."
         }
-        $tools['semgrep'] = ((& $SemgrepCommand --version) | Select-Object -First 1).Trim()
+        $tools['semgrep'] = ((& $SemgrepCommand --version --disable-version-check) | Select-Object -First 1).Trim()
         $configArgs = @($semgrepSmells | ForEach-Object { $sid = $_.id; Get-SemgrepRuleFiles -SkillRoot $SkillRoot -RulePath $_.detector.rule } | ForEach-Object { '--config'; $_ })
         $targets = @($files | ForEach-Object { Join-Path $TreePath $_ })
         # Explicit targets, not the tree root: a directory scan would apply semgrep's own
