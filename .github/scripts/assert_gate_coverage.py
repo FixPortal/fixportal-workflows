@@ -2640,13 +2640,11 @@ def resolve_committed_paths(root, relative, allow_outside_repository=False):
     # repository root is refused outright rather than clamped: nothing outside the
     # checkout is a repo-local gate script.
     parts = []
-    climbed = False
     overclimbed = False
     for part in relative.split("/"):
         if part in ("", "."):
             continue
         if part == "..":
-            climbed = True
             if not parts:
                 # OVER-CLIMBED LEXICALLY. Returning here would be the same early-exit
                 # mistake as the one below, one step earlier: `scripts/link/../../../gate.py`
