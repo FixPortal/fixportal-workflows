@@ -108,9 +108,18 @@ jobs:
             echo "::error file=$policy::A high/low entry contains '[' or '{'. Tier globs support only *, ** and ?; a bracket class or brace alternation would match literally and under-tier. Write one entry per path."
             exit 1
           fi
-          # The review control plane must stay HIGH in every repo: this file decides which
-          # reviewers a PR needs, and .coderabbit.yaml can silence a reviewer outright.
-          #
+
+      # The review control plane must stay HIGH in every repo: this file decides which
+      # reviewers a PR needs, and .coderabbit.yaml can silence a reviewer outright. This
+      # deliberately sits in its own simple step (the shape fixportal-engine uses) so a
+      # consumer's contract checker can require its complete executable body instead of
+      # interpreting a larger shell program. The step NAME is pinned by scaffold-ci's tests.
+      - name: Policy-controlled paths must remain HIGH
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy=.claude/review-policy.json
+
           # The MERGE BARRIER joined the list on 2026-08-23, after an adversarial-review
           # sweep found the same hole in six estate repos at once. "CI Gate" is a required
           # status check produced by the PR's OWN copy of ci.yml: a PR that keeps the job,
