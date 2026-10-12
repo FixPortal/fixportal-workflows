@@ -165,7 +165,7 @@ jobs:
       # PARSED, NOT GREPPED — replaced the two grep steps that used to live here
       # (2026-08-24). Those greps had to exclude comment lines, because the pattern for
       # each rule matched the comment EXPLAINING that rule: the first version failed the
-      # guard in every repo it was installed into, caught on the fixportal-venue pilot.
+      # guard in every repo it was installed into, caught on a rollout pilot.
       # They were also both too loose (prose tripped them) and too tight (a quoted value,
       # a list-form trigger `on: [push, pull_request_target]`, or a digest-pinned image
       # read wrongly). A parser has neither problem, and the checker's own source sitting
