@@ -159,10 +159,16 @@ jobs:
           # but if present they must receive HIGH review.
           # assert_canonical_assets.py joined on 2026-09-26: gate coverage already refuses a
           # gate-feeding script that is not HIGH, but the guard should hold that on its own.
+          #
+          # "Exists" means TRACKED, case-exactly: `[ -f NuGet.config ]` is true for a tracked
+          # lowercase nuget.config on a case-insensitive filesystem (Windows, macOS) and
+          # demanded a path the repo does not have. git ls-files reports the name as committed.
+          # grep has no -q on purpose: it must drain the pipe, or pipefail can see git die of
+          # SIGPIPE in a large repo and report "not tracked".
           for required in .claude/ci-budget-approval.json .github/canonical-assets.json \
             .github/scripts/assert_canonical_assets.py \
             nuget.config NuGet.config global.json .config/dotnet-tools.json .npmrc Directory.Build.props; do
-            if [ -f "$required" ] && ! jq -e --arg r "$required" '.high | index($r)' "$policy" >/dev/null; then
+            if git ls-files | grep -xF -- "$required" >/dev/null && ! jq -e --arg r "$required" '.high | index($r)' "$policy" >/dev/null; then
               echo "::error file=$policy::'$required' exists but is missing from the high list. An edit to it would get the lighter review."
               exit 1
             fi

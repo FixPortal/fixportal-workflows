@@ -2,8 +2,8 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "e10d858302bc73a5c84f2df5541f0a3aa754bb5e",
-    "syncedAt": "2026-10-12"
+    "commit": "540c74515ab6d687b2fc4f58e43a59c35b848ee8",
+    "syncedAt": "2026-10-13"
   },
   "assets": [
     {
@@ -169,10 +169,10 @@
     },
     {
       "path": ".github/workflows/review-policy-guard.yml",
-      "sha256": "a941f0c9a02114c145aef7eb524841a6cb231b517888dcf4c569dfca21dc9074",
+      "sha256": "fb00848a7c3f9ee0a74f388cc83f2e79621776fbbe7e4b6f2131a929fabc56da",
       "verbatim": false,
-      "commit": "e10d858302bc73a5c84f2df5541f0a3aa754bb5e",
-      "syncedAt": "2026-10-12"
+      "commit": "540c74515ab6d687b2fc4f58e43a59c35b848ee8",
+      "syncedAt": "2026-10-13"
     },
     {
       "path": ".github/workflows/review-tier.yml",
