@@ -10,9 +10,11 @@ FILE_MAX, FUNC_MAX = 800, 120
 # The lookahead rejects type declarations: `class Svc(IDep d) {` and `record R(int A) {`
 # have a parameter list and a brace but are not functions, and measuring one as a function
 # made the scan skip every method nested inside it.
-SIGNATURE = re.compile(r"^\s*(public|private|protected|internal|static|async|export|function|def)\b(?![^(]*\b(?:class|record|struct|interface|enum)\b)[^;=]*\([^;]*\)\s*(\{|=>|:)?\s*$")
-OPENER = re.compile(r"^\s*(public|private|protected|internal|static|async|export|function|def)\b(?![^(]*\b(?:class|record|struct|interface|enum)\b)[^;=]*\(")
+SIGNATURE = re.compile(r"^\s*(public|private|protected|internal|static|async|export|function|def)\b(?![^(]*\b(?:class|record|struct|interface|enum)\s+\w+)[^;=]*\([^;]*\)\s*(\{|=>|:)?\s*$")
+OPENER = re.compile(r"^\s*(public|private|protected|internal|static|async|export|function|def)\b(?![^(]*\b(?:class|record|struct|interface|enum)\s+\w+)[^;=]*\(")
 WRAP_LIMIT = 30  # a parameter list longer than this many lines is not a signature
+SOURCE = (".cs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py")
+UNSUPPORTED = (".ps1", ".psm1", ".go", ".java", ".rs", ".rb", ".kt", ".swift", ".cpp", ".c")
 
 def python_hits(rel, source):
     try:
@@ -25,7 +27,8 @@ def python_hits(rel, source):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             span = node.end_lineno - node.lineno + 1
             if span > FUNC_MAX:
-                hits.append({"file": rel, "line": node.lineno, "endLine": node.end_lineno, "text": f"function spans {span} lines: {lines[node.lineno - 1].strip()[:80]}"})
+                signature = " ".join(lines[node.lineno - 1:node.body[0].lineno - 1]).strip() or lines[node.lineno - 1].strip()
+                hits.append({"file": rel, "line": node.lineno, "endLine": node.end_lineno, "text": f"function spans {span} lines: {signature}"})
     return hits
 
 def signature_end(lines, i):
@@ -44,10 +47,12 @@ def main():
     ap.add_argument("--root", required=True); ap.add_argument("--files", required=True); ap.add_argument("--smell", required=True)
     a = ap.parse_args()
     root = pathlib.Path(a.root)
-    hits, unread = [], []
+    hits, unread, skipped = [], [], []
     for rel in pathlib.Path(a.files).read_text(encoding="utf-8").splitlines():
         rel = rel.strip()
-        if not rel or not rel.endswith((".cs", ".ts", ".tsx", ".js", ".jsx", ".py")):
+        if rel.lower().endswith(UNSUPPORTED):
+            skipped.append(rel)
+        if not rel or not rel.lower().endswith(SOURCE):
             continue
         path = root / rel
         if not path.is_file():
@@ -61,7 +66,7 @@ def main():
         lines = source.splitlines()
         if len(lines) > FILE_MAX:
             hits.append({"file": rel, "line": 1, "endLine": len(lines), "text": f"file is {len(lines)} lines"})
-        if rel.endswith(".py"):
+        if rel.lower().endswith(".py"):
             hits += python_hits(rel, source)
             continue
         i = 0
@@ -76,10 +81,13 @@ def main():
                         break
                     j += 1
                 if opened and j - i + 1 > FUNC_MAX:
-                    hits.append({"file": rel, "line": i + 1, "endLine": j + 1, "text": f"function spans {j - i + 1} lines: {lines[i].strip()[:80]}"})
+                    signature = " ".join(line.strip() for line in lines[i:head + 1])
+                    hits.append({"file": rel, "line": i + 1, "endLine": j + 1, "text": f"function spans {j - i + 1} lines: {signature}"})
                     i = j
             i += 1
     status, reason = ("not assessed", "could not read " + ", ".join(unread)) if unread else ("assessed", "")
+    if skipped:
+        status, reason = "not assessed", "; ".join(filter(None, [reason, "unsupported source: " + ", ".join(skipped)]))
     print(json.dumps({"status": status, "reason": reason, "hits": sorted(hits, key=lambda h: (h["file"], h["line"]))}))
 
 if __name__ == "__main__":

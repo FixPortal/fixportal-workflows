@@ -93,6 +93,53 @@ function Get-SemgrepRuleFiles([string] $SkillRoot, [string] $RulePath) {
     return @($full) + $siblings
 }
 
+function Get-CatchSpans([string] $Text, [int] $StartLine, [string] $Language) {
+    # Keep offsets and newlines while removing comments and string literals from scope matching.
+    $literals = '(?s)"{3}.*?"{3}|''{3}.*?''{3}|@"(?:""|[^"])*"|"(?:\\.|[^"\\])*"|''(?:\\.|[^''\\])*''|`(?:\\.|[^`\\])*`'
+    $literals += if ($Language -eq 'python') { '|\#[^\r\n]*' } else { '|/\*.*?\*/|//[^\r\n]*' }
+    $code = [regex]::Replace($Text, $literals, [Text.RegularExpressions.MatchEvaluator]{ param($m) $m.Value -replace '[^\r\n]', ' ' })
+    if ($Language -eq 'python') {
+        $lines = @($code -split "`r?`n")
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -notmatch '^(\s*)except\b') { continue }
+            $indent = $Matches[1].Length
+            $header = $i; $depth = 0; $tail = $null
+            for (; $header -lt $lines.Count; $header++) {
+                for ($column = 0; $column -lt $lines[$header].Length; $column++) {
+                    $char = $lines[$header][$column]
+                    if ($char -in '(', '[', '{') { $depth++ }
+                    if ($char -in ')', ']', '}') { $depth-- }
+                    if ($char -eq ':' -and $depth -eq 0) { $tail = $lines[$header].Substring($column + 1).Trim(); break }
+                }
+                if ($null -ne $tail) { break }
+            }
+            if ($null -eq $tail) { continue }
+            if ($tail -eq 'pass') { [pscustomobject]@{ Start = $StartLine + $i; End = $StartLine + $header; Column = $indent + 1 }; continue }
+            $end = $header
+            for ($j = $header + 1; $j -lt $lines.Count; $j++) {
+                if (-not $lines[$j].Trim()) { continue }
+                if (($lines[$j].Length - $lines[$j].TrimStart().Length) -le $indent) { break }
+                $end = $j
+            }
+            $body = if ($end -gt $header) { ($lines[($header + 1)..$end] -join "`n").Trim() } else { '' }
+            if ($body -eq 'pass') { [pscustomobject]@{ Start = $StartLine + $i; End = $StartLine + $end; Column = $indent + 1 } }
+        }
+        return
+    }
+    foreach ($match in [regex]::Matches($code, '\bcatch\b[^{}]*\{')) {
+        $open = $match.Index + $match.Length - 1
+        $depth = 1; $close = $open + 1
+        while ($close -lt $code.Length -and $depth -gt 0) {
+            if ($code[$close] -eq '{') { $depth++ }
+            if ($code[$close] -eq '}') { $depth-- }
+            $close++
+        }
+        if ($depth -eq 0 -and -not $code.Substring($open + 1, $close - $open - 2).Trim()) {
+            [pscustomobject]@{ Start = $StartLine + ([regex]::Matches($code.Substring(0, $match.Index), "`n")).Count; End = $StartLine + ([regex]::Matches($code.Substring(0, $close - 1), "`n")).Count; Column = $match.Index - $code.LastIndexOf([char]10, $match.Index) }
+        }
+    }
+}
+
 function Invoke-SmellDetectors {
     [CmdletBinding()]
     param(
@@ -137,17 +184,33 @@ function Invoke-SmellDetectors {
         # because analysis failed are all coverage gaps, never a clean 'assessed'.
         $semgrepFailure = [System.Collections.Generic.List[string]]::new()
         $skippedRel = [System.Collections.Generic.List[string]]::new()
+        $fileFailure = @{}
+        $catchSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($b in @(Split-ByLength $targets $budget)) {
-            $json = & $SemgrepCommand scan @configArgs --json --metrics=off --quiet --no-git-ignore --disable-version-check @b 2>$null | Out-String
+            $json = & $SemgrepCommand scan @configArgs --json --metrics=off --verbose --no-git-ignore --disable-version-check @b 2>$null | Out-String
             $semgrepExit = $LASTEXITCODE
             $parsed = $null
             try { $parsed = ConvertFrom-Json $json -ErrorAction Stop } catch { $parsed = $null }
             if ($semgrepExit -ne 0) { $semgrepFailure.Add("semgrep exited $semgrepExit") }
             if ($null -eq $parsed) { if ($semgrepExit -eq 0) { $semgrepFailure.Add('semgrep wrote no parseable JSON') }; continue }
             $errs = @($parsed.errors | Where-Object { $_ })
-            if ($errs.Count) { $semgrepFailure.Add("semgrep reported $($errs.Count) error(s): $((([string]$errs[0].message).Trim() -split "`n")[0])") }
+            foreach ($err in $errs) {
+                $message = "semgrep error: $((([string]$err.message).Trim() -split "`n")[0])"
+                $paths = @(@($err.path) + @($err.spans | ForEach-Object { $_.file }) | Where-Object { $_ } | Select-Object -Unique)
+                if (-not $paths.Count) { $semgrepFailure.Add($message); continue }
+                foreach ($path in $paths) {
+                    $relPath = if ([IO.Path]::IsPathRooted($path)) { [IO.Path]::GetRelativePath($TreePath, $path) } else { $path }
+                    $relPath = $relPath.Replace('\', '/')
+                    $fileFailure[$relPath] = $message
+                    $skippedRel.Add($relPath)
+                }
+            }
             foreach ($sk in @($parsed.paths.skipped | Where-Object { $_ })) {
-                if ($sk -and [string]$sk.reason -match 'error|fail|size|time|big') { $skippedRel.Add([IO.Path]::GetRelativePath($TreePath, [string]$sk.path).Replace('\', '/')) }
+                if ($sk -and [string]$sk.reason -match 'error|fail|size|time|big|insufficient_permissions') {
+                    $path = [string]$sk.path
+                    $relPath = if ([IO.Path]::IsPathRooted($path)) { [IO.Path]::GetRelativePath($TreePath, $path) } else { $path }
+                    $skippedRel.Add($relPath.Replace('\', '/'))
+                }
             }
             foreach ($r in @($parsed.results | Where-Object { $_ })) {
                 $rel = [IO.Path]::GetRelativePath($TreePath, $r.path).Replace('\', '/')
@@ -158,15 +221,22 @@ function Invoke-SmellDetectors {
                     $text = (([IO.File]::ReadAllLines($r.path))[([int]$r.start.line - 1)..($end - 1)] -join "`n").Trim()
                 }
                 $smellId = Get-SmellIdFromCheck $r.check_id
-                # S13 matches a whole try statement, but only its catch/except clause is the
-                # smell: scopeStart is the first line of the last catch/except clause, so an edit elsewhere in the try
-                # does not make the PR the author of an old empty catch.
-                $scope = [int]$r.start.line
                 if ($smellId -eq 'S13') {
-                    $textLines = @($text -split "`r?`n")
-                    for ($k = $textLines.Count - 1; $k -ge 0; $k--) { if ($textLines[$k] -match '\b(catch|except)\b') { $scope = [int]$r.start.line + $k; break } }
+                    $language = $script:LanguageByExtension[[IO.Path]::GetExtension($rel).ToLowerInvariant()]
+                    # Use source lines without trimming so nested matches share absolute clause columns.
+                    $clauseText = ([IO.File]::ReadAllLines($r.path))[([int]$r.start.line - 1)..($end - 1)] -join "`n"
+                    $spans = @(Get-CatchSpans $clauseText ([int]$r.start.line) $language)
+                    if (-not $spans.Count) {
+                        $fileFailure[$rel] = 'could not scope semgrep S13 clause'
+                        $skippedRel.Add($rel)
+                    }
+                    foreach ($span in $spans) {
+                        if (-not $catchSeen.Add("$rel|$($span.Start)|$($span.Column)|$($span.End)")) { continue }
+                        $raw.Add([pscustomobject]@{ smell = $smellId; file = $rel; line = [int]$r.start.line; endLine = $span.End; scopeStart = $span.Start; text = $text; detector = "semgrep@$($tools['semgrep'])" })
+                    }
+                    continue
                 }
-                $raw.Add([pscustomobject]@{ smell = $smellId; file = $rel; line = [int]$r.start.line; endLine = $end; scopeStart = $scope; text = $text; detector = "semgrep@$($tools['semgrep'])" })
+                $raw.Add([pscustomobject]@{ smell = $smellId; file = $rel; line = [int]$r.start.line; endLine = $end; scopeStart = [int]$r.start.line; text = $text; detector = "semgrep@$($tools['semgrep'])" })
             }
         }
         $failureText = ($semgrepFailure | Select-Object -Unique) -join '; '
@@ -189,7 +259,10 @@ function Invoke-SmellDetectors {
                 if ($s.id -eq 'S13' -and $l -eq 'powershell') { continue } # Assessed by the PowerShell parser below.
                 if ($langs -contains $l) {
                     $gap = @($skippedRel | Where-Object { $script:LanguageByExtension[[IO.Path]::GetExtension($_).ToLowerInvariant()] -eq $l })
-                    if ($gap.Count) { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = "semgrep skipped $($gap.Count) $l path(s): $(($gap | Select-Object -First 3) -join ', ')" }) }
+                    if ($gap.Count) {
+                        $notes = @($gap | ForEach-Object { $fileFailure[$_] } | Where-Object { $_ } | Select-Object -Unique) -join '; '
+                        $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = "semgrep skipped $($gap.Count) $l path(s): $(($gap | Select-Object -First 3) -join ', ') $notes" })
+                    }
                     else { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = $l }) }
                 }
                 else { $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = "no rule for $l" }) }
