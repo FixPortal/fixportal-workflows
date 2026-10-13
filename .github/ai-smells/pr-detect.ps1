@@ -38,7 +38,10 @@ $files = @($added.Keys | Where-Object { -not (Test-PathExcluded $_ $Exclude) } |
 # not news; the same hit measured at the merge-base says so.
 $sizeSmells = @('S30', 'S41')
 
-function Get-HitKey($h) { "$($h.smell)|$($h.file)|$(([string]$h.text) -replace '\d+', '#')" }
+function Get-HitKey($h) {
+    $identity = ([string]$h.text) -replace '^function spans \d+ lines:', 'function spans # lines:' -replace '^file is \d+ lines$', 'file is # lines' -replace '^\d+% of \d+ non-blank lines', '#% of # non-blank lines'
+    return "$($h.smell)|$($h.file)|$identity"
+}
 
 $hits = @(); $coverage = @()
 if ($files.Count) {
@@ -90,6 +93,7 @@ if ($files.Count) {
                 file     = $_.file
                 line     = [int]$_.line
                 lineText = if ($_.line -ge 1 -and $_.line -le $lines.Count) { $lines[$_.line - 1].Trim() } else { '' }
+                context  = Get-HitContext $lines ([int]$_.line)
                 text     = $_.text
             }
         })

@@ -89,12 +89,13 @@ function Get-HitSpan {
     return @{ Start = $start; End = $end }
 }
 
-function Get-DeletionPoint([hashtable] $Deleted, [string] $File, [int] $Start, [int] $End) {
+function Get-DeletionPoint([hashtable] $Deleted, [string] $File, [int] $Start, [int] $End, [switch] $WholeFile) {
     # A pure-deletion hunk `+N,0` removed lines between N and N+1; it lies inside a span when
     # Start <= N < End. $null when there is none.
     if (-not $Deleted -or -not $Deleted.ContainsKey($File)) { return $null }
+    if ($WholeFile) { $Start = 0; $End++ }
     $inside = @($Deleted[$File] | Where-Object { $_ -ge $Start -and $_ -lt $End } | Sort-Object)
-    if ($inside.Count) { return [int]$inside[0] }
+    if ($inside.Count) { return [Math]::Max(1, [int]$inside[0]) } # A leading deletion has no preceding line; anchor on the first survivor.
     return $null
 }
 
@@ -108,7 +109,7 @@ function Test-HitOnAddedLines {
     $span = Get-HitSpan $Hit
     if (Test-RangeAdded $Added $Hit.file $span.Start ($span.End - $span.Start + 1)) { return $true }
     # An empty catch made by DELETING the body adds no line anywhere: the PR still authored it.
-    return $Hit.smell -eq 'S13' -and ($null -ne (Get-DeletionPoint $Deleted $Hit.file $span.Start $span.End))
+    return $Hit.smell -in 'S13', 'S41' -and ($null -ne (Get-DeletionPoint $Deleted $Hit.file $span.Start $span.End -WholeFile:($Hit.smell -eq 'S41')))
 }
 
 function Get-AnchoredHit {
@@ -120,7 +121,7 @@ function Get-AnchoredHit {
     if ($Hit.smell -ne 'S14' -or [string]$Hit.text -notmatch '^duplicates (.+):(\d+) \((\d+) lines\)$') {
         $span = Get-HitSpan $Hit
         $first = Get-FirstAddedLine $Added $Hit.file $span.Start ($span.End - $span.Start + 1)
-        if ($null -eq $first -and $Hit.smell -eq 'S13') { $first = Get-DeletionPoint $Deleted $Hit.file $span.Start $span.End }
+        if ($null -eq $first -and $Hit.smell -in 'S13', 'S41') { $first = Get-DeletionPoint $Deleted $Hit.file $span.Start $span.End -WholeFile:($Hit.smell -eq 'S41') }
         if ($null -eq $first -or $first -eq [int]$Hit.line) { return $Hit }
         $moved = $Hit.PSObject.Copy()
         $moved.line = $first
@@ -142,15 +143,22 @@ function Get-AnchoredHit {
     return $swapped
 }
 
+function Get-HitContext([string[]] $Lines, [int] $Line) {
+    $anchor = $Lines[$Line - 1].Trim()
+    for ($i = $Line - 2; $i -ge 0; $i--) {
+        $candidate = $Lines[$i].Trim()
+        if ($candidate -and $candidate -ne $anchor -and $candidate -notmatch '^[{};]+$') { return $candidate }
+    }
+    return ''
+}
+
 function Get-SmellMarker {
-    # Keyed on file + anchor text + the hit's ORDINAL among identical anchors in the file
-    # (never a line number: a moved hit keeps its marker). Two hits with the same anchor text
-    # must not share a marker, or the second is silently dropped from Post and Overflow.
-    # Ordinal 0 hashes exactly as the single-occurrence form, so posted threads keep matching.
+    # Context distinguishes identical anchors without shifting when a different occurrence is inserted above.
     [CmdletBinding()]
     param([Parameter(Mandatory)] $Hit)
     $occurrence = if ($Hit.occurrence) { [int]$Hit.occurrence } else { 0 }
     $key = "$($Hit.file)`n$(([string]$Hit.lineText).Trim())"
+    if ($Hit.context) { $key += "`n$($Hit.context)" }
     if ($occurrence -gt 0) { $key += "`n#$occurrence" }
     $bytes = [Text.Encoding]::UTF8.GetBytes($key)
     $hash = [Convert]::ToHexString([Security.Cryptography.SHA1]::HashData($bytes)).ToLowerInvariant()
@@ -158,13 +166,13 @@ function Get-SmellMarker {
 }
 
 function Add-HitOccurrence {
-    # Numbers hits that share smell + file + anchor text, in the order given (detect sorts by
-    # smell, file, line, so the ordinal follows the file top to bottom).
+    # shortcut: identical anchors with identical context still use position; use syntax identity if these recur.
     [CmdletBinding()]
     param([object[]] $Hits)
     $count = @{}
     foreach ($h in @($Hits)) {
         $key = "$($h.smell)`n$($h.file)`n$(([string]$h.lineText).Trim())"
+        if ($h.context) { $key += "`n$($h.context)" }
         $n = if ($count.ContainsKey($key)) { $count[$key] } else { 0 }
         $count[$key] = $n + 1
         $copy = $h.PSObject.Copy()

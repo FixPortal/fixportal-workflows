@@ -5,7 +5,8 @@ headings, bullets and `---` rules as comments."""
 import argparse, json, pathlib, re
 
 COMMENT = re.compile(r"^\s*(//|#(?!include|region|endregion|if|else|endif|pragma)|/\*|\*|<!--|--)")
-SOURCE = (".cs", ".ts", ".tsx", ".js", ".jsx", ".py")
+SOURCE = (".cs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".ps1", ".psm1",
+          ".go", ".java", ".rs", ".rb", ".kt", ".swift", ".cpp", ".c")
 THRESHOLD, MIN_LINES = 0.45, 20
 
 def main():
