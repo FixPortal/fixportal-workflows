@@ -4,7 +4,12 @@ non-blank lines, with at least 20 non-blank lines, is a hit spanning the whole f
 headings, bullets and `---` rules as comments."""
 import argparse, json, pathlib, re
 
-COMMENT = re.compile(r"^\s*(//|#(?!include|region|endregion|if|else|endif|pragma)|/\*|\*|<!--|--)")
+DIRECTIVE = r"(?:include|region|endregion|ifdef|ifndef|if|else|elif|endif|pragma|define|undef|error|warning|line)\b"
+# '#' + directive or Rust attribute is code. C-family sources may put whitespace after the '#'; elsewhere
+# '# define the thing' is prose.
+COMMENT = re.compile(rf"^\s*(//|#(?!{DIRECTIVE}|\[|!\[)|/\*|\*|<!--|--)")
+C_COMMENT = re.compile(rf"^\s*(//|#(?![ \t]*{DIRECTIVE}|\[|!\[)|/\*|\*|<!--|--)")
+C_FAMILY = (".c", ".cpp", ".cs")
 SOURCE = (".cs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".ps1", ".psm1",
           ".go", ".java", ".rs", ".rb", ".kt", ".swift", ".cpp", ".c")
 THRESHOLD, MIN_LINES = 0.45, 20
@@ -31,7 +36,8 @@ def main():
         lines = [l for l in all_lines if l.strip()]
         if len(lines) < MIN_LINES:
             continue
-        ratio = sum(1 for l in lines if COMMENT.match(l)) / len(lines)
+        comment = C_COMMENT if rel.lower().endswith(C_FAMILY) else COMMENT
+        ratio = sum(1 for l in lines if comment.match(l)) / len(lines)
         if ratio > THRESHOLD:
             hits.append({"file": rel, "line": 1, "endLine": len(all_lines), "text": f"{ratio:.0%} of {len(lines)} non-blank lines are comments"})
     status, reason = ("not assessed", "could not read " + ", ".join(unread)) if unread else ("assessed", "")
