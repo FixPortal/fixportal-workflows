@@ -127,11 +127,18 @@ function Get-ScanFiles {
     $listed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $ok = $true
     foreach ($b in $batches) {
-        $spec = @(@($b) + $exclude | Where-Object { $_ })
+        # Includes are literal: a name that starts with ':' would otherwise parse as pathspec magic.
+        $spec = @(@(@($b) | Where-Object { $_ } | ForEach-Object { ":(literal)$_" }) + $exclude)
         $gitArgs = @('-C', $TreePath, 'ls-files', '-z')
         if ($spec) { $gitArgs += @('--') + $spec }
-        $raw = & git @gitArgs 2>$null
-        if ($LASTEXITCODE -ne 0) { $ok = $false; break }
+        $consoleEncoding = [Console]::OutputEncoding
+        try {
+            [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+            $raw = & git @gitArgs 2>$null
+            $lsExit = $LASTEXITCODE
+        }
+        finally { [Console]::OutputEncoding = $consoleEncoding }
+        if ($lsExit -ne 0) { $ok = $false; break }
         foreach ($f in (($raw -join '') -split "`0")) { if ($f) { [void]$listed.Add($f) } }
     }
     if ($ok) {

@@ -18,8 +18,15 @@ function Get-DiffLineInfo {
     # two-dot diff from it would count the base's own new lines as the PR's.
     $mergeBase = (& git -C $RepoPath merge-base $Base $Head).Trim()
     if ($LASTEXITCODE -ne 0) { throw "git merge-base $Base $Head failed" }
-    $diff = & git -C $RepoPath -c core.quotepath=false diff -U0 -M --diff-filter=AMR --no-color $mergeBase $Head
-    if ($LASTEXITCODE -ne 0) { throw "git diff $mergeBase $Head failed" }
+    # Native output is decoded with [Console]::OutputEncoding; a legacy code page garbles a non-ASCII path.
+    $consoleEncoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+        $diff = & git -C $RepoPath -c core.quotepath=false diff -U0 -M --diff-filter=AMR --no-color $mergeBase $Head
+        $diffExit = $LASTEXITCODE
+    }
+    finally { [Console]::OutputEncoding = $consoleEncoding }
+    if ($diffExit -ne 0) { throw "git diff $mergeBase $Head failed" }
     $added = @{}; $deleted = @{}; $renames = @{}
     $current = $null; $renameFrom = $null
     # Hunk bodies are skipped by their @@ line counts. Matching `+++ b/` anywhere switched the

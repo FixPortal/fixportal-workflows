@@ -276,6 +276,26 @@ def is_pinned(ref):
     return len(revision) == SHA_LEN and all(char in "0123456789abcdef" for char in revision)
 
 
+def is_digest_ref(ref):
+    """True for a non-`docker://` ref pinned with `@sha256:`. That is a container-image
+    pin; a `uses:` action or reusable workflow resolves a git ref, which cannot contain
+    `:`, so such a ref names no revision and must not count as pinned."""
+    return "@" in ref and not ref.lower().startswith("docker://") and ref.rsplit("@", 1)[1].lower().startswith("sha256:")
+
+
+def digest_pinned_uses(document):
+    """Step and job `uses:` refs of a workflow that are `@sha256:` digest refs. Container
+    and service images are not `uses:` values, so they never appear here."""
+    refs = []
+    jobs = document.get("jobs")
+    for job in (jobs.values() if isinstance(jobs, dict) else []):
+        if not isinstance(job, dict):
+            continue
+        candidates = [job.get("uses")] + [step.get("uses") for step in (job.get("steps") or []) if isinstance(step, dict)]
+        refs += [ref for ref in candidates if isinstance(ref, str) and is_digest_ref(ref)]
+    return refs
+
+
 def is_reusable_workflow_ref(ref):
     """True when a local `./` ref calls a reusable workflow rather than an action.
 
@@ -554,6 +574,14 @@ def check_ref(job, ref, origin, unpinned):
     return True, unpinned
 
 
+def print_digest_error(job, ref, origin):
+    print(
+        f"::error file={origin}::Action or reusable workflow '{ref}' ({job}) is pinned "
+        "with an @sha256: digest. That pins a container image; a `uses:` ref must name a "
+        "40-hex commit SHA (or a vN tag for actions/*)."
+    )
+
+
 def check_local_action(job, ref, origin, unpinned, visited):
     """Pin-check one local action's own refs -- a composite's `uses:` steps, a
     docker action's registry image -- and recursively the local composites IT calls.
@@ -612,6 +640,9 @@ def check_local_action(job, ref, origin, unpinned, visited):
     for inner_ref in local_action_refs(inner, manifest.parent):
         bad, unpinned = check_ref(f"{job} -> {ref}", inner_ref, manifest, unpinned)
         failed = failed or bad
+        if inner_ref in composite_step_refs(inner) and is_digest_ref(inner_ref):
+            print_digest_error(f"{job} -> {ref}", inner_ref, manifest)
+            failed = True
         if not inner_ref.startswith("./") or is_reusable_workflow_ref(inner_ref):
             continue
         bad, unpinned = check_local_action(
@@ -712,6 +743,10 @@ def main():
                     "privilege. Declare the specific permissions each job needs."
                 )
                 failed = True
+
+        for ref in digest_pinned_uses(document):
+            print_digest_error("uses", ref, path)
+            failed = True
 
         for job, ref in action_refs(document):
             bad, first_party_tag = check_ref(job, ref, path, first_party_tag)

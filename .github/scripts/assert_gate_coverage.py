@@ -1791,7 +1791,7 @@ GATE_SCRIPT = re.compile(
     # widens DETECTION only -- more scripts required HIGH, never fewer. The trailing
     # `\b` is what keeps `.jsx` out: `js` followed by a word character never matches.
     r"""(?<![\w.-])(?:\.[\\/])?[\\/]?((?:[\w.-]+[\\/])*(?:\.github[\\/]scripts|scripts|build|tools)[\\/]"""
-    r"""[\w.\\/-]*\.(?:[Pp][Ss]1|[Pp][Yy]|[Ss][Hh]|[Mm][Jj][Ss]|[Jj][Ss]))\b"""
+    r"""[\w.\\/-]*\.(?:[Pp][Ss][Mm]1|[Pp][Ss]1|[Pp][Yy]|[Ss][Hh]|[Bb][Aa][Ss][Hh]|[Mm][Jj][Ss]|[Cc][Jj][Ss]|[Jj][Ss]|[Tt][Ss]))\b"""
 )
 # A `run:` key at any depth. Group 1 is everything before the key, so its LENGTH is the
 # key's own column -- which is what continuation_lines needs to find a block scalar's
