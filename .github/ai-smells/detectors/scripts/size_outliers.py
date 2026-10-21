@@ -10,8 +10,20 @@ FILE_MAX, FUNC_MAX = 800, 120
 # The lookahead rejects type declarations: `class Svc(IDep d) {` and `record R(int A) {`
 # have a parameter list and a brace but are not functions, and measuring one as a function
 # made the scan skip every method nested inside it.
-SIGNATURE = re.compile(r"^\s*(public|private|protected|internal|static|async|export|function|def)\b(?![^(]*\b(?:class|record|struct|interface|enum)\s+\w+)[^;=]*\([^;]*\)\s*(\{|=>|:)?\s*$")
-OPENER = re.compile(r"^\s*(public|private|protected|internal|static|async|export|function|def)\b(?![^(]*\b(?:class|record|struct|interface|enum)\s+\w+)[^;=]*\(")
+# After the parameter list: an optional `: ReturnType` (TS/Python), then `{`, `=>` or nothing.
+# An optional `key: ` prefix admits `default: function Inner(`.
+SIGNATURE = re.compile(r"^\s*(?:[\w$]+\s*:\s*)?(public|private|protected|internal|static|async|export|function|def)\b(?![^(]*\b(?:class|record|struct|interface|enum)\s+\w+)[^;=]*\([^;]*\)\s*(?::[^;]*?)?\s*(\{|=>)?\s*$")
+OPENER = re.compile(r"^\s*(?:[\w$]+\s*:\s*)?(public|private|protected|internal|static|async|export|function|def)\b(?![^(]*\b(?:class|record|struct|interface|enum)\s+\w+)[^;=]*\(")
+# TS/JS arrow bindings: `const f = (a): T => {`, `const f = useCallback((a) => {`, `const L = lazy(() =>`.
+# shortcut: `const f = a => {` is read only when the parameter is bare; a type annotation
+# on the binding that itself contains `=` (a function type) is not read. Upgrade to a parser.
+CONST_OPENER = re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:const|let|var)\s+[\w$]+\s*(?::[^=]+)?=\s*(?:async\s+)?(?:[\w$.]+\s*\(\s*)?(?:async\s+)?(?:\(|(?=[\w$]+\s*=>))")
+CONST_SIGNATURE = re.compile(CONST_OPENER.pattern + r".*=>\s*\{?\s*$")
+ARROW_END = re.compile(r"=>\s*\{?\s*$")
+# Strings, char literals, template literals and comments, blanked before braces are counted.
+# shortcut: a regex literal holding a quote or `//` can desynchronise this; upgrade to a tokenizer.
+LITERAL = re.compile(r'//[^\n]*|/\*.*?\*/|@"(?:""|[^"])*"|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|`(?:\\.|[^`\\])*`', re.S)
+KEEP = re.compile(r"[^\r\n\x0b\x0c\x1c-\x1e\x85  ]")
 WRAP_LIMIT = 30  # a parameter list longer than this many lines is not a signature
 SOURCE = (".cs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py")
 UNSUPPORTED = (".ps1", ".psm1", ".go", ".java", ".rs", ".rb", ".kt", ".swift", ".cpp", ".c")
@@ -31,16 +43,32 @@ def python_hits(rel, source):
                 hits.append({"file": rel, "line": node.lineno, "endLine": node.end_lineno, "text": f"function spans {span} lines: {signature}"})
     return hits
 
+def blank_literals(source):
+    return LITERAL.sub(lambda m: KEEP.sub(" ", m.group()), source)
+
 def signature_end(lines, i):
     """Index of the last line of the signature that starts at lines[i], or None. A parameter
     list wrapped over several lines is joined up to its closing ')' before matching."""
-    if not OPENER.match(lines[i]):
+    if not (OPENER.match(lines[i]) or CONST_OPENER.match(lines[i])):
         return None
     joined, k = lines[i], i
-    while joined.count("(") > joined.count(")") and k + 1 < len(lines) and k - i < WRAP_LIMIT:
+    while joined.count("(") > joined.count(")") and not ARROW_END.search(joined) and k + 1 < len(lines) and k - i < WRAP_LIMIT:
         k += 1
         joined += " " + lines[k].strip()
-    return k if SIGNATURE.match(joined) else None
+    return k if (SIGNATURE.match(joined) or CONST_SIGNATURE.match(joined)) else None
+
+def block_end(code, i, head):
+    """Index of the line that closes the block opened by the signature at code[i..head], or
+    None. A `=>` signature with no `{` (`lazy(() =>`) is closed by its parentheses instead."""
+    signature = " ".join(code[i:head + 1])
+    open_c, close_c = ("(", ")") if signature.rstrip().endswith("=>") else ("{", "}")
+    depth, opened = 0, False
+    for j in range(i, len(code)):
+        depth += code[j].count(open_c) - code[j].count(close_c)
+        opened = opened or open_c in code[j]
+        if opened and depth <= 0:
+            return j
+    return None
 
 def main():
     ap = argparse.ArgumentParser()
@@ -69,18 +97,13 @@ def main():
         if rel.lower().endswith(".py"):
             hits += python_hits(rel, source)
             continue
+        code = blank_literals(source).splitlines()
         i = 0
         while i < len(lines):
-            head = signature_end(lines, i)
+            head = signature_end(code, i)
             if head is not None:
-                depth, j, opened = 0, i, False
-                while j < len(lines):
-                    depth += lines[j].count("{") - lines[j].count("}")
-                    opened = opened or "{" in lines[j]
-                    if opened and depth <= 0:
-                        break
-                    j += 1
-                if opened and j - i + 1 > FUNC_MAX:
+                j = block_end(code, i, head)
+                if j is not None and j - i + 1 > FUNC_MAX:
                     signature = " ".join(line.strip() for line in lines[i:head + 1])
                     hits.append({"file": rel, "line": i + 1, "endLine": j + 1, "text": f"function spans {j - i + 1} lines: {signature}"})
                     i = j

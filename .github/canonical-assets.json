@@ -2,16 +2,16 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "c2e36a28da976907c5b193a82d4939ffd054ae4a",
-    "syncedAt": "2026-10-16"
+    "commit": "39b1670411f25b531bca3e2e4cb7c468935af475",
+    "syncedAt": "2026-10-21"
   },
   "assets": [
     {
       "path": ".github/ai-smells/detect.ps1",
-      "sha256": "33052608079ebad9975348dd026cdb34839980f1bd0cff30bb06a8268aeb27b1",
+      "sha256": "15ee9ad925191d633e649e96cfae2edbd929bba8c9f3b96c9d03600f7ec58b67",
       "verbatim": true,
-      "commit": "c2e36a28da976907c5b193a82d4939ffd054ae4a",
-      "syncedAt": "2026-10-16"
+      "commit": "39b1670411f25b531bca3e2e4cb7c468935af475",
+      "syncedAt": "2026-10-21"
     },
     {
       "path": ".github/ai-smells/detectors/rules/S10.yml",
@@ -85,10 +85,10 @@
     },
     {
       "path": ".github/ai-smells/detectors/scripts/comment_density.py",
-      "sha256": "5f5d1673ee2d5f828c881ed68995fb2d102b214554e6110c40d4e996744b951f",
+      "sha256": "1ca4c01f27ab6526d1beb8aafb7a48c49298ba9e4fa9448fca2f00538249a535",
       "verbatim": true,
-      "commit": "8ea28c5b890669622695ca29ed9cde274c442b57",
-      "syncedAt": "2026-10-14"
+      "commit": "39b1670411f25b531bca3e2e4cb7c468935af475",
+      "syncedAt": "2026-10-21"
     },
     {
       "path": ".github/ai-smells/detectors/scripts/jscpd.json",
@@ -106,17 +106,17 @@
     },
     {
       "path": ".github/ai-smells/detectors/scripts/size_outliers.py",
-      "sha256": "31cf20c602666a06781382f7815f08df2bcd13b59aef1f99d0d9b7815b37f7de",
+      "sha256": "dbcfeddb6971509ee426c6d91d72b1c9ad8742caffe83003308c73c8b38938de",
       "verbatim": true,
-      "commit": "0590781ca8b0d41ab5051df45e56288493d021f9",
-      "syncedAt": "2026-10-13"
+      "commit": "39b1670411f25b531bca3e2e4cb7c468935af475",
+      "syncedAt": "2026-10-21"
     },
     {
       "path": ".github/ai-smells/post-smell-threads.ps1",
-      "sha256": "b8bfe1bc93a05a260472d05377b0b5382a6c10f1185e2b8655c6849c93bf10df",
+      "sha256": "d355f70a3e510cf25d856c6dd455e22ccf6c8ac93fc79b8f1d3b1d971665ba46",
       "verbatim": true,
-      "commit": "a2ddae4b9c194ac31e54f857dedcbe1b9614823e",
-      "syncedAt": "2026-10-12"
+      "commit": "39b1670411f25b531bca3e2e4cb7c468935af475",
+      "syncedAt": "2026-10-21"
     },
     {
       "path": ".github/ai-smells/pr-detect.ps1",
@@ -127,10 +127,10 @@
     },
     {
       "path": ".github/ai-smells/pr-scope.ps1",
-      "sha256": "7689f9da2899c2b0545f3cb29f05916c83c00bfc513a175fb70c94a628c4e987",
+      "sha256": "5222ca77dba6a5e388f89e0d271b3acd4f9a33d6a08106de9df1167f15d8643c",
       "verbatim": true,
-      "commit": "0590781ca8b0d41ab5051df45e56288493d021f9",
-      "syncedAt": "2026-10-13"
+      "commit": "39b1670411f25b531bca3e2e4cb7c468935af475",
+      "syncedAt": "2026-10-21"
     },
     {
       "path": ".github/ai-smells/smells.json",
@@ -148,17 +148,17 @@
     },
     {
       "path": ".github/scripts/assert_gate_coverage.py",
-      "sha256": "3c054a9afe787f6838c8076bfb3df615f2f856bc047a98ffd02f65521994d0bb",
+      "sha256": "192ca655c5126513965cbbfa97f50cfc0c84b055a2dbf886d77bc0b54caaa5ef",
       "verbatim": true,
-      "commit": "a2ddae4b9c194ac31e54f857dedcbe1b9614823e",
-      "syncedAt": "2026-10-12"
+      "commit": "39b1670411f25b531bca3e2e4cb7c468935af475",
+      "syncedAt": "2026-10-21"
     },
     {
       "path": ".github/scripts/assert_workflow_hygiene.py",
-      "sha256": "0739463ff00ef0e86221136c9061e80ab81f87aa0e5e18707da0f56c14a68ca1",
+      "sha256": "13fef6c40e16fa189d0b7f6fa2805da26dc3ba66f85b6ebd663a8eb868789d11",
       "verbatim": true,
-      "commit": "a2ddae4b9c194ac31e54f857dedcbe1b9614823e",
-      "syncedAt": "2026-10-12"
+      "commit": "39b1670411f25b531bca3e2e4cb7c468935af475",
+      "syncedAt": "2026-10-21"
     },
     {
       "path": ".github/workflows/ai-smells.yml",

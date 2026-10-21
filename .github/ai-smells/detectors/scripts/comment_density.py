@@ -7,12 +7,26 @@ import argparse, json, pathlib, re
 DIRECTIVE = r"(?:include|region|endregion|ifdef|ifndef|if|else|elif|endif|pragma|define|undef|error|warning|line)\b"
 # '#' + directive or Rust attribute is code. C-family sources may put whitespace after the '#'; elsewhere
 # '# define the thing' is prose.
-COMMENT = re.compile(rf"^\s*(//|#(?!{DIRECTIVE}|\[|!\[)|/\*|\*|<!--|--)")
-C_COMMENT = re.compile(rf"^\s*(//|#(?![ \t]*{DIRECTIVE}|\[|!\[)|/\*|\*|<!--|--)")
+# No SOURCE language comments with `--` or `<!--`, and a bare leading `*` is a comment only
+# inside an open /* block (see comment_count): otherwise `*args,` and `--depth;` read as prose.
+COMMENT = re.compile(rf"^\s*(//|#(?!{DIRECTIVE}|\[|!\[)|/\*)")
+C_COMMENT = re.compile(rf"^\s*(//|#(?![ \t]*{DIRECTIVE}|\[|!\[)|/\*)")
 C_FAMILY = (".c", ".cpp", ".cs")
 SOURCE = (".cs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".ps1", ".psm1",
           ".go", ".java", ".rs", ".rb", ".kt", ".swift", ".cpp", ".c")
 THRESHOLD, MIN_LINES = 0.45, 20
+
+def comment_count(lines, pattern):
+    count, in_block = 0, False
+    for line in lines:
+        if in_block:
+            count += 1
+            in_block = "*/" not in line
+        elif pattern.match(line):
+            count += 1
+            stripped = line.lstrip()
+            in_block = stripped.startswith("/*") and "*/" not in stripped
+    return count
 
 def main():
     ap = argparse.ArgumentParser()
@@ -37,7 +51,7 @@ def main():
         if len(lines) < MIN_LINES:
             continue
         comment = C_COMMENT if rel.lower().endswith(C_FAMILY) else COMMENT
-        ratio = sum(1 for l in lines if comment.match(l)) / len(lines)
+        ratio = comment_count(lines, comment) / len(lines)
         if ratio > THRESHOLD:
             hits.append({"file": rel, "line": 1, "endLine": len(all_lines), "text": f"{ratio:.0%} of {len(lines)} non-blank lines are comments"})
     status, reason = ("not assessed", "could not read " + ", ".join(unread)) if unread else ("assessed", "")
