@@ -2,8 +2,8 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "39b1670411f25b531bca3e2e4cb7c468935af475",
-    "syncedAt": "2026-10-21"
+    "commit": "e3f3dfa4ee07c41cf12a5c16b11d136da93e4cf7",
+    "syncedAt": "2026-10-26"
   },
   "assets": [
     {
@@ -148,10 +148,10 @@
     },
     {
       "path": ".github/scripts/assert_gate_coverage.py",
-      "sha256": "192ca655c5126513965cbbfa97f50cfc0c84b055a2dbf886d77bc0b54caaa5ef",
+      "sha256": "f1ebb1071eb01b2e88d22d053e037461912a8401c6f6ca0952d24395088b872b",
       "verbatim": true,
-      "commit": "39b1670411f25b531bca3e2e4cb7c468935af475",
-      "syncedAt": "2026-10-21"
+      "commit": "e3f3dfa4ee07c41cf12a5c16b11d136da93e4cf7",
+      "syncedAt": "2026-10-26"
     },
     {
       "path": ".github/scripts/assert_workflow_hygiene.py",
