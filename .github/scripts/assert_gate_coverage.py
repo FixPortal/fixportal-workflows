@@ -853,7 +853,7 @@ def strip_outer_parentheses(expression):
 
 
 _UNKNOWN = object()
-_LITERAL = r"(?:true|false|null|-?[0-9]+(?:\.[0-9]+)?|'(?:''|[^'])*'|\"(?:\\.|[^\"])*\")"
+_LITERAL = r"(?:true|false|null|-?[0-9]+(?:\.[0-9]+)?|'(?:''|[^'])*'|\"(?:\\.|[^\"\\])*\")"
 
 
 def literal_value(value):
