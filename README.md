@@ -36,6 +36,8 @@ tier; the guard fails the run instead. Do not remove it without putting
 
 ## Contributing
 
+Documentation index: [docs/README.md](docs/README.md).
+
 See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: workflows here are a
 public interface, so never change an input name or default without a plan for
 consumers, validate with actionlint before pushing, and PRs merge via rebase.
