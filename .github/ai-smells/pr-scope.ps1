@@ -5,6 +5,16 @@
 #>
 $ErrorActionPreference = 'Stop'
 
+function Format-SafeLogText {
+    # A coverage reason can carry text from the PR (a file name). The Actions runner reads a log line
+    # that starts with :: or ##[ as a workflow command, and a name with a line break can start one.
+    # Control characters become spaces, so the text stays on its own line, and the command markers are
+    # broken so they cannot parse wherever they land.
+    [CmdletBinding()]
+    param([AllowNull()] [AllowEmptyString()] [string] $Text)
+    return (($Text -replace '[\x00-\x1f\x7f]+', ' ') -replace '::', ': :') -replace '##\[', '## ['
+}
+
 function Get-DiffLineInfo {
     # One merge-base diff yields three things the PR filter needs:
     #   Added    file -> set of added new-file line numbers

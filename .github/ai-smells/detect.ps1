@@ -432,6 +432,34 @@ function Invoke-SmellDetectors {
         # remain globs. Preserve exact casing for Linux generated-file exclusions.
         $generatedIgnore = @($generated | ForEach-Object { [regex]::Replace($_, '([*?\[\]{}()!+@|])', '\$1') })
         $ignore = @(@($ignoreDirs | ForEach-Object { "**/$_/**" }) + @($script:ExcludeGlobs | ForEach-Object { "**/$_" }) + @($script:GeneratedGlobs | ForEach-Object { "**/$_" }) + $generatedIgnore + @('**/docs/sources/**', '**/.claude/worktrees/**') + @($JscpdExclude | Where-Object { $_ } | ForEach-Object { $_.TrimStart('/') -replace '^\./', '' }))
+        # jscpd walks the filesystem, not git. Untracked and ignored paths (scratch folders, evidence
+        # dumps, build output no ExcludeDirs entry names) would be tokenised too: a working tree with
+        # ~120k such source files held jscpd for over ten minutes before it aborted. Ask git which
+        # paths it does not track and ignore them. --directory collapses a wholly untracked folder to
+        # one entry. Outside a git tree, or if git cannot say, nothing is added and the scan is as before.
+        $untrackedIgnore = @()
+        if (Test-Path -LiteralPath (Join-Path $TreePath '.git')) {
+            $untrackedListed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $untrackedOk = $true
+            foreach ($lsArgs in @(@('--others', '--exclude-standard'), @('--others', '--ignored', '--exclude-standard'))) {
+                $consoleEncoding = [Console]::OutputEncoding
+                try {
+                    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+                    $rawUntracked = & git -C $TreePath ls-files -z --directory @lsArgs 2>$null
+                    $untrackedExit = $LASTEXITCODE
+                }
+                finally { [Console]::OutputEncoding = $consoleEncoding }
+                if ($untrackedExit -ne 0) { $untrackedOk = $false; break }
+                foreach ($u in (($rawUntracked -join '') -split "`0")) { if ($u) { [void]$untrackedListed.Add($u) } }
+            }
+            if ($untrackedOk) {
+                $untrackedIgnore = @($untrackedListed | Sort-Object | ForEach-Object {
+                        $escaped = [regex]::Replace($_.TrimEnd('/'), '([*?\[\]{}()!+@|])', '\$1')
+                        if ($_.EndsWith('/')) { "$escaped/**" } else { $escaped }
+                    })
+            }
+        }
+        $ignore = @($ignore + $untrackedIgnore)
         # npm's Windows command shim cannot carry an estate-sized ignore list.
         $configPath = Join-Path $OutDir 'jscpd-options.json'
         [IO.File]::WriteAllText($configPath, (@{ ignore = $ignore } | ConvertTo-Json -Depth 3), [Text.UTF8Encoding]::new($false))
@@ -439,11 +467,13 @@ function Invoke-SmellDetectors {
         # Resolve the prefix executable before changing location; remaining file
         # arguments must already be absolute. --absolute keeps report names absolute.
         $jscpdFailure = ''
+        # Keep stderr: discarding it left a failed scan with an exit code and no cause.
+        $jscpdErrPath = Join-Path $OutDir ('jscpd-' + [guid]::NewGuid().ToString('N') + '.err')
         try {
             $jscpdExecutable = Get-Command $JscpdCommand[0] -ErrorAction Stop
             Push-Location -LiteralPath $TreePath
             try {
-                & $jscpdExecutable @($JscpdCommand | Select-Object -Skip 1) --config ($configPath.Replace('\', '/')) --silent --absolute --noSymlinks --reporters json --output ($report.Replace('\', '/')) --min-lines 8 --max-lines 10000 --max-size 1mb --format $formats '.' 2>$null | Out-Null
+                & $jscpdExecutable @($JscpdCommand | Select-Object -Skip 1) --config ($configPath.Replace('\', '/')) --silent --absolute --noSymlinks --reporters json --output ($report.Replace('\', '/')) --min-lines 8 --max-lines 10000 --max-size 1mb --format $formats '.' 2>$jscpdErrPath | Out-Null
                 $jscpdExit = $LASTEXITCODE
             }
             finally { Pop-Location }
@@ -453,7 +483,12 @@ function Invoke-SmellDetectors {
             $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = $jscpdFailure }); continue
         }
         if ($jscpdExit -ne 0) {
-            $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = "jscpd exited $jscpdExit" }); continue
+            $jscpdCause = ''
+            if (Test-Path -LiteralPath $jscpdErrPath) {
+                $firstErr = @(Get-Content -LiteralPath $jscpdErrPath -TotalCount 20 -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
+                if ($firstErr.Count) { $jscpdCause = ': ' + $firstErr[0].Trim().Substring(0, [Math]::Min(200, $firstErr[0].Trim().Length)) }
+            }
+            $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = "jscpd exited $jscpdExit$jscpdCause" }); continue
         }
         $jsonPath = Join-Path $report 'jscpd-report.json'
         if (-not (Test-Path -LiteralPath $jsonPath)) {
@@ -463,11 +498,24 @@ function Invoke-SmellDetectors {
             $normalizedClones = [Collections.Generic.List[object]]::new()
             $parsed = Get-Content -LiteralPath $jsonPath -Raw | ConvertFrom-Json -ErrorAction Stop
             if ($null -eq $parsed -or $parsed.duplicates -isnot [array]) { throw 'missing duplicates array' }
+            $repairedEnds = 0
             foreach ($d in $parsed.duplicates) {
                 if (-not $d.firstFile.name -or -not $d.secondFile.name -or
-                    [int]$d.firstFile.start -lt 1 -or [int]$d.secondFile.start -lt 1 -or [int]$d.lines -lt 1 -or
-                    ($null -ne $d.firstFile.end -and [int]$d.firstFile.end -lt [int]$d.firstFile.start) -or
-                    ($null -ne $d.secondFile.end -and [int]$d.secondFile.end -lt [int]$d.secondFile.start)) { throw 'invalid duplicate entry' }
+                    [int]$d.firstFile.start -lt 1 -or [int]$d.secondFile.start -lt 1 -or [int]$d.lines -lt 1) { throw 'invalid duplicate entry' }
+                # jscpd 4.x writes an end line before its own start (or zero) for some clones whose
+                # start and line count are sound: observed 13 of 109 clones on one small repository,
+                # in 4.0.5 and 4.3.0 alike. The end is advisory, so an unusable one is dropped and the
+                # span is taken from start and line count. Rejecting the report instead turned every
+                # such repository's whole S14 check into "not assessed".
+                foreach ($side in @($d.firstFile, $d.secondFile)) {
+                    if ($null -ne $side.end) {
+                        $parsedEnd = 0
+                        if (-not [int]::TryParse([string]$side.end, [ref]$parsedEnd) -or $parsedEnd -lt [int]$side.start) {
+                            $side.end = $null
+                            $repairedEnds++
+                        }
+                    }
+                }
                 # Invalid filename strings (including embedded NUL) must be a
                 # coverage gap too. Validate both paths before accepting any hits.
                 $first = Resolve-CloneReportPath $TreePath $d.firstFile.name
@@ -488,7 +536,8 @@ function Invoke-SmellDetectors {
             $firstEnd = if ($d.firstFile.end) { [int]$d.firstFile.end } else { [int]$d.firstFile.start + [int]$d.lines - 1 }
             $raw.Add([pscustomobject]@{ smell = $s.id; file = $first; line = [int]$d.firstFile.start; endLine = $firstEnd; scopeStart = [int]$d.firstFile.start; text ="duplicates ${second}:$($d.secondFile.start) ($($d.lines) lines)"; detector = "jscpd@$($tools['jscpd'])" })
         }
-        $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = '' })
+        $cloneNote = if ($repairedEnds) { "jscpd reported an unusable end line for $repairedEnds clone partner(s); end lines are advisory, so spans come from start and line count, and a second location is scoped by the first one's line count for every clone" } else { '' }
+        $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = $cloneNote })
     }
 
     # --- scripts ----------------------------------------------------------------------
