@@ -43,18 +43,21 @@ if ($pick.Overflow.Count) {
         $author = if ($env:GITHUB_ACTIONS) { 'github-actions[bot]' } else { '' }
     }
     $existingId = @()
+    $skipNotice = $false
     if ($author) {
         $existingId = @(gh api "repos/$Repo/issues/$Pr/comments" --paginate --jq ".[] | select(.user.login == `"$author`" and (.body | contains(`"$marker`"))) | .id")
-        if ($LASTEXITCODE -ne 0) { $existingId = @(); Write-Warning 'could not list PR comments; posting a new overflow notice' }
+        # A failed listing cannot tell "no notice yet" from "notice exists": posting would duplicate it.
+        if ($LASTEXITCODE -ne 0) { $existingId = @(); $skipNotice = $true; Write-Warning 'could not list PR comments; skipping the overflow notice rather than risk a duplicate' }
     }
     else { Write-Warning 'could not tell who posts here; posting a new overflow notice rather than editing a comment' }
-    if ($existingId.Count) {
+    if ($skipNotice) { }
+    elseif ($existingId.Count) {
         gh api -X PATCH "repos/$Repo/issues/comments/$($existingId[0])" -f body="$notice" | Out-Null
     }
     else {
         gh pr comment $Pr -R $Repo --body $notice | Out-Null
     }
-    if ($LASTEXITCODE -ne 0) { Write-Warning 'could not post the overflow comment' }
+    if (-not $skipNotice -and $LASTEXITCODE -ne 0) { Write-Warning 'could not post the overflow comment' }
 }
 
 $gaps = @($result.coverage | Where-Object status -eq 'not assessed')

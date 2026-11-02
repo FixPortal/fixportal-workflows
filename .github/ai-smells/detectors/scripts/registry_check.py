@@ -54,6 +54,22 @@ def is_private(eco, pkg, nuget, npm):
             best = (rank, private)
     return bool(best and best[1])
 
+NPM_NON_REGISTRY = re.compile(r"^(?:file|link|workspace|portal|git|git\+\w+|github|gitlab|bitbucket|https?):|^(?:\.{1,2}[/\\]|~/|/)|^[\w.-]+/[\w.-]+(?:#.*)?$")
+
+def npm_registry_name(key, spec):
+    """The registry package a package.json entry names, or None when its spec is not a registry one.
+    `npm:real@1` is an alias: the key is local, the aliased name is what the registry holds."""
+    if not isinstance(spec, str):
+        return key
+    spec = spec.strip()
+    if spec.startswith("npm:"):
+        alias = spec[4:]
+        return alias.rsplit("@", 1)[0] if "@" in alias[1:] else alias
+    return None if NPM_NON_REGISTRY.match(spec) else key
+
+def poetry_local(spec):
+    return isinstance(spec, dict) and any(k in spec for k in ("path", "git", "url"))
+
 def declared(root, rel):
     name = pathlib.PurePosixPath(rel).name.lower()
     if not (name.endswith(".csproj") or name in ("directory.packages.props", "packages.props", "package.json", "pyproject.toml") or re.match(r"requirements.*\.txt$", name)):
@@ -72,8 +88,11 @@ def declared(root, rel):
         data = json.loads(text)
         lines = text.splitlines()
         for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
-            for pkg in (data.get(section) or {}):
-                line = next((i for i, l in enumerate(lines, 1) if f'"{pkg}"' in l), 1)
+            for key, spec in (data.get(section) or {}).items():
+                pkg = npm_registry_name(key, spec)
+                if pkg is None:
+                    continue  # file:, link:, workspace:, git and URL specs name no registry package
+                line = next((i for i, l in enumerate(lines, 1) if f'"{key}"' in l), 1)
                 out.append(("npm", pkg, line))
     elif re.match(r"requirements.*\.txt$", name):
         for i, line in enumerate(text.splitlines(), 1):
@@ -100,13 +119,13 @@ def declared(root, rel):
                 line = next((i for i, l in enumerate(lines, 1) if pkg in l), 1)
                 out.append(("pypi", pkg, line))
         poetry_deps = data.get("tool", {}).get("poetry", {}).get("dependencies") or {}
-        for pkg in poetry_deps:
-            if pkg != "python":
+        for pkg, spec in poetry_deps.items():
+            if pkg != "python" and not poetry_local(spec):
                 line = next((i for i, l in enumerate(lines, 1) if pkg in l), 1)
                 out.append(("pypi", pkg, line))
         for group_deps in (data.get("tool", {}).get("poetry", {}).get("group") or {}).values():
-            for pkg in (group_deps.get("dependencies") or {}):
-                if pkg != "python":
+            for pkg, spec in (group_deps.get("dependencies") or {}).items():
+                if pkg != "python" and not poetry_local(spec):
                     line = next((i for i, l in enumerate(lines, 1) if pkg in l), 1)
                     out.append(("pypi", pkg, line))
     return out

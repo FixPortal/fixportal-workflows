@@ -118,17 +118,19 @@ function Get-ScanFiles {
     # Batched: pr-detect passes every file a PR touches, and ~1000 paths overflowed the
     # command line before git started. Exclude pathspecs go in every batch, or a batch
     # holding only includes would list the excluded files.
-    $excludeMagic = '^:(!|\^|\([^)]*\bexclude\b)'
+    # Short form takes '/', '!' and '^' in any order (':!x', ':/!x', ':^/x'): exclusion is a '!' or '^' anywhere in that prefix.
+    $excludeMagic = '^:(?:[/!^]*[!^]|\((?:[^)]*,)?exclude(?:,[^)]*)?\))'
     $exclude = @($Pathspec | Where-Object { $_ -match $excludeMagic })
     $include = @($Pathspec | Where-Object { $_ -and $_ -notmatch $excludeMagic })
     $budget = 24000 - (($exclude | ForEach-Object { $_.Length + 3 } | Measure-Object -Sum).Sum)
-    $batches = @(Split-ByLength $include $budget)
+    # Includes are literal: a name that starts with ':' would otherwise parse as pathspec magic.
+    # The prefix is added BEFORE batching so Split-ByLength budgets the length git actually receives.
+    $batches = @(Split-ByLength @($include | ForEach-Object { ":(literal)$_" }) $budget)
     if (-not $batches.Count) { $batches = @('') }
     $listed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $ok = $true
     foreach ($b in $batches) {
-        # Includes are literal: a name that starts with ':' would otherwise parse as pathspec magic.
-        $spec = @(@(@($b) | Where-Object { $_ } | ForEach-Object { ":(literal)$_" }) + $exclude)
+        $spec = @(@(@($b) | Where-Object { $_ }) + $exclude)
         $gitArgs = @('-C', $TreePath, 'ls-files', '-z')
         if ($spec) { $gitArgs += @('--') + $spec }
         $consoleEncoding = [Console]::OutputEncoding

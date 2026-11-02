@@ -33,13 +33,39 @@ Pure Python, invoked directly rather than through a shell wrapper: bash cannot s
 CRLF line endings, and a repo whose .gitattributes checks the file out with CRLF gets
 `set: pipefail: invalid option name` and a permanently red required check. Python does
 not care about CRLF, so the failure mode is designed out rather than patched per repo.
+
+YAML STRUCTURE IS READ THROUGH PyYAML, which assert_workflow_hygiene.py already requires
+on the same runners. The line regexes below still read shell bodies and the job/needs/if
+grammar, but which lines are TEXT and which are KEYS, and what `defaults:`, `env:` and
+`working-directory:` actually hold, come from the parser -- see compose_yaml.
 """
 import json
 import math
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    # `python -S` skips site-packages, and the test suites invoke this file that way for
+    # start-up speed. Pull the site directories in before giving up: without PyYAML the
+    # structural reads cannot run, and "cannot read" must exit non-zero, not vouch.
+    import site
+
+    site.main()
+    try:
+        import yaml
+    except ImportError:
+        print(
+            "python3 cannot import yaml. Provide PyYAML in the runner image or a pinned "
+            "isolated environment, and invoke this checker with that interpreter "
+            "(assert_workflow_hygiene.py has the same requirement).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 
 ID = r"[A-Za-z_][A-Za-z0-9_-]*"
@@ -94,7 +120,17 @@ _REDIR = r"(?:\s*[12]?>>?\s*(?:&[12]|[^\s;|&]+))*"
 # the same command as `echo "upstream failed" >&2`, and refusing the first form reddened a
 # gate whose body does fail. It cannot widen what the form VOUCHES for, because the failing
 # command itself is still required separately by _FAIL.
-_ECHO = rf"(?:{_REDIR}\s*)?(?:echo|printf)\s+[^\n|&;<>]*{_REDIR}"
+#
+# THE ARGUMENTS ARE PLAIN WORDS. `[^\n|&;<>]*` admitted `echo ([Environment]::Exit(0))`,
+# which under pwsh exits the step ZERO while the echo is still being evaluated, before the
+# failing command runs. Quoted strings never
+# reach these patterns -- mask_quoted has blanked them by then -- so a word simply excludes
+# every grouping, substitution and quoting character along with the separators the
+# surrounding forms read.
+# A braced NAME (`${x}`, `${#x}`) is admitted: it is a plain variable read under both
+# shells, while every expanding form (`${x:-...}`, `${x@P}`, `${env:x}`) stays refused.
+_WORD = r"(?:[^\s|&;<>()\[\]{}`'\"$]|\$(?!\{)|\$\{#?[A-Za-z_][A-Za-z0-9_]*\})+"
+_ECHO = rf"(?:{_REDIR}\s*)?(?:echo|printf)(?:\s+{_WORD})*{_REDIR}"
 _NONZERO_STATUS = r"0*(?:[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])"
 _FAIL_EXIT = rf"exit\s+{_NONZERO_STATUS}{_REDIR}\s*;?"
 _FAIL = rf"(?:exit\s+{_NONZERO_STATUS}|false){_REDIR}\s*;?"
@@ -152,10 +188,10 @@ ACCEPTED_FAILING_FORMS_NO_FALSE = tuple(
 _THROW = re.compile(r"throw(?:\s+[^|&;<>]*)?")
 # A MESSAGE line is the only thing a failing command may follow. It writes output
 # and cannot re-decide the step's exit status, so vouching for it as a prefix does
-# not vouch for a command that could make the step succeed. This is _ECHO with the
-# argument made optional: mask_quoted has already blanked any quoted text by the
-# time it runs, so `echo "Upstream results: ..."` reaches it as a bare `echo`.
-_MESSAGE = re.compile(rf"(?:{_REDIR}\s*)?(?:echo|printf)(?:\s+[^\n|&;<>]*)?{_REDIR}")
+# not vouch for a command that could make the step succeed. It is _ECHO: mask_quoted
+# has already blanked any quoted text by the time it runs, so
+# `echo "Upstream results: ..."` reaches it as a bare `echo`.
+_MESSAGE = re.compile(_ECHO)
 # `set -euo pipefail` is the house prefix on run: blocks across this estate, and
 # refusing it was a false RED waiting for the first gate written in the house style --
 # the direction that gets a working control deleted to make CI green.
@@ -614,10 +650,10 @@ def tolerant_jobs(lines, jobs, job_indent):
 
 
 def job_block(lines, jobs, job_id):
-    """The lines of one job's body, from its key to the next job key."""
+    """The lines of one job's body, from its key to the next job key, as a Slice."""
     start = jobs[job_id]
     end = min((i for i in sorted(jobs.values()) if i > start), default=len(lines))
-    return [line.rstrip("\r\n") for line in lines[start + 1 : end]]
+    return slice_of(lines, start + 1, end, transform=lambda line: line.rstrip("\r\n"))
 
 
 def job_needs(lines, jobs, job_id, job_indent):
@@ -926,7 +962,14 @@ def static_truth(condition, _nested=False):
 
     expression = strip_outer_parentheses(expression)
     if expression.startswith("!"):
-        value = static_truth(expression[1:], True)
+        operand = expression[1:]
+        # `!` is UNARY and binds tighter than a comparison, so `!1 == 2` is `(!1) == 2`,
+        # not `!(1 == 2)`. Folding the latter credited coverage to a step that never runs
+        # The precedence is UNVERIFIED against
+        # the runner, so a negated comparison is left UNKNOWN rather than folded either way.
+        if any(len(split_top_level(operand, operator)) > 1 for operator in ("==", "!=", "<=", ">=", "<", ">")):
+            return _UNKNOWN
+        value = static_truth(operand, True)
         return not value if value is True or value is False else _UNKNOWN
     if expression.startswith(("'", '"')) and re.fullmatch(_LITERAL, expression):
         literal = literal_value(expression)
@@ -935,6 +978,11 @@ def static_truth(condition, _nested=False):
         return True
     if expression.lower() == "false":
         return False
+    # A bare number or null folds by GitHub truthiness: `0` and `null` are false, every
+    # other number true. Left UNKNOWN, `if: ${{ 0 }}` on a feeder step never met the
+    # always-skipped refusal.
+    if re.fullmatch(r"-?[0-9]+(?:\.[0-9]+)?|null", expression, re.IGNORECASE):
+        return bool(literal_value(expression.lower()))
     # `always()` is unconditionally true in GitHub Actions, so it is a literal boolean here
     # in every sense that matters. Leaving it UNKNOWN made failure_atoms keep it as a
     # residual conjunct in the common `always() && contains(needs.*.result, 'failure')`,
@@ -1214,7 +1262,7 @@ def mask_quoted(line, *, powershell=False):
     return "".join(out)
 
 
-def ends_non_zero(body, *, allow_throw=False, allow_false=True):
+def ends_non_zero(body, *, allow_throw=False, allow_false=True, powershell=False):
     """True when the gate body is a RECOGNISED failing form, as a WHOLE.
 
     Splitting a de-quoted, de-commented line on command separators and accepting
@@ -1249,7 +1297,9 @@ def ends_non_zero(body, *, allow_throw=False, allow_false=True):
     `false` is a builtin only under bash, and an unknown shell may be pwsh on
     Windows, where it resolves through PATH (see ACCEPTED_FAILING_FORMS_NO_FALSE).
     `exit` 1-255 is a builtin under both candidate shells and stays accepted
-    either way.
+    either way. `powershell` selects mask_quoted's quoting discipline, so a caller
+    that does not know the shell can require the body to read as the same form under
+    BOTH (see step_can_fail).
     """
     # A COMMAND SUBEXPRESSION CAN EXIT THE STEP BEFORE THE FAILING COMMAND RUNS. Under
     # `shell: pwsh`, `echo "$(exit 0)"` exits ZERO during expansion, and mask_quoted
@@ -1269,7 +1319,7 @@ def ends_non_zero(body, *, allow_throw=False, allow_false=True):
         return False
     if re.search(r"\bexit\s+[^\s\n;|&<>]*['\"]", body):
         return False
-    text = mask_quoted(body)
+    text = mask_quoted(body, powershell=powershell)
     # Drop comments AFTER masking, so a `#` inside a string is not treated as one.
     text = re.sub(r"(?m)(?<!\S)#[^\n]*", "", text)
     # Normalise whitespace per logical line and drop the empties.
@@ -1308,7 +1358,11 @@ def powershell_ends_non_zero(body, *, throw=True):
     1-255 is a builtin under both candidate shells and stays accepted either way.
     """
     string = r"(?:'(?:[^'\n]|'')*'|\"(?:[^`\"\n]|`.)*\")"
-    message = re.compile(rf"(?:Write-Host|Write-Output|Write-Information)(?:\s+{string})?", re.IGNORECASE)
+    # `echo` is pwsh's alias for Write-Output and the spelling the house one-liner uses,
+    # so refusing it reddened a `shell: pwsh` gate that does fail (tax portal review
+    # 20261101T004738Z, c02-C5). Admitted with a QUOTED argument or none, like the
+    # cmdlets: an expression argument stays refused.
+    message = re.compile(rf"(?:Write-Host|Write-Output|Write-Information|echo)(?:\s+{string})?", re.IGNORECASE)
     final = rf"throw(?:\s+{string})?|" if throw else ""
     failure = re.compile(rf"(?:{final}exit\s+{_NONZERO_STATUS})\s*", re.IGNORECASE)
     lines = [line.strip().rstrip(";").strip() for line in body.splitlines() if line.strip()]
@@ -1409,6 +1463,22 @@ def step_can_fail(block, span, key_indent, default_shell=None):
         # false RED.
         if value and not is_block_scalar_header(raw):
             body = [value]
+        elif not is_block_scalar_header(raw):
+            # An EMPTY header opens a PLAIN scalar on the following lines, not a literal
+            # block: YAML folds several lines with spaces, so `echo failed` / `exit 1` runs
+            # as the ONE command `echo failed exit 1` and exits ZERO. A single line is just
+            # the command written on the next line, so only more than one line is refused.
+            plain, _ = continuation_lines(block, i, key_indent)
+            plain = [strip_inline_comment(line).strip() for line in plain]
+            plain = [line for line in plain if line]
+            if not plain:
+                return False, "has an empty `run:` body"
+            if len(plain) > 1:
+                return False, (
+                    "has a plain multi-line `run:` body, which YAML folds into one command; "
+                    "write `run: |`"
+                )
+            body = [decode_yaml_scalar(plain[0])]
         else:
             body, _ = continuation_lines(block, i, key_indent)
         # A FOLDED body (`run: >`) joins its lines with spaces at run time, so the
@@ -1472,10 +1542,21 @@ def step_can_fail(block, span, key_indent, default_shell=None):
         # therefore admitted only once the allowlist above has resolved the shell
         # to a POSIX spelling -- explicit pwsh never reaches this line (it returns
         # from the probe arm), so `shell is not None` here means bash.
-        if ends_non_zero(
-            joined,
-            allow_throw=shell is not None and shell.startswith("pwsh"),
-            allow_false=shell is not None,
+        # With NO shell key the body must read as the same failing form under BOTH
+        # quoting disciplines. `echo "foo\`"` / `exit 1` / `#"` is a message then an exit
+        # under bash, but under pwsh the backtick escapes the quote and the string runs
+        # on to the `"` on the last line, swallowing `exit 1`: the step exits ZERO on a
+        # Windows runner while the bash reading vouched for it (adversarial review
+        # 20261031T213036Z, M1). Same both-disciplines rule changes_directory applies.
+        disciplines = (False,) if shell is not None else (False, True)
+        if all(
+            ends_non_zero(
+                joined,
+                allow_throw=shell is not None and shell.startswith("pwsh"),
+                allow_false=shell is not None,
+                powershell=powershell,
+            )
+            for powershell in disciplines
         ):
             return True, ""
         where = f" The effective shell `{shell}` came from `defaults.run.shell`." if shell_from_default else ""
@@ -1575,12 +1656,16 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
     if body_indent is None:
         sys.exit(f"{workflow_path}: '{gate_job}' has an empty body -- it asserts nothing.")
     # The effective `defaults.run.shell` for the gate job's steps: the job's own first,
-    # then the workflow's. The workflow-level slice is every top-level line outside the
-    # jobs mapping -- `defaults:` may sit after `jobs:`, and missing it there re-opens
-    # the X1 noexec-shell bypass one key lower in the file.
-    default_shell = default_run_shell(job_level_lines(block, body_indent))
-    if default_shell is None:
-        default_shell = default_run_shell(workflow_level_lines(lines))
+    # then the workflow's. Both are read from the parsed document, so a `defaults:` after
+    # `jobs:` is found (missing it re-opens the X1 noexec-shell bypass one key lower in
+    # the file) and one nested under matrix data or inside a block scalar is not.
+    try:
+        document, _, _ = parsed_document(lines, workflow_path)
+        default_shell = default_run_shell(job_node(document, gate_job))
+        if default_shell is None:
+            default_shell = default_run_shell(document)
+    except ValueError as error:
+        sys.exit(str(error) if str(error).startswith(str(workflow_path)) else f"{workflow_path}: {error}")
     job_if_value = key_pattern(body_indent, "if")
 
     condition = None
@@ -1615,7 +1700,7 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
     # line right beside the condition:
     #
     #     - name: Fail if any upstream job did not succeed
-    #       if: contains(needs.*.result, 'failure') || ...        <- the actual gate
+    #       if: always() && (contains(needs.*.result, 'failure') || ...)   <- the actual gate
     #       run: |
     #         echo "Upstream results: ${{ join(needs.*.result, ', ') }}"   <- matched too
     #
@@ -1659,11 +1744,12 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
         sys.exit(
             f"{workflow_path}: '{gate_job}' has no step whose `if:` references a "
             "reachable `needs.<job>.result` for an adverse outcome.\n"
-            "Use an explicit status override such as `always() && (...)`; implicit "
-            "or explicit success() can mask failure/cancellation. The gate otherwise "
-            "aggregates nothing and reports success unconditionally. A "
-            "`needs.*.result` appearing only in a `run:` body -- an echo of the upstream "
-            "results, say -- gates nothing."
+            "Use an explicit status override such as `always() && (...)`. A bare "
+            "`contains(needs.*.result, ...)` step condition does fail on a healthy gate job, "
+            "but it is refused by policy: without a status function it carries an implicit "
+            "success(), so a cancelled gate job, or one whose earlier step failed, skips the "
+            "step and the required check does not fail. A `needs.*.result` appearing only "
+            "in a `run:` body -- an echo of the upstream results, say -- gates nothing."
         )
 
     # EVERY declared dependency, not merely one of them. Accepting the first
@@ -2039,60 +2125,224 @@ def policy_root(workflow_path):
     return None
 
 
-def run_payload_indexes(lines):
-    """The line indexes consumed by block-scalar `run:` payloads in `lines`.
+class Slice(list):
+    """A contiguous run of a document's lines that remembers where it came from.
 
-    A `run: |` body is SHELL TEXT at workflow indentation, and a LOCAL_USES scan over
-    physical lines cannot tell it from syntax: an indented `uses: ./action` inside the
-    payload -- a heredoc writing an action manifest, say -- matched and read as a local
-    delegation. A missing target was silently ignored, but an EXISTING non-composite one
-    raised the ValueError in delegated_run_bodies and failed gate coverage over a line
-    the workflow never executes as a step. That is a false RED on a correct workflow --
-    the direction that gets a working control deleted to make CI green.
-
-    Block-scalar and plain multiline STEP payloads are indexed. A defaults.run mapping
-    remains YAML metadata. A single-line `run: foo` carries its command
-    on the `run:` line itself, which starts with the key and so cannot match LOCAL_USES.
-    The value test reads the COMMENT-STRIPPED value, exactly as the run-body loops in
-    delegated_run_bodies and gated_run_bodies do -- `run: | # build log` is a real
-    spelling, and BLOCK_SCALAR is anchored.
+    The line scanners work on slices -- a job's block, one step's lines -- but the YAML
+    parser can only read a WHOLE document: a job that is an alias (`repeated: *build`)
+    names an anchor defined in another job's block, and composing the slice alone fails
+    on the undefined alias. So a slice carries its document and its offset, and every
+    parsed answer about it is read off the document by absolute line. A plain list is its
+    own document at offset 0; a slice of a slice composes the offsets.
     """
-    payloads = set()
-    index = 0
-    while index < len(lines):
-        match = RUN_KEY.match(lines[index])
-        if not match or step_span(lines, index, len(match.group(1))) is None:
-            index += 1
+
+    def __init__(self, lines, document, offset):
+        super().__init__(lines)
+        self.document = document
+        self.offset = offset
+
+
+def slice_of(lines, start, end, transform=None):
+    document = getattr(lines, "document", lines)
+    offset = getattr(lines, "offset", 0)
+    body = lines[start:end]
+    if transform is not None:
+        body = [transform(line) for line in body]
+    return Slice(body, document, offset + start)
+
+
+MERGE_TAG = "tag:yaml.org,2002:merge"
+
+
+def compose_yaml(lines, name=None):
+    """(root node, text) for a whole file's lines, from PyYAML's composer.
+
+    STRUCTURE IS READ FROM A PARSER, NOT A LINE REGEX. Every structural scan in this file
+    used to recognise YAML by line shape, and every valid spelling the shape missed was a
+    hole: block-scalar text read as keys, a `defaults:` whose flow mapping sat on the next
+    line, an anchored or aliased `env:`, an escaped key (adversarial review
+    20261031T213036Z, T1/H3; simulator-frontend 20261101T004730Z, S1/S2). The composer
+    resolves aliases to the nodes they name and marks every node with the lines it
+    occupies, which is exactly what those scans need.
+
+    Raises ValueError on anything PyYAML cannot read. "Cannot parse" must never render as
+    "nothing to check"; every caller turns the error into a fail-closed exit.
+    """
+    text = "\n".join(line.rstrip("\r\n") for line in lines)
+    try:
+        return yaml.compose(text, Loader=yaml.SafeLoader), text
+    except yaml.YAMLError as error:
+        where = f"{name}: " if name else ""
+        raise ValueError(f"{where}cannot parse as YAML, so coverage cannot be verified: {error}") from None
+
+
+def iter_nodes(node, seen=None):
+    """Every node reachable from `node`, each once (an alias shares its anchor's node)."""
+    if seen is None:
+        seen = set()
+    if node is None or id(node) in seen:
+        return
+    seen.add(id(node))
+    yield node
+    if isinstance(node, yaml.MappingNode):
+        for key, value in node.value:
+            yield from iter_nodes(key, seen)
+            yield from iter_nodes(value, seen)
+    elif isinstance(node, yaml.SequenceNode):
+        for item in node.value:
+            yield from iter_nodes(item, seen)
+
+
+def mapping_entries(node):
+    """(key text, value node) pairs of a MappingNode; empty for anything else."""
+    if not isinstance(node, yaml.MappingNode):
+        return []
+    return [(key.value, value) for key, value in node.value if isinstance(key, yaml.ScalarNode)]
+
+
+def mapping_get(node, key):
+    for name, value in mapping_entries(node):
+        if name == key:
+            return value
+    return None
+
+
+def job_node(root, job_id):
+    """The parsed mapping of one job, or None."""
+    return mapping_get(mapping_get(root, "jobs"), job_id)
+
+
+def step_node_at(scope, line):
+    """The step (or other mapping) under `scope` whose `run:` key sits on absolute `line`."""
+    for node in iter_nodes(scope):
+        if not isinstance(node, yaml.MappingNode):
             continue
-        value = strip_inline_comment(match.group(2)).strip()
-        if not value or BLOCK_SCALAR.match(value):
-            _, following = continuation_lines(lines, index, len(match.group(1)))
-            payloads.update(range(index + 1, following))
-            index = following
-        else:
-            index += 1
+        for key, _ in node.value:
+            if isinstance(key, yaml.ScalarNode) and key.value == "run" and key.start_mark.line == line:
+                return node
+    return None
+
+
+def assert_readable_shapes(root, text, name=None):
+    """Refuse the YAML shapes the LINE scanners in this file do not model.
+
+    Each is valid YAML that a regex over lines reads wrongly, and wrongly in the fail-OPEN
+    direction: the construct hides a key, a step or a value from a scan that then reports
+    it covered.
+
+      * a merge key (`<<: *base`) splices in keys no scan sees;
+      * a double-quoted key with an escape (`"sh\\x65ll"`) is `shell` to GitHub and nothing
+        to key_pattern (tax portal review 20261101T004738Z, M13);
+      * a flow-style `steps:` or a flow-mapping step item carries `run:` text no RUN_KEY
+        line ever matches (adversarial review 20261031T213036Z, M5);
+      * a flow collection on the line AFTER its key reads as an empty value, so `needs:`
+        loses its list (XM1; simulator-frontend 20261101T004730Z, S2).
+
+    Anchors, aliases and tags are NOT refused: the composer resolves them, the parsed
+    reads below see through them, and the job-level forms are accepted by existing
+    fixtures. Raises ValueError, which every caller turns into a fail-closed exit.
+    """
+    where = f"{name}: " if name else ""
+    for node in iter_nodes(root):
+        if not isinstance(node, yaml.MappingNode):
+            continue
+        for key, value in node.value:
+            line = key.start_mark.line + 1
+            if key.tag == MERGE_TAG:
+                raise ValueError(f"{where}line {line}: YAML merge key `<<` is unsupported; spell the keys out")
+            raw_key = text[key.start_mark.index : key.end_mark.index]
+            if isinstance(key, yaml.ScalarNode) and key.style == '"' and "\\" in raw_key:
+                raise ValueError(f"{where}line {line}: escaped double-quoted key {raw_key} is unsupported; write the key plainly")
+            if isinstance(value, (yaml.MappingNode, yaml.SequenceNode)) and value.flow_style and value.start_mark.line > key.start_mark.line:
+                raise ValueError(f"{where}line {line}: a flow-style value for `{key.value}` must start on the key's own line")
+            if isinstance(key, yaml.ScalarNode) and key.value == "steps" and isinstance(value, yaml.SequenceNode):
+                if value.flow_style and value.value:
+                    raise ValueError(f"{where}line {line}: flow-style `steps:` is unsupported; write each step as a `- ` block item")
+                for item in value.value:
+                    if isinstance(item, yaml.MappingNode) and item.flow_style:
+                        raise ValueError(f"{where}line {item.start_mark.line + 1}: a flow-mapping step `{{...}}` is unsupported; write the step as a block mapping")
+
+
+def scalar_payload_indexes(root):
+    """The line indexes that hold TEXT rather than structure: the continuation lines of
+    every multi-line scalar and the inside of every multi-line flow collection."""
+    payloads = set()
+
+    def add(owner_line, node):
+        if not (isinstance(node, yaml.ScalarNode) or getattr(node, "flow_style", False)):
+            return
+        end = node.end_mark
+        last = end.line - 1 if end.column == 0 else end.line
+        payloads.update(range(owner_line + 1, last + 1))
+
+    for node in iter_nodes(root):
+        if isinstance(node, yaml.MappingNode):
+            for key, value in node.value:
+                add(key.start_mark.line, value)
+        elif isinstance(node, yaml.SequenceNode):
+            for item in node.value:
+                add(item.start_mark.line, item)
     return payloads
 
 
-# A `working-directory:` value, including the dash form a step's FIRST key takes
-# (`- working-directory: sub`). Without the optional dash that spelling was invisible, so
-# a gate script under `sub/` resolved against the repository root and went untiered --
-# fail-open on ordinary YAML.
-WORKDIR = re.compile(r"""^\s*(?:-\s+)?(?:'working-directory'|"working-directory"|working-directory)\s*:\s*(.*?)\s*$""")
+_PARSED = {}
+
+
+def parsed_document(lines, name=None):
+    """(root, text, payload indexes) of a whole file, parsed and shape-checked once."""
+    document = getattr(lines, "document", lines)
+    cached = _PARSED.get(id(document))
+    if cached is not None and cached[0] is document:
+        return cached[1:]
+    root, text = compose_yaml(document, name)
+    assert_readable_shapes(root, text, name)
+    payload = scalar_payload_indexes(root)
+    _PARSED[id(document)] = (document, root, text, payload)
+    return root, text, payload
+
+
+def run_payload_indexes(lines):
+    """The indexes of `lines` that are TEXT rather than structure.
+
+    Previously only block-scalar `run:` payloads were indexed, so a `defaults:`, `shell:`,
+    `BASH_ENV:` or `working-directory:` line inside ANY OTHER block scalar -- an `env:`
+    value, a `with:` input, a `run-name:` -- was read as a real key: fail-OPEN when it
+    spelled a shell the checker then trusted, false RED when it spelled a key the checker
+    refuses (adversarial review 20261031T213036Z, H3; tax portal 20261101T004738Z, M35).
+    The parser now decides what is text: the body of every multi-line scalar and the
+    inside of every multi-line flow collection, anywhere in the document. `lines` may be
+    a whole file or a Slice of one; the answer is relative to `lines`.
+    """
+    offset = getattr(lines, "offset", 0)
+    _, _, payload = parsed_document(lines)
+    return {index - offset for index in payload if offset <= index < offset + len(lines)}
+
+
 # The composite action's own directory, spelled the three ways a run body can reach it.
 ACTION_PATH = re.compile(r"\$\{\{\s*github\.action_path\s*\}\}|\$\{GITHUB_ACTION_PATH\}|\$GITHUB_ACTION_PATH\b")
-STEPS_KEY = re.compile(r"""^(?:'steps'|"steps"|steps)\s*:""")
 
 
-def working_directories(lines):
-    """Every working directory, resolving github.workspace and refusing unknown expressions.
+def working_directories(node, exclude=(), rewrite=None):
+    """Every working directory under the parsed `node`, resolving github.workspace and
+    refusing unknown expressions.
 
-    `run:` block-scalar payload lines are skipped via run_payload_indexes: a
-    `working-directory:` line inside a heredoc or embedded script is shell text, not a
-    YAML key, and reading it reddened a correct workflow over an expression it never
-    executes as a directory -- and an `!unsupported ...` entry exits HARD, so that read
-    was a false RED on the control this function feeds. Same distinction the LOCAL_USES
-    scans draw, for the same reason.
+    Read from the PARSED document rather than from `working-directory:` lines. The line
+    read missed the flow spelling `defaults: {run: {working-directory: sub}}` outright, so
+    a feeder's relative script path resolved from the root, failed to resolve, and was
+    dropped -- untiered (adversarial review 20261031T213036Z, M3) -- and it read a
+    `working-directory:` line inside an `env:` block scalar as a real key, reddening a
+    correct workflow over text it never executes (H3). The parser sees every spelling the
+    same way and never reads text as a key.
+
+    `exclude` names top-level keys of `node` whose subtree belongs to a different scope:
+    `jobs` when `node` is the workflow root, `steps` when it is a job. At those two scopes
+    only `defaults.run.working-directory` reaches a step, so only it is read: scanning
+    every other subtree read `on.workflow_call.inputs.working-directory` (an input
+    declaration), `strategy.matrix` keys and `with:` inputs as directories, and the input
+    mapping's not-a-string sentinel reddened a valid reusable workflow (CodeRabbit, PR
+    #425). `node` itself is scanned whole when `exclude` is empty. `rewrite` is applied
+    to each value before classification (a composite action rewrites its action-path
+    expression to its own directory).
 
     `${{ github.workspace }}` is honoured only at the START of the value -- the one
     position where it names the checkout root this checker resolves against. A
@@ -2104,58 +2354,57 @@ def working_directories(lines):
     that never climbs past the root (`sub/../other`) stays allowed.
     """
     found = set()
-    payloads = run_payload_indexes(lines)
-    index = 0
-    while index < len(lines):
-        if index in payloads:
-            index += 1
-            continue
-        line = lines[index]
-        match = WORKDIR.match(strip_comment(line))
-        if match:
-            value = match.group(1).strip()
-            indent = len(match.group(0)) - len(match.group(0).lstrip())
-            if BLOCK_SCALAR.match(value):
-                body, index = continuation_lines(lines, index, indent + (2 if line.lstrip().startswith("-") else 0))
-                value = " ".join(part.strip() for part in body)
-            else:
-                index += 1
-            value = value.strip().strip("'\"")
-            workspace_rooted = bool(re.match(r"\$\{\{\s*github\.workspace\s*\}\}", value, re.IGNORECASE))
-            if workspace_rooted:
-                value = re.sub(r"\$\{\{\s*github\.workspace\s*\}\}", "", value, count=1, flags=re.IGNORECASE)
-            if "${{" in value:
-                found.add(f"!unsupported working-directory expression: {value}")
-                continue
-            value = value.replace("\\", "/").strip()
-            if (value.startswith("/") and not workspace_rooted) or re.match(r"^[A-Za-z]:", value):
-                found.add(f"!unsupported absolute working-directory: {value}")
-                continue
-            value = value.strip("/")
-            # Every RELATIVE value gets the climb check, not only workspace-rooted
-            # ones: a plain `..` resolves against the workspace and escapes the
-            # checkout by the same lexical join, and the bare-candidate suspension
-            # in gate_script_paths would let the script that runs go unchecked.
-            depth = 0
-            for segment in value.split("/"):
-                if segment == "..":
-                    depth -= 1
-                elif segment and segment != ".":
-                    depth += 1
+    if node is None:
+        return found
+    if exclude:
+        run_defaults = mapping_get(mapping_get(node, "defaults"), "run")
+        roots = [run_defaults] if run_defaults is not None else []
+    else:
+        roots = [node]
+    for scope in roots:
+        for inner in iter_nodes(scope):
+            for name, value_node in mapping_entries(inner):
+                if name != "working-directory":
+                    continue
+                if not isinstance(value_node, yaml.ScalarNode):
+                    found.add("!unsupported working-directory value that is not a string")
+                    continue
+                value = " ".join(value_node.value.split())
+                if rewrite is not None:
+                    value = rewrite(value)
+                workspace_rooted = bool(re.match(r"\$\{\{\s*github\.workspace\s*\}\}", value, re.IGNORECASE))
+                if workspace_rooted:
+                    value = re.sub(r"\$\{\{\s*github\.workspace\s*\}\}", "", value, count=1, flags=re.IGNORECASE)
+                if "${{" in value:
+                    found.add(f"!unsupported working-directory expression: {value}")
+                    continue
+                value = value.replace("\\", "/").strip()
+                if (value.startswith("/") and not workspace_rooted) or re.match(r"^[A-Za-z]:", value):
+                    found.add(f"!unsupported absolute working-directory: {value}")
+                    continue
+                value = value.strip("/")
+                # Every RELATIVE value gets the climb check, not only workspace-rooted
+                # ones: a plain `..` resolves against the workspace and escapes the
+                # checkout by the same lexical join, and the bare-candidate suspension
+                # in gate_script_paths would let the script that runs go unchecked.
+                depth = 0
+                for segment in value.split("/"):
+                    if segment == "..":
+                        depth -= 1
+                    elif segment and segment != ".":
+                        depth += 1
+                    if depth < 0:
+                        break
                 if depth < 0:
-                    break
-            if depth < 0:
-                found.add(f"!unsupported working-directory climbing above the workspace root: {value}")
-                continue
-            if value:
-                found.add(value.rstrip("/"))
-            continue
-        index += 1
+                    found.add(f"!unsupported working-directory climbing above the workspace root: {value}")
+                    continue
+                if value:
+                    found.add(value.rstrip("/"))
     return found
 
 
 def step_lines(block, run_index, key_indent):
-    """The lines of the step whose `run:` key is at `run_index`.
+    """The lines of the step whose `run:` key is at `run_index`, as a Slice.
 
     Scoping to the step is what keeps a SIBLING step's working-directory out of this
     step's candidate paths: it never applies here, and an unrelated file that happened to
@@ -2167,232 +2416,48 @@ def step_lines(block, run_index, key_indent):
     if span is None:
         return block
     start, end = span
-    return block[start:end]
+    return slice_of(block, start, end)
 
 
-def job_level_lines(block, body_indent):
-    """A job's own lines OUTSIDE its `steps:` sequence -- where `defaults.run` lives.
+def step_directories(scope, block, run_index, rewrite=None):
+    """The working directories that apply to the `run:` at `block[run_index]`: the step's
+    own, read from the parsed step; or the whole `scope` when the key is not in a step."""
+    step = step_node_at(scope, getattr(block, "offset", 0) + run_index)
+    return working_directories(step if step is not None else scope, rewrite=rewrite)
 
-    The sequence may be indented under `steps:` or flush with it (`- run:` at the key's
-    own column), so a dash at exactly `body_indent` still belongs to the steps.
+
+def default_run_shell(node):
+    """The `defaults.run.shell` of the parsed mapping `node`, or None when unset.
+
+    Read from the PARSED document and only at the mapping's own top level: a `defaults:`
+    nested under `strategy.matrix.include` is matrix data, not the job default
+    (adversarial review 20261031T213036Z, XL2), and text shaped like one inside an `env:`
+    block scalar is a string (H3). The flow, block, anchored, aliased, next-line-flow and
+    quoted spellings all resolve the same way because the parser reads them, not a regex
+    (M4, XM1; simulator-frontend 20261101T004730Z, S2, S13). `run:` also appears as a
+    STEP key; the scoped descent is why a step's own `run:` is never read here
+    (adversarial review 20260929T030431Z, X1).
+
+    A `defaults:` or `run:` that is present but not a mapping, or a `shell:` that is not a
+    string, RAISES: "cannot resolve defaults.run.shell" must never read as "no default",
+    because the body would then be vouched under a shell the runner does not use.
     """
-    if body_indent is None:
-        return []
-    out = []
-    in_steps = False
-    for line in block:
-        if COMMENT_OR_BLANK.match(line):
-            continue
-        indent = len(line) - len(line.lstrip())
-        stripped = line.strip()
-        if indent <= body_indent:
-            if in_steps and indent == body_indent and stripped.startswith("- "):
-                continue
-            in_steps = indent == body_indent and bool(STEPS_KEY.match(stripped))
-            if in_steps:
-                continue
-        elif in_steps:
-            continue
-        out.append(line)
-    return out
-
-
-def workflow_level_lines(lines):
-    """Top-level lines OUTSIDE the `jobs:` mapping, before or after it.
-
-    YAML does not fix the order of top-level keys, and GitHub accepts a
-    `defaults:` block after `jobs:`. Slicing at the first job line drops such a
-    block, and a dropped workflow-level default is invisible to the shell and
-    working-directory lookups that depend on it -- the X1 noexec-shell bypass
-    moves one key lower in the file. The jobs mapping ends exactly where
-    read_gate_contract ends it: the first later line that is not blank, not a
-    comment, and not indented.
-    """
-    start = next(
-        (i for i, line in enumerate(lines) if JOBS_KEY.match(strip_comment(line).rstrip())),
-        len(lines),
-    )
-    end = next(
-        (
-            i
-            for i in range(start + 1, len(lines))
-            if lines[i].strip() and not lines[i].startswith((" ", "#"))
-        ),
-        len(lines),
-    )
-    return lines[:start] + lines[end:]
-
-
-def _flow_entry_raw(text, wanted):
-    """The RAW depth-1 value text for `wanted` in a `{...}` flow mapping, or None.
-
-    parse_flow_mapping drops a nested mapping's value (its callers need scalars
-    only); this walk keeps the raw span, braces included, so the caller can descend
-    into it. Quote- and depth-aware in exactly parse_flow_mapping's way: a quoted
-    span is data, and `#` opens a comment only outside quotes.
-    """
-    length = len(text)
-
-    def skip_gap(i):
-        while i < length:
-            if text[i] in " \t\r\n":
-                i += 1
-            elif text[i] == "#":
-                newline = text.find("\n", i)
-                i = length if newline == -1 else newline + 1
-            else:
-                break
-        return i
-
-    def read_quoted(i):
-        quote = text[i]
-        i += 1
-        while i < length:
-            char = text[i]
-            if quote == '"' and char == BACKSLASH and i + 1 < length:
-                i += 2
-                continue
-            if char == quote:
-                if quote == "'" and text[i + 1 : i + 2] == "'":
-                    i += 2
-                    continue
-                return i + 1
-            i += 1
-        return i
-
-    index = skip_gap(0)
-    if index >= length or text[index] != "{":
+    defaults = mapping_get(node, "defaults")
+    if defaults is None:
         return None
-    depth = 1
-    index += 1
-    while index < length and depth > 0:
-        index = skip_gap(index)
-        if index >= length:
-            break
-        char = text[index]
-        if char == "{":
-            depth += 1
-            index += 1
-            continue
-        if char == "}":
-            depth -= 1
-            index += 1
-            continue
-        if char == ",":
-            index += 1
-            continue
-        if depth != 1:
-            if char in "'\"":
-                index = read_quoted(index)
-            else:
-                index += 1
-            continue
-        if char in "'\"":
-            key_end = read_quoted(index)
-            key = text[index + 1 : key_end - 1]
-            index = key_end
-        else:
-            start = index
-            while index < length and text[index] not in ",{}: \t\r\n":
-                index += 1
-            key = text[start:index]
-        index = skip_gap(index)
-        if index >= length or text[index] != ":":
-            continue
-        index = skip_gap(index + 1)
-        start = index
-        if index < length and text[index] in "'\"":
-            index = read_quoted(index)
-        elif index < length and text[index] == "{":
-            nested = 0
-            while index < length:
-                char = text[index]
-                if char in "'\"":
-                    index = read_quoted(index)
-                    continue
-                if char == "{":
-                    nested += 1
-                elif char == "}":
-                    nested -= 1
-                    if nested == 0:
-                        index += 1
-                        break
-                index += 1
-        else:
-            while index < length and text[index] not in ",} \t\r\n":
-                index += 1
-        if key == wanted:
-            return text[start:index].strip()
-    return None
-
-
-def _block_entry(lines, index, base, wanted):
-    """(raw value, line index, line indent) of `wanted` among the block children of the
-    mapping whose key sits at indent `base` on `lines[index]`; (None, None, None)
-    when absent.
-
-    The first child fixes the mapping's indent; a `wanted:` at any deeper indent
-    belongs to a nested mapping and is not read -- which is what scopes a
-    `defaults:` -> `run:` -> `shell:` descent to that one path.
-    """
-    key = re.compile(rf"^(?:'{wanted}'|\"{wanted}\"|{wanted})\s*:\s*(.*)$")
-    child_indent = None
-    for follow in range(index + 1, len(lines)):
-        line = lines[follow]
-        if COMMENT_OR_BLANK.match(line):
-            continue
-        indent = len(line) - len(line.lstrip(" "))
-        if indent <= base:
-            break
-        if child_indent is None:
-            child_indent = indent
-        if indent != child_indent:
-            continue
-        match = key.match(line.strip())
-        if match:
-            return match.group(1), follow, indent
-    return None, None, None
-
-
-def _nested_entry(lines, index, indent, inline, wanted):
-    """(raw value, line index, line indent) of `wanted` one mapping level below the key
-    on `lines[index]` (itself at `indent`, with inline text `inline`) -- from its
-    block children, or from its flow mapping. (None, None, None) when the key's
-    value is not a mapping or has no such entry. A flow value is read with the rest
-    of the file as its continuation, as resolve_runs_using does for `runs:`."""
-    if inline.lstrip().startswith("{"):
-        return _flow_entry_raw("\n".join([inline] + list(lines[index + 1:])), wanted), index, indent
-    if strip_inline_comment(inline).strip():
-        return None, None, None
-    return _block_entry(lines, index, indent, wanted)
-
-
-def default_run_shell(lines):
-    """The `shell:` value nested under `defaults:` -> `run:` in `lines`, or None.
-
-    Scoped to that one path: a bare `shell:` anywhere else (an environment variable
-    named shell, say) is NOT the runner's default shell, and reading it as one
-    vouches for pwsh-only forms under a bash that never runs. Both spellings are
-    resolved: the ordinary block form, descended by indentation, and the flow form
-    (`defaults: {run: {shell: bash}}`), whose nested braces are walked with quotes
-    honoured so a `}` inside a value cannot end the read early. `run:` also appears
-    as a STEP key; the scoped descent is why a step's own `run:` is never read here.
-    (Adversarial review 20260929T030431Z, X1.)
-    """
-    defaults_key = re.compile(r"""^\s*(?:'defaults'|"defaults"|defaults)\s*:\s*(.*)$""")
-    for index, line in enumerate(lines):
-        match = defaults_key.match(line)
-        if not match:
-            continue
-        indent = len(line) - len(line.lstrip(" "))
-        run, run_index, run_indent = _nested_entry(lines, index, indent, match.group(1), "run")
-        if run is None:
-            continue
-        shell, _, _ = _nested_entry(lines, run_index, run_indent, run, "shell")
-        if shell is None:
-            continue
-        return decode_yaml_scalar(strip_inline_comment(shell).strip()).strip()
-    return None
+    if not isinstance(defaults, yaml.MappingNode):
+        raise ValueError("cannot resolve defaults.run.shell: `defaults:` is not a mapping")
+    run = mapping_get(defaults, "run")
+    if run is None:
+        return None
+    if not isinstance(run, yaml.MappingNode):
+        raise ValueError("cannot resolve defaults.run.shell: `defaults.run:` is not a mapping")
+    shell = mapping_get(run, "shell")
+    if shell is None:
+        return None
+    if not isinstance(shell, yaml.ScalarNode):
+        raise ValueError("cannot resolve defaults.run.shell: `shell:` is not a string")
+    return " ".join(shell.value.split())
 
 
 def delegated_run_bodies(root, ref, visited, include_directories=True):
@@ -2431,7 +2496,9 @@ def delegated_run_bodies(root, ref, visited, include_directories=True):
     except ValueError:
         action_dir = None
     index = 0
+    document, _, _ = parsed_document(lines, target)
     payload_indexes = run_payload_indexes(lines)
+    rewrite = (lambda value: ACTION_PATH.sub(action_dir, value)) if action_dir is not None else None
     while index < len(lines):
         if index in payload_indexes:
             index += 1
@@ -2447,10 +2514,7 @@ def delegated_run_bodies(root, ref, visited, include_directories=True):
         else:
             body, index = ([value] if value else []), index + 1
         if body:
-            scoped = step_lines(lines, run_index, len(match.group(1)))
-            if action_dir is not None:
-                scoped = [ACTION_PATH.sub(action_dir, line) for line in scoped]
-            directories = working_directories(scoped) if include_directories else set()
+            directories = step_directories(document, lines, run_index, rewrite) if include_directories else set()
             if action_dir is not None and any(ACTION_PATH.search(line) for line in body):
                 directories.add(action_dir)
                 body = [ACTION_PATH.sub(action_dir, line) for line in body]
@@ -2476,17 +2540,24 @@ def delegated_workflow_run_bodies(root, ref, visited, include_directories=True):
     lines = target.read_text(encoding="utf-8-sig").splitlines()
     jobs, _, _ = read_gate_contract(lines, "__coverage_no_gate__")
     if not jobs:
+        # `jobs: {build: {...}}` parses to NO jobs, and returning here let every script
+        # the reusable workflow runs escape tiering. check_file refuses the same spelling
+        # for the calling workflow; the callee gets the same refusal (adversarial review
+        # 20261031T213036Z, M6).
+        if any(JOBS_DECL.match(strip_comment(line).rstrip()) for line in lines):
+            raise ValueError(
+                f"{target}: flow-style or empty 'jobs' mapping in a reusable workflow is "
+                "unsupported; refusing to skip its scripts."
+            )
         return
-    first_job = min(jobs.values())
-    job_indent = len(lines[first_job]) - len(lines[first_job].lstrip(" "))
-    workflow_directories = working_directories(workflow_level_lines(lines)) if include_directories else set()
+    document, _, _ = parsed_document(lines, target)
+    workflow_directories = working_directories(document, exclude={"jobs"}) if include_directories else set()
     for job_id in jobs:
         block = job_block(lines, jobs, job_id)
+        job = job_node(document, job_id)
         job_directories = set(workflow_directories)
         if include_directories:
-            job_directories |= working_directories(
-                job_level_lines(block, job_body_indent(lines, jobs, job_id, job_indent))
-            )
+            job_directories |= working_directories(job, exclude={"steps"})
         payload_indexes = run_payload_indexes(block)
         index = 0
         while index < len(block):
@@ -2502,7 +2573,7 @@ def delegated_workflow_run_bodies(root, ref, visited, include_directories=True):
                 body, index = ([value] if value else []), index + 1
             directories = set(job_directories)
             if include_directories:
-                directories |= working_directories(step_lines(block, run_index, len(match.group(1))))
+                directories |= step_directories(job, block, run_index)
             if body:
                 yield body, directories
         for line_index, line in enumerate(block):
@@ -2527,9 +2598,10 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root, include_directories=Tru
     control behind it.
     """
     job_indent = len(lines[jobs[gate_job]]) - len(lines[jobs[gate_job]].lstrip(" "))
+    document, _, _ = parsed_document(lines)
     # Only workflow-level `defaults.run` -- outside the jobs mapping, before or after
     # it -- can set a working directory for this job's steps.
-    workflow_directories = working_directories(workflow_level_lines(lines)) if include_directories else set()
+    workflow_directories = working_directories(document, exclude={"jobs"}) if include_directories else set()
     pending = list(set(needs) | {gate_job})
     seen = set()
     while pending:
@@ -2540,15 +2612,14 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root, include_directories=Tru
         if job_id not in jobs:
             continue
         block = job_block(lines, jobs, job_id)
+        job = job_node(document, job_id)
         # Directories that apply to EVERY step of this job: workflow- and job-level
         # `defaults.run.working-directory`. A step's own value is added per run body
         # below; a sibling step's is not. Computed once per job rather than once per
         # script match.
         job_directories = set(workflow_directories)
         if include_directories:
-            job_directories |= working_directories(
-                job_level_lines(block, job_body_indent(lines, jobs, job_id, job_indent))
-            )
+            job_directories |= working_directories(job, exclude={"steps"})
         payload_indexes = run_payload_indexes(block)
         index = 0
         while index < len(block):
@@ -2575,7 +2646,7 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root, include_directories=Tru
                 body, index = ([value] if value else []), index + 1
             directories = set(job_directories)
             if include_directories:
-                directories |= working_directories(step_lines(block, run_index, len(match.group(1))))
+                directories |= step_directories(job, block, run_index)
             for body_line in body:
                 yield job_id, body_line, body, directories
         payload_indexes = run_payload_indexes(block)
@@ -2755,7 +2826,9 @@ _KEYWORDS = r"(?:(?:then|do|else|if|elif|while|until|!)\s+)*"
 # that used to paper over this (QUOTED_ASSIGNMENT_DIRECTORY_CHANGE) is gone -- keeping
 # two patterns in agreement was a cost with no coverage behind it.
 _ASSIGNMENT_WORD = r"[A-Za-z_][A-Za-z0-9_]*=(?:'(?:[^']|'')*'|\"(?:\\.|[^\"])*\"|[^\s;&|]*)"
-_DIRECTORY_COMMAND = r"(?:(?:command|builtin)\s+|" + _ASSIGNMENT_WORD + r"\s+)*(?P<directory>cd|pushd|Push-Location|Set-Location)(?=[\s;&|()`<>$]|$)"
+# `sl` and `chdir` are pwsh's built-in aliases for Set-Location, so a Windows gate can
+# change directory without spelling `cd`.
+_DIRECTORY_COMMAND = r"(?:(?:command|builtin)\s+|" + _ASSIGNMENT_WORD + r"\s+)*(?P<directory>cd|chdir|sl|pushd|Push-Location|Set-Location)(?=[\s;&|()`<>$]|$)"
 # An unquoted backtick opens a command substitution just as `$(` does, so it anchors too.
 DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|(`{])\s*" + _KEYWORDS + _DIRECTORY_COMMAND, re.IGNORECASE)
 # A directory change as a command INSIDE a quoted string, which may span lines. An opening
@@ -2912,25 +2985,385 @@ def _recognised_suffixes(relative):
     begins at a `scripts`/`build`/`tools` segment (or a `.github` segment followed by
     `scripts`, mirroring the regex) recovers it. More candidates, never fewer.
 
-    A prefix that CLIMBS disqualifies the suffix: `scripts/../../scripts/probe.ps1`
-    escapes the checkout, and its `scripts/probe.ps1` suffix is a DIFFERENT file at
-    run time -- one the repository may legitimately carry. Asserting it would redden
-    the checkout over a script that never runs, which is the false-RED direction.
-    Cancelled climbs are not recovered here because they need no recovery: the full
-    relative is always a candidate and resolve_committed_paths reduces it lexically.
+    A prefix that CLIMBS ABOVE ITS OWN START disqualifies every later suffix:
+    `scripts/../../scripts/probe.ps1` escapes the checkout, and its `scripts/probe.ps1`
+    suffix is a DIFFERENT file at run time -- one the repository may legitimately carry.
+    Asserting it would redden the checkout over a script that never runs, which is the
+    false-RED direction. A BALANCED climb does not disqualify: in
+    `$GITHUB_WORKSPACE/x/../scripts/gate.py` the `..` only undoes `x`, and the suffix
+    names exactly the file that runs. A flag that stayed set after ANY `..` yielded
+    nothing there, so the script was never required HIGH (adversarial review
+    20261031T213036Z, H4). Depth is tracked instead, and the suffix is refused only once
+    the prefix has gone below where it started.
     """
     segments = relative.split("/")
-    climbed = False
+    depth = 0
+    escaped = False
     for index, segment in enumerate(segments):
         if segment == "..":
-            climbed = True
+            depth -= 1
+            escaped = escaped or depth < 0
             continue
-        if climbed:
+        if escaped:
             continue
         if segment in ("scripts", "build", "tools") or (
             segment == ".github" and segments[index + 1:index + 2] == ["scripts"]
         ):
             yield "/".join(segments[index:])
+        if segment and segment != ".":
+            depth += 1
+
+
+# `npm run <name>` (or `run-script`), with any `--flag` before the script name.
+NPM_RUN = re.compile(r"\bnpm\s+(?:run|run-script)\s+(?:--?[\w-]+\s+)*([\w:.@/-]+)")
+
+
+def printed_only(line, start):
+    """True when the text at `start` of `line` is merely the ARGUMENT of a printing command.
+
+    `echo "see scripts/report.py"` names a script it never runs. Reading the path out of
+    raw text forced that file HIGH and, beside a `cd`, reddened the required check
+    outright (tax portal review 20261101T004738Z, M18). The exemption is the one
+    changes_directory already applies to quoted strings: the command must be echo/printf/
+    Write-*, nothing before the text may open a substitution, and nothing after it may
+    pipe the text onward -- each of those EXECUTES the text. An unquoted `(` in the
+    printing command's own arguments counts as a substitution too: `echo (cmd)` and
+    `Write-Host (cmd)` run cmd under pwsh, `echo <(cmd)` runs it under bash (CodeRabbit,
+    PR #425).
+    """
+    masked = mask_quoted(line)
+    before, after = masked[:start], masked[start:].split("\n", 1)[0]
+    if "$(" in line or "`" in line or PIPE.search(after):
+        return False
+    command = MESSAGE_COMMAND.search(before)
+    return command is not None and "(" not in command.group(0)
+
+
+def npm_script_commands(root, bases, name, visited):
+    """(package directory, command) for every package.json script `npm run <name>` runs.
+
+    Resolved from each `base` directory's package.json, with the `pre<name>` and
+    `post<name>` hooks npm runs around it, and followed transitively through nested
+    `npm run` calls. A script reached only this way was invisible to the checker: the
+    frontend's `npm run lint:ratchet` ran `scripts/lintRatchet.mjs`, the file that
+    enforces a HIGH-tiered ratchet, and nothing required the script itself to be HIGH
+    (simulator-frontend review 20261101T004730Z, S7).
+    """
+    commands = []
+    for base in bases:
+        package = root / base / "package.json" if base else root / "package.json"
+        try:
+            scripts = json.loads(package.read_text(encoding="utf-8-sig")).get("scripts")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not isinstance(scripts, dict):
+            continue
+        for hook in (f"pre{name}", name, f"post{name}"):
+            command = scripts.get(hook)
+            if not isinstance(command, str) or (base, hook) in visited:
+                continue
+            visited.add((base, hook))
+            commands.append((base, command))
+            for nested in NPM_RUN.finditer(command):
+                commands.extend(npm_script_commands(root, [base], nested.group(1), visited))
+    return commands
+
+
+def script_references(body, directories, root):
+    """(relative path, applicable directories) for every gate-script reference `body`
+    makes, directly or through `npm run`.
+
+    Three readings, each only ADDING candidates (more scripts required HIGH, never fewer):
+    each physical line, as before; the body with bash line continuations folded, because
+    `scripts/ga\\` + newline + `te.py` is `scripts/gate.py` to bash and matched nothing
+    per line (adversarial review 20261031T213036Z, XL1); and the package.json commands
+    behind each `npm run <name>`, resolved against the package's own directory as well
+    as the body's. A reference that is only PRINTED is skipped -- see printed_only.
+    """
+    text = "\n".join(body)
+    folded = re.sub(r"\\\n[ \t]*", "", text)
+    for source in {text, folded}:
+        for match in GATE_SCRIPT.finditer(source):
+            if printed_only(source, match.start(1)):
+                continue
+            yield match.group(1).replace("\\", "/"), directories
+    bases = [""] + sorted(directory for directory in directories if directory and not directory.startswith("!"))
+    # Unsupported working-directory markers travel with every interpreter reference, so
+    # `working-directory: ${{ matrix.path }}` + `python gate.py` is refused, not resolved at the root.
+    markers = {directory for directory in directories if directory.startswith("!")}
+    for relative, extra in interpreter_references(folded, bases, root):
+        yield relative, extra | markers
+    for match in NPM_RUN.finditer(folded):
+        if printed_only(folded, match.start()):
+            continue
+        for base, command in npm_script_commands(root, bases, match.group(1), set()):
+            for script in GATE_SCRIPT.finditer(command):
+                yield script.group(1).replace("\\", "/"), directories | ({base} if base else set())
+            # `"gate": "python3 gate.py"` runs a root-level script GATE_SCRIPT cannot see (CodeRabbit, PR #426).
+            # npm runs it from the package's own directory.
+            for relative, extra in interpreter_references(command, [base], root):
+                yield relative, extra | markers
+
+
+# A Python interpreter as a command word. The target after it is read by
+# interpreter_references; GATE_SCRIPT alone saw none of `-m`, `unittest discover -s` or a
+# root-level `python3 gate.py` (tax portal review 20261101T004738Z, M36).
+# A path prefix is allowed (`.venv/bin/python`, `/usr/bin/python3`; CodeRabbit, PR #426).
+# A closing quote may follow (`"C:\Program Files\Python\python.exe" gate.py`).
+PYTHON_COMMAND = re.compile(r"(?<![\w.-])python(?:3(?:\.\d+)*)?(?:\.exe)?(?=[\"']?[ \t])")
+# Spellings of the checkout root in a target path, read as the repository root.
+WORKSPACE_PREFIX = re.compile(r"^(?:\$\{?GITHUB_WORKSPACE\}?|\$\{\{\s*github\.workspace\s*\}\}|\$env:GITHUB_WORKSPACE)/")
+# A shell redirection token: complete on its own (`2>&1`, `>out.txt`), or one that takes the next
+# token as its file (`>`, `2>>`). Neither is an interpreter argument.
+REDIRECT_COMPLETE = re.compile(r"\d*>&(?:\d+|-)|&>>?\S+|\d*>>?\S+|\d*<\S+")
+REDIRECT_OPEN = re.compile(r"\d*>>?|&>>?|\d*<")
+# Interpreter options that consume the next token.
+PYTHON_VALUE_OPTIONS = {"-X", "-W", "-Q"}
+# pytest options whose value is a separate token, so it is not read as a path.
+PYTEST_VALUE_OPTIONS = {"-k", "-m", "-c", "-p", "-o", "-n", "-W", "-r", "--rootdir", "--confcutdir", "--basetemp", "--junitxml", "--cov", "--cov-report", "--ignore", "--deselect"}
+# unittest options whose value is a separate token (`-k smoke`), so it is not read as a target (Gitar, PR #426).
+UNITTEST_VALUE_OPTIONS = {"-k"}
+# Shell separators that end one command, searched in quote-masked text.
+COMMAND_END = re.compile(r";|&&|\|\||\||\n")
+
+
+def _resolve_under_bases(root, bases, relative):
+    """Root-relative committed paths of `relative` under each base directory."""
+    found = []
+    for base in bases:
+        candidate = f"{base}/{relative}" if base else relative
+        found.extend(resolve_committed_paths(root, candidate, allow_outside_repository=True))
+    return found
+
+
+def _files_matching(root, bases, start, patterns):
+    """(start resolved, files): every file under `start` (per base) matching a pattern.
+
+    Recursive. unittest discovery only descends into importable packages, so this can name
+    more files than ever run -- the fail-closed direction, more scripts required HIGH.
+    """
+    resolved_start = False
+    files = set()
+    root_resolved = root.resolve()
+    for base in bases:
+        directory = (root / base / start) if base else (root / start)
+        try:
+            directory = directory.resolve()
+        except OSError:
+            continue
+        if not directory.is_dir() or not directory.is_relative_to(root_resolved):
+            continue
+        resolved_start = True
+        for pattern in patterns:
+            for path in directory.rglob(pattern):
+                if path.is_file() and ".git" not in path.relative_to(root_resolved).parts:
+                    files.add(path.relative_to(root_resolved).as_posix())
+    return resolved_start, files
+
+
+def interpreter_references(text, bases, root):
+    """(relative path, directories) for every repo file a `python ...` command runs.
+
+    Covers what GATE_SCRIPT's path pattern cannot see: `python -m unittest discover -s D
+    -p P` (every file the pattern matches under D), `python -m pytest <paths>` (each
+    file, or each test module and conftest.py under a directory), `python -m pkg.mod`
+    when `pkg/mod.py` or its package is in the checkout, and `python <file>.py` at any
+    path, root level included.
+
+    FAIL-CLOSED where the target names repository content that cannot be resolved: a
+    discover start directory or a pytest path that does not exist, or a `-m` module whose
+    top-level package is in the checkout but whose file is not. Those are refused rather
+    than passed, because an unresolved target is a gate script nobody can require HIGH
+    (owner decision, PR #425 M36). A module with no trace in the checkout (`pip`, `venv`,
+    `pytest` itself) is an installed tool, not repo code, and passes.
+
+    THE BOUNDARY: a module reached only through PYTHONPATH or an installed editable
+    package is read as a tool. Review of the workflow change is the control there.
+    """
+    for match in PYTHON_COMMAND.finditer(text):
+        if printed_only(text, match.start()) or _in_shell_comment(text, match.start()):
+            continue
+        rest = text[match.end():].lstrip("\"'")
+        end = COMMAND_END.search(mask_quoted(rest))
+        segment = rest[:end.start()] if end else rest
+        # A shell comment is not an argument (`python -m pytest ci # run tests`).
+        comment = re.search(r"(?:^|[ \t])#", mask_quoted(segment))
+        if comment:
+            segment = segment[:comment.start()]
+        tokens = _interpreter_tokens(segment)
+        index = 0
+        while index < len(tokens) and tokens[index].startswith("-") and tokens[index] not in ("-m", "-c"):
+            index += 2 if tokens[index] in PYTHON_VALUE_OPTIONS else 1
+        if index >= len(tokens) or tokens[index] == "-c":
+            continue
+        if tokens[index] != "-m":
+            target, rooted = WORKSPACE_PREFIX.subn("", tokens[index].replace("\\", "/"))
+            if target.endswith(".py"):
+                # A workspace-rooted target names the root file only, whatever working-directory says (CodeRabbit, PR #426).
+                found = _resolve_under_bases(root, [""] if rooted else bases, target)
+                for relative in found:
+                    yield relative, set()
+                # Unresolved here, a relative target is still yielded raw so gate_script_paths
+                # applies its directory-change refusal: `cd sub` then `python3 gate.py` runs
+                # sub/gate.py, which nothing above resolves (CodeRabbit, PR #426). An absolute,
+                # home or variable path is outside the checkout and is not a repo gate script,
+                # and a workspace-rooted one that is absent is not in the checkout at all.
+                if not found and not rooted and not re.match(r"^(?:[/~$]|[A-Za-z]:)", target):
+                    yield target, {base for base in bases if base}
+            continue
+        if index + 1 >= len(tokens):
+            continue
+        module, args = tokens[index + 1], tokens[index + 2:]
+        if module == "unittest":
+            yield from _unittest_references(root, bases, args)
+        elif module in ("pytest", "py.test"):
+            yield from _pytest_references(root, bases, args)
+        else:
+            yield from _module_references(root, bases, module)
+
+
+def _in_shell_comment(text, start):
+    """True when `start` follows an unquoted `#` on its line: `# python3 -m pytest ci` runs nothing (CodeRabbit, PR #426)."""
+    line_start = text.rfind("\n", 0, start) + 1
+    return re.search(r"(?:^|[ \t])#", mask_quoted(text[line_start:start])) is not None
+
+
+def _interpreter_tokens(segment):
+    """The words of one interpreter command, quotes stripped, redirections dropped.
+
+    Non-POSIX shlex, because POSIX mode treats a backslash as an escape and turns
+    `.\\ci\\gate.py` into `.cigate.py` (CodeRabbit, PR #426). Quotes are stripped per
+    token, which also cleans a token cut from inside `bash -c "python3 gate.py"`.
+    """
+    try:
+        raw = shlex.split(segment, posix=False)
+    except ValueError:
+        raw = segment.split()
+    # A word ending in one backslash escaped the space after it (`gate\ script.py` in bash). Not
+    # before an option: `tests\ -q` is a Windows trailing separator, not an escape (Gitar, PR #426).
+    words = []
+    for word in raw:
+        if words and words[-1].endswith("\\") and not words[-1].endswith("\\\\") and not word.startswith("-"):
+            words[-1] = words[-1][:-1] + " " + word
+        else:
+            words.append(word)
+    tokens, skip = [], False
+    for token in (word.strip("\"'") for word in words):
+        if skip:
+            skip = False
+            continue
+        # A redirection attached to an argument (`gate.py>out.txt`) is split off it.
+        attached = re.search(r"[<>]", token)
+        if attached and attached.start() > 0 and not token[:attached.start()].isdigit() and token[attached.start() - 1] != "&":
+            token, redirect = token[:attached.start()], token[attached.start():]
+            skip = bool(REDIRECT_OPEN.fullmatch(redirect))
+        elif REDIRECT_COMPLETE.fullmatch(token):
+            continue
+        elif REDIRECT_OPEN.fullmatch(token):
+            skip = True
+            continue
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _refusal(message):
+    return "", {"!unsupported " + message}
+
+
+def _unittest_references(root, bases, args):
+    if args and args[0] == "discover":
+        start, pattern, positional, index = ".", "test*.py", [], 1
+        while index < len(args):
+            arg = args[index]
+            if arg in UNITTEST_VALUE_OPTIONS:
+                index += 2
+                continue
+            if arg in ("-s", "--start-directory", "-p", "--pattern", "-t", "--top-level-directory") and index + 1 < len(args):
+                if arg in ("-s", "--start-directory"):
+                    start = args[index + 1]
+                elif arg in ("-p", "--pattern"):
+                    pattern = args[index + 1]
+                index += 2
+                continue
+            if not arg.startswith("-"):
+                positional.append(arg)
+            index += 1
+        if positional:
+            start = positional[0]
+        if len(positional) > 1:
+            pattern = positional[1]
+        resolved, files = _files_matching(root, bases, start.replace("\\", "/"), [pattern])
+        if not resolved:
+            yield _refusal(f"cannot resolve the unittest discover start directory '{start}'; run the gate's tests from a directory in the checkout")
+        for relative in sorted(files):
+            yield relative, set()
+        return
+    names, index = [], 0
+    while index < len(args):
+        if args[index] in UNITTEST_VALUE_OPTIONS:
+            index += 2
+            continue
+        if not args[index].startswith("-"):
+            names.append(args[index])
+        index += 1
+    if not names:
+        yield from _unittest_references(root, bases, ["discover"])
+        return
+    for name in names:
+        relative = name.replace("\\", "/") if name.endswith(".py") or "/" in name else name.replace(".", "/") + ".py"
+        found = _resolve_under_bases(root, bases, relative)
+        if not found:
+            # A dotted name may stop at a class or method: try each shorter prefix as a module.
+            parts = name.split(".")
+            for cut in range(len(parts) - 1, 0, -1):
+                found = _resolve_under_bases(root, bases, "/".join(parts[:cut]) + ".py")
+                if found:
+                    break
+        if not found:
+            yield _refusal(f"cannot resolve the unittest target '{name}' to a file in the checkout")
+        for relative in found:
+            yield relative, set()
+
+
+def _pytest_references(root, bases, args):
+    paths, index = [], 0
+    while index < len(args):
+        arg = args[index]
+        if arg.startswith("-"):
+            index += 2 if arg in PYTEST_VALUE_OPTIONS else 1
+            continue
+        paths.append(arg.split("::", 1)[0].replace("\\", "/"))
+        index += 1
+    for path in paths or ["."]:
+        if path.endswith(".py"):
+            found = _resolve_under_bases(root, bases, path)
+            if not found:
+                yield _refusal(f"cannot resolve the pytest target '{path}' to a file in the checkout")
+            for relative in found:
+                yield relative, set()
+            continue
+        resolved, files = _files_matching(root, bases, path, ["test_*.py", "*_test.py", "conftest.py"])
+        if not resolved:
+            yield _refusal(f"cannot resolve the pytest target '{path}' in the checkout")
+        for relative in sorted(files):
+            yield relative, set()
+
+
+def _module_references(root, bases, module):
+    parts = module.split(".")
+    stem = "/".join(parts)
+    for relative in (stem + ".py", stem + "/__main__.py"):
+        found = _resolve_under_bases(root, bases, relative)
+        if found:
+            for item in found:
+                yield item, set()
+            return
+    head = parts[0]
+    if _resolve_under_bases(root, bases, head + ".py") or any(
+        (root / base / head if base else root / head).is_dir() for base in bases
+    ):
+        yield _refusal(f"cannot resolve `python -m {module}` to a file in the checkout, though '{head}' is repository content")
 
 
 def gate_script_paths(lines, jobs, needs, gate_job, root):
@@ -2948,9 +3381,13 @@ def gate_script_paths(lines, jobs, needs, gate_job, root):
     disk, by resolve_committed_paths.
     """
     found = {}
-    for job_id, body_line, body, directories in gated_run_bodies(lines, jobs, needs, gate_job, root):
-        for match in GATE_SCRIPT.finditer(body_line):
-            relative = match.group(1).replace("\\", "/")
+    seen_bodies = set()
+    for job_id, _, body, directories in gated_run_bodies(lines, jobs, needs, gate_job, root):
+        body_key = (job_id, tuple(body), tuple(sorted(directories)))
+        if body_key in seen_bodies:
+            continue
+        seen_bodies.add(body_key)
+        for relative, directories in script_references(body, directories, root):
             unsupported = next((directory for directory in directories if directory.startswith("!unsupported ")), None)
             if unsupported:
                 sys.exit(f"{root}: {unsupported[1:]}")
@@ -3115,7 +3552,122 @@ def assert_gate_scripts(workflow_path, lines, jobs, needs, gate_job):
         )
 
 
-def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty="fail"):
+# Environment keys that can neutralise the gate's accepted exit command before it runs.
+# BASH_ENV and ENV name a start-up file bash/sh sources, SHELLOPTS and BASHOPTS set shell
+# options such as noexec at start-up, and BASH_FUNC_name%% imports a function over a
+# builtin. Refusing BASH_ENV alone left every other route open (adversarial review
+# 20261031T213036Z, M2; tax portal 20261101T004738Z, M16).
+STARTUP_ENV_KEYS = ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS")
+# The same routes spelled inside a GATE JOB run body -- a GITHUB_ENV write, or a write to
+# pwsh's `$PROFILE`, which the runner loads because its pwsh template omits -NoProfile.
+STARTUP_OVERRIDE_TOKEN = re.compile(
+    r"(?i)\b(?:BASH_ENV|SHELLOPTS|BASHOPTS|BASH_FUNC_\w*)\b|(?<![\w$:])ENV(?=\s*[=<])|\$(?:env:)?PROFILE\b"
+)
+
+
+def startup_env_keys(mapping):
+    """The keys of a parsed `env:` mapping that can neutralise the gate's exit command."""
+    if mapping is None:
+        return []
+    if not isinstance(mapping, yaml.MappingNode):
+        raise ValueError("`env:` is not a mapping this checker can read, so a start-up override cannot be ruled out")
+    return [name for name, _ in mapping_entries(mapping) if name in STARTUP_ENV_KEYS or name.startswith("BASH_FUNC_")]
+
+
+def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_exempt, label=""):
+    """Refuse a feeder step that can never fail its job or never runs.
+
+    `continue-on-error: true` on a step is the step-level spelling of a tolerated job:
+    the step's failure is swallowed and the feeder reports green. An `if:` that is
+    statically false never runs the step at all. Either leaves a check the gate believes
+    in doing nothing.
+
+    Keys are matched at the step's OWN column, the guard step_can_fail already applies:
+    an action INPUT named `if` or `continue-on-error` under `with:` is a value, not a step
+    control, and reading it as one reddened a correct workflow (adversarial review
+    20261031T213036Z, L3; tax portal 20261101T004738Z, M20).
+
+    A best-effort step is exempted by naming `<job>/<step id>` in GATE_STEP_EXEMPT -- an
+    explicit, reviewable list, as GATE_EXEMPT is for jobs. Fail-closed with no exemption
+    reddened the first consumer with a best-effort step (simulator-frontend review
+    20261101T004730Z, S12). `label` prefixes the job id when the jobs belong to a called
+    reusable workflow, in messages and in exemption entries alike.
+    """
+    executable = re.compile(r"""^(\s*(?:-\s+)?)(?:'run'|"run"|run|'uses'|"uses"|uses)\s*:""")
+    for feeder in sorted(feeders):
+        block = job_block(lines, jobs, feeder)
+        payloads = run_payload_indexes(block)
+        seen = set()
+        for index, line in enumerate(block):
+            match = executable.match(line) if index not in payloads else None
+            if not match:
+                continue
+            indent = len(match.group(1))
+            span = step_span(block, index, indent)
+            if span is None or span in seen:
+                continue
+            seen.add(span)
+            kind = "run step" if "run" in line[indent:].split(":", 1)[0] else "step"
+
+            def own_key(key):
+                pattern = step_key_pattern(indent, key)
+                for offset in range(*span):
+                    entry = pattern.match(block[offset]) if offset not in payloads else None
+                    if entry and len(entry.group(1)) == indent:
+                        value = strip_comment(entry.group(2)).strip()
+                        if not value or is_block_scalar_header(value):
+                            body, _ = continuation_lines(block, offset, indent)
+                            value = " ".join(strip_comment(part).strip() for part in body)
+                        return value
+                return None
+
+            tolerance = own_key("continue-on-error")
+            if tolerance is not None and static_truth(tolerance) is not False:
+                step_id = own_key("id")
+                entry = f"{label}{feeder}/{decode_yaml_scalar(step_id)}" if step_id else None
+                if entry in step_exempt:
+                    used_exempt.add(entry)
+                else:
+                    sys.exit(
+                        f"{workflow_path}: feeder '{label}{feeder}' has a tolerated {kind}"
+                        + (f" (id '{decode_yaml_scalar(step_id)}')" if step_id else "")
+                        + ". A step whose failure is swallowed checks nothing the gate can see. "
+                        "Remove `continue-on-error`, or give the step an `id:` and name "
+                        "`<job>/<step id>` in GATE_STEP_EXEMPT with a written rationale."
+                    )
+            condition = own_key("if")
+            if condition is not None and static_truth(condition) is False:
+                sys.exit(f"{workflow_path}: feeder '{label}{feeder}' has an always-skipped {kind}.")
+
+
+def reusable_workflow_feeder(lines, jobs, job_id, job_indent, root):
+    """(path, lines, jobs, job indent) of the LOCAL reusable workflow `job_id` calls, or None."""
+    indent = job_body_indent(lines, jobs, job_id, job_indent)
+    if indent is None:
+        return None
+    uses_key = key_pattern(indent, "uses")
+    for line in job_block(lines, jobs, job_id):
+        match = uses_key.match(line)
+        if not match:
+            continue
+        ref = decode_yaml_scalar(strip_comment(match.group(1)).strip())
+        # `./` and `$/` are the two local spellings LOCAL_USES admits.
+        if not (ref.startswith(("./", "$/")) and ref[2:].startswith(".github/workflows/")):
+            return None
+        target = root / ref[2:]
+        if not target.is_file():
+            return None
+        callee_lines = target.read_text(encoding="utf-8-sig").splitlines()
+        callee_jobs, _, _ = read_gate_contract(callee_lines, "")
+        if not callee_jobs:
+            return None  # delegated_workflow_run_bodies refuses the flow spelling
+        parsed_document(callee_lines, target)
+        first = min(callee_jobs.values())
+        return target, callee_lines, callee_jobs, len(callee_lines[first]) - len(callee_lines[first].lstrip(" "))
+    return None
+
+
+def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty="fail", step_exempt=frozenset()):
     """Assert one file's full gate contract. Returns True when the file contains the
     gate job (and every assertion ran), False when it has no gate job at all.
 
@@ -3150,69 +3702,24 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
 
     # AFTER the gate-job test: a workflow with no gate job feeds nothing, so in directory
     # mode a file-exempt release.yml with `env: BASH_ENV:` does not redden the whole run.
-    # And block-scalar `run:` payloads are skipped: a heredoc line starting
-    # `BASH_ENV:` is shell text, not an env key.
-    payload_indexes = run_payload_indexes(lines)
-    root = policy_root(workflow_path) or Path(workflow_path).resolve().parent.parent.parent
-    # Quoted keys admitted, as for every other key this checker reads: `"BASH_ENV":` is the
-    # same env key, and missing it let the override through.
     #
-    # A bare `BASH_ENV:` line is an env assignment ONLY when it sits inside an `env:`
-    # block. Matching it file-wide flagged any nested key that happens to share the
-    # name -- an action's `with:` input, a matrix value -- and reddened workflows that
-    # set no environment variable at all (adversarial review 20260929T030431Z, F7b).
-    # So the open `env:` block is tracked by indentation: its children sit deeper than
-    # the `env` key's own column (for the `- env:` sequence spelling that column is
-    # past the dash), and the first non-blank line at or before the column ends it.
-    # Block-scalar VALUES inside the block (`SCRIPT: |`) are string content, not
-    # keys, and their payload lines are skipped over.
-    bash_env_key = False
-    env_block_indent = None
-    env_scalar_indent = None
-    for index, line in enumerate(lines):
-        if index in payload_indexes:
-            continue
-        stripped = strip_comment(line)
-        text = stripped.strip()
-        indent = len(line) - len(line.lstrip(" "))
-        if env_block_indent is not None:
-            if not text:
-                continue
-            if env_scalar_indent is not None:
-                if indent > env_scalar_indent:
-                    continue
-                env_scalar_indent = None
-            if indent <= env_block_indent:
-                env_block_indent = None
-            else:
-                if re.match(r"""(?:'BASH_ENV'|"BASH_ENV"|BASH_ENV)\s*:""", stripped.lstrip()):
-                    bash_env_key = True
-                    break
-                if re.match(r"""^\s*(?:'[^'\n]+'|"[^"\n]+"|[A-Za-z0-9_.-]+)\s*:\s*[|>]""", stripped):
-                    env_scalar_indent = indent
-                continue
-        # The env value is read off the RAW line, not the comment-stripped one: a `#`
-        # inside a quoted value is data, and cutting there left an unterminated
-        # fragment that raised on valid YAML -- the same false RED resolve_runs_using's
-        # flow-mapping arm documents. The dash allowance admits `- env: {…}`, the
-        # spelling the key takes when it opens a step's sequence item; without it that
-        # inline mapping was never read at all.
-        env = re.match(r"""^(\s*)(?:-(\s+))?(?:'env'|"env"|env)\s*:\s*(.*)$""", line)
-        if not env:
-            continue
-        if env.group(3).lstrip().startswith("{"):
-            # A flow mapping may span lines, so the rest of the file is handed over as
-            # the continuation -- the same call shape resolve_runs_using uses. The
-            # parser itself tracks quotes and comments, so trailing text is safe.
-            entries = parse_flow_mapping("\n".join([env.group(3)] + list(lines[index + 1:])))
-            if entries is None:
-                sys.exit(f"{workflow_path}: cannot parse an inline env mapping; refusing to verify BASH_ENV.")
-            if any(key.strip("'\"") == "BASH_ENV" for key, _ in entries):
-                bash_env_key = True
-                break
-        elif not strip_comment(env.group(3)).strip():
-            env_block_indent = len(env.group(1)) + (1 + len(env.group(2)) if env.group(2) else 0)
-    if not bash_env_key:
+    # THE START-UP ENVIRONMENT IS READ FROM THE PARSED DOCUMENT, at the three scopes that
+    # reach the gate job's shell: the workflow's `env:`, the gate job's, and its steps'.
+    # Text scanning the whole file would redden the gate for a feeder-only `BASH_ENV:`
+    # (job-level env does not cross jobs), read `BASH_ENV:` text inside a non-`run:` block
+    # scalar as a key, and miss an override behind an anchored or aliased `env:`
+    # (`env: &shared`). The composer resolves aliases and knows what is text.
+    try:
+        document, _, _ = parsed_document(lines, workflow_path)
+        gate = job_node(document, gate_job)
+        overrides = startup_env_keys(mapping_get(document, "env")) + startup_env_keys(mapping_get(gate, "env"))
+        steps = mapping_get(gate, "steps")
+        for step in (steps.value if isinstance(steps, yaml.SequenceNode) else []):
+            overrides += startup_env_keys(mapping_get(step, "env"))
+    except ValueError as error:
+        sys.exit(str(error) if str(error).startswith(str(workflow_path)) else f"{workflow_path}: {error}")
+    root = policy_root(workflow_path) or Path(workflow_path).resolve().parent.parent.parent
+    if not overrides:
         seen_run_bodies = set()
         for job_id, _, body, _ in gated_run_bodies(
             lines, jobs, needs, gate_job, root, include_directories=False
@@ -3228,7 +3735,6 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             if body_key in seen_run_bodies:
                 continue
             seen_run_bodies.add(body_key)
-            body_text = "\n".join(body)
             # The bare token, refused outright. The conjunction this replaces -- an
             # assignment AND a redirection AND a `$GITHUB_ENV` spelling -- missed real
             # overrides: `echo "BASH_ENV<<EOF" >> "$GITHUB_ENV"` writes heredoc syntax
@@ -3238,13 +3744,17 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             # the gate's accepted failing forms, so ANY mention is refused here, even
             # in an echo: a gate step is not the place for text this checker has to
             # classify.
-            if re.search(r"(?i)\bBASH_ENV\b", body_text):
-                bash_env_key = True
+            match = STARTUP_OVERRIDE_TOKEN.search("\n".join(body))
+            if match:
+                overrides.append(match.group(0))
                 break
-    if bash_env_key:
+    if overrides:
         sys.exit(
-            f"{workflow_path}: BASH_ENV can load shell functions that override the gate's "
-            "accepted exit command. Remove the override or use a separately verified gate shell."
+            f"{workflow_path}: {', '.join(sorted(set(overrides)))} can neutralise the gate's "
+            "accepted exit command: BASH_ENV/ENV load a start-up file, SHELLOPTS/BASHOPTS set "
+            "shell options such as noexec, BASH_FUNC_* imports a function over a builtin, and "
+            "$PROFILE is loaded by the runner's pwsh. Remove the override or use a separately "
+            "verified gate shell."
         )
 
     gate_line = lines[jobs[gate_job]]
@@ -3292,7 +3802,9 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
         return False
 
     unsafe_feeders = set()
-    for feeder in set(needs) - {gate_job}:
+    # A feeder that is ITSELF conditional-exempt is allowed to skip, so a conditional or
+    # exempt job behind it is no new hole; walking its chain reddened a correct workflow.
+    for feeder in set(needs) - {gate_job} - conditional_exempt:
         if runs_regardless(feeder):
             continue
         pending = list(job_needs(lines, jobs, feeder, job_indent))
@@ -3338,33 +3850,48 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             "A tolerated job cannot provide a required check or serve as the aggregate gate."
         )
 
-    for feeder in set(needs) - {gate_job}:
-        block = job_block(lines, jobs, feeder)
-        payloads = run_payload_indexes(block)
-        executable = re.compile(r"""^(\s*(?:-\s+)?)(?:'run'|"run"|run|'uses'|"uses"|uses)\s*:""")
-        seen = set()
-        for index, line in enumerate(block):
-            match = executable.match(line) if index not in payloads else None
-            if not match:
-                continue
-            indent = len(match.group(1))
-            span = step_span(block, index, indent)
-            if span is None or span in seen:
-                continue
-            seen.add(span)
-            for key, message in (("continue-on-error", "tolerated run step"), ("if", "always-skipped run step")):
-                pattern = step_key_pattern(indent, key)
-                for offset in range(*span):
-                    entry = pattern.match(block[offset]) if offset not in payloads else None
-                    if not entry:
-                        continue
-                    value = strip_comment(entry.group(2)).strip()
-                    if not value or is_block_scalar_header(value):
-                        body, _ = continuation_lines(block, offset, indent)
-                        value = " ".join(strip_comment(part).strip() for part in body)
-                    truth = static_truth(value)
-                    if (key == "continue-on-error" and truth is not False) or (key == "if" and truth is False):
-                        sys.exit(f"{workflow_path}: feeder '{feeder}' has a {message}.")
+    used_step_exempt = set()
+    assert_feeder_steps(workflow_path, lines, jobs, set(needs) - {gate_job}, step_exempt, used_step_exempt)
+
+    # A feeder that is a LOCAL REUSABLE WORKFLOW runs that file's jobs, and the caller
+    # reports success when every callee job succeeds OR SKIPS. A conditional, tolerated or
+    # step-neutered job inside the callee is therefore the same hole as the same thing on
+    # the feeder itself, and nothing looked inside.
+    # The callee's jobs get the feeder's own checks; a feeder named in
+    # GATE_CONDITIONAL_EXEMPT may skip, so its callee may be conditional too.
+    for feeder in sorted(set(needs) - {gate_job}):
+        callee = reusable_workflow_feeder(lines, jobs, feeder, job_indent, root)
+        if callee is None:
+            continue
+        callee_path, callee_lines, callee_jobs, callee_indent = callee
+        if feeder not in conditional_exempt:
+            skippable = sorted(conditional_jobs(callee_lines, callee_jobs, callee_indent))
+            if skippable:
+                sys.exit(
+                    f"{workflow_path}: feeder '{feeder}' calls {callee_path}, whose job(s) "
+                    f"{', '.join(skippable)} carry a job-level 'if:'. A skipped callee job passes the "
+                    "caller and so the gate; remove the condition, or name the feeder in "
+                    "GATE_CONDITIONAL_EXEMPT with a written rationale."
+                )
+        tolerated = sorted(tolerant_jobs(callee_lines, callee_jobs, callee_indent))
+        if tolerated:
+            sys.exit(
+                f"{workflow_path}: feeder '{feeder}' calls {callee_path}, whose job(s) "
+                f"{', '.join(tolerated)} carry 'continue-on-error'. A tolerated callee job cannot fail "
+                "the feeder."
+            )
+        assert_feeder_steps(callee_path, callee_lines, callee_jobs, set(callee_jobs), step_exempt, used_step_exempt, label=f"{feeder}/")
+
+    stale = sorted(
+        entry for entry in step_exempt
+        if entry.split("/", 1)[0] in set(needs) - {gate_job} and entry not in used_step_exempt
+    )
+    if stale:
+        sys.exit(
+            f"{workflow_path}: GATE_STEP_EXEMPT names step(s) that do not exist or are not "
+            f"tolerated: {', '.join(stale)}. Each entry is `<job>/<step id>` for a feeder step "
+            "carrying `continue-on-error`."
+        )
 
     assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs)
     assert_gate_scripts(workflow_path, lines, jobs, needs, gate_job)
@@ -3381,22 +3908,29 @@ def split_env(name):
 
 
 def main(argv):
-    if len(argv) < 2:
+    if len(argv) < 2 or len(argv) > 3:
+        # A third positional was silently ignored, so a stale call that still passed one
+        # exited 0 with that argument unread.
         sys.exit("usage: assert_gate_coverage.py <workflow-file|workflow-dir> [gate-job-id]")
 
     target = argv[1]
     gate_job = argv[2] if len(argv) > 2 else os.environ.get("GATE_JOB", "ci-gate")
     exempt = split_env("GATE_EXEMPT")
     conditional_exempt = split_env("GATE_CONDITIONAL_EXEMPT")
+    step_exempt = split_env("GATE_STEP_EXEMPT")
+    malformed = sorted(entry for entry in step_exempt if not all(entry.split("/")) or "/" not in entry)
+    if malformed:
+        sys.exit(f"GATE_STEP_EXEMPT entries are `<job>/<step id>`; malformed: {', '.join(malformed)}")
+    step_jobs = {entry.split("/", 1)[0] for entry in step_exempt}
 
     if not Path(target).is_dir():
         if not Path(target).is_file():
             sys.exit(f"{target}: workflow path does not exist or is not a file.")
-        unknown = sorted((exempt | conditional_exempt) - parse_jobs(target))
+        unknown = sorted((exempt | conditional_exempt | step_jobs) - parse_jobs(target))
         if unknown:
             sys.exit(
-                f"{target}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT name jobs that do not "
-                f"exist: {', '.join(unknown)}"
+                f"{target}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT/GATE_STEP_EXEMPT name jobs that do "
+                f"not exist: {', '.join(unknown)}"
             )
         # The return value is the WHOLE assertion when the gate job is absent:
         # check_file reports every other breach by exiting, but answers "no gate job
@@ -3411,7 +3945,7 @@ def main(argv):
         # traceback reads as a broken checker, and a broken checker is what gets a
         # working control deleted to make CI green.
         try:
-            no_gate = check_file(target, gate_job, exempt, conditional_exempt) is False
+            no_gate = check_file(target, gate_job, exempt, conditional_exempt, step_exempt=step_exempt) is False
         except ValueError as error:
             sys.exit(str(error))
         if no_gate:
@@ -3443,11 +3977,11 @@ def main(argv):
     all_jobs = set()
     for workflow_path in files:
         all_jobs |= parse_jobs(workflow_path)
-    unknown = sorted((exempt | conditional_exempt) - all_jobs)
+    unknown = sorted((exempt | conditional_exempt | step_jobs) - all_jobs)
     if unknown:
         sys.exit(
-            f"{target}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT name jobs that do not "
-            f"exist in any workflow: {', '.join(unknown)}"
+            f"{target}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT/GATE_STEP_EXEMPT name jobs that do "
+            f"not exist in any workflow: {', '.join(unknown)}"
         )
 
     gated = 0
@@ -3455,7 +3989,7 @@ def main(argv):
         # Same ValueError-to-refusal translation as file mode: a delegated action the
         # checker cannot classify must redden the run with a message, not a traceback.
         try:
-            result = check_file(workflow_path, gate_job, exempt, conditional_exempt, on_empty="skip")
+            result = check_file(workflow_path, gate_job, exempt, conditional_exempt, on_empty="skip", step_exempt=step_exempt)
         except ValueError as error:
             sys.exit(str(error))
         if result is None:
