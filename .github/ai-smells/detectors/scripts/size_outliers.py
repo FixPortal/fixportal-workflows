@@ -61,11 +61,18 @@ def block_end(code, i, head):
     """Index of the line that closes the block opened by the signature at code[i..head], or
     None. A `=>` signature with no `{` (`lazy(() =>`) is closed by its parentheses instead."""
     signature = " ".join(code[i:head + 1])
-    open_c, close_c = ("(", ")") if signature.rstrip().endswith("=>") else ("{", "}")
+    open_c, close_c = "{", "}"
+    start, first = head, code[head][code[head].rfind(")") + 1:]  # braces inside the parameter list are not the body
+    if signature.rstrip().endswith("=>"):
+        if head + 1 < len(code) and code[head + 1].lstrip().startswith("{"):
+            start, first = head + 1, code[head + 1]  # `=>` with the body's `{` on the next line
+        else:
+            open_c, close_c, start, first = "(", ")", i, code[i]
     depth, opened = 0, False
-    for j in range(i, len(code)):
-        depth += code[j].count(open_c) - code[j].count(close_c)
-        opened = opened or open_c in code[j]
+    for j in range(start, len(code)):
+        text = first if j == start else code[j]
+        depth += text.count(open_c) - text.count(close_c)
+        opened = opened or open_c in text
         if opened and depth <= 0:
             return j
     return None

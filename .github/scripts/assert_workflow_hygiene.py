@@ -410,8 +410,9 @@ def workflow_checks_out_code(document):
     content by any means -- not merely that it calls no `actions/checkout`. Read every
     `run:` body in the workflow and in every local action it delegates to, and look for
     `git clone`/`git fetch` of a PR ref, `gh pr checkout`, and any `curl`/`wget` of a
-    tarball or archive URL. Also inspect remote reusable workflows: their YAML is not
-    available in the caller's checkout, so this checker cannot follow them. A rationale
+    tarball or archive URL. A remote reusable workflow is refused outright in an
+    exempted workflow (remote_reusable_workflows), since its YAML is not in the
+    checkout for anyone to follow. A rationale
     that only says "no checkout action" has not
     discharged this.
     """
@@ -451,6 +452,37 @@ def checks_out_code(document, visited):
         if inner is not None and composite_checks_out_code(inner, visited):
             return True
     return False
+
+
+def remote_reusable_workflows(document, visited):
+    """Job-level `uses:` of a NON-LOCAL reusable workflow, here or in any local reusable
+    workflow this one calls.
+
+    A remote workflow's YAML is not in the checkout, so workflow_checks_out_code cannot see
+    whether it checks out head code -- and it runs with the caller's token. In a workflow
+    exempted from the target-context refusal that is an unverifiable checkout, so it is
+    refused outright (observatory review 20261031T154535Z N02-C3, owner decision on
+    PR #425). Composite actions cannot call reusable workflows, so only jobs are followed.
+    """
+    found = []
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return found
+    for job in jobs.values():
+        ref = job.get("uses") if isinstance(job, dict) else None
+        if not isinstance(ref, str):
+            continue
+        if not ref.startswith("./"):
+            found.append(ref)
+            continue
+        key = local_key(ref)
+        if key in visited:
+            continue
+        visited.add(key)
+        inner = load_local(ref)
+        if inner is not None:
+            found.extend(remote_reusable_workflows(inner, visited))
+    return found
 
 
 def composite_checks_out_code(document, visited):
@@ -693,8 +725,19 @@ def main():
 
         exempted = path.name in PRIVILEGED_TRIGGER_NO_CHECKOUT
         uses_checkout = workflow_checks_out_code(document)
+        remote_calls = remote_reusable_workflows(document, set()) if exempted else []
         for event in events:
             if event in PRIVILEGED_TRIGGERS:
+                if exempted and remote_calls:
+                    print(
+                        f"::error file={path}::This workflow is named in "
+                        "PRIVILEGED_TRIGGER_NO_CHECKOUT but calls a non-local reusable "
+                        f"workflow ({', '.join(sorted(set(remote_calls)))}). Its YAML is not in "
+                        "this checkout, so whether it checks out head code cannot be verified. "
+                        "Vendor it under .github/workflows/, or remove the exemption."
+                    )
+                    failed = True
+                    continue
                 if exempted and not uses_checkout:
                     print(
                         f"::notice file={path}::Target-context trigger exempted via "
