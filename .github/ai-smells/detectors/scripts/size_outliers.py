@@ -57,12 +57,36 @@ def signature_end(lines, i):
         joined += " " + lines[k].strip()
     return k if (SIGNATURE.match(joined) or CONST_SIGNATURE.match(joined)) else None
 
+def params_close(code, i, head):
+    """Column on code[head] just past the `)` where the signature's parentheses first balance.
+    The LAST `)` belongs to the body in `f(): number { return g() }`. Unbalanced on the head
+    line (`useCallback((a) => {`), the last `)` is the best cut there is. A type parameter
+    list before the first `(` is skipped: in `f<T extends { make(): void }>(arg: T) {` the
+    first balanced `)` closes `make()`, not the parameters."""
+    depth = sum(line.count("(") - line.count(")") for line in code[i:head])
+    angle, seen_paren = 0, depth != 0
+    for col, ch in enumerate(code[head]):
+        if not seen_paren and ch == "<":
+            angle += 1
+            continue
+        if not seen_paren and ch == ">" and angle and code[head][col - 1:col] != "=":
+            angle -= 1
+            continue
+        if angle:
+            continue
+        if ch in "()":
+            seen_paren = True
+            depth += 1 if ch == "(" else -1
+            if depth == 0:
+                return col + 1
+    return code[head].rfind(")") + 1
+
 def block_end(code, i, head):
     """Index of the line that closes the block opened by the signature at code[i..head], or
     None. A `=>` signature with no `{` (`lazy(() =>`) is closed by its parentheses instead."""
     signature = " ".join(code[i:head + 1])
     open_c, close_c = "{", "}"
-    start, first = head, code[head][code[head].rfind(")") + 1:]  # braces inside the parameter list are not the body
+    start, first = head, code[head][params_close(code, i, head):]  # braces inside the parameter list are not the body
     if signature.rstrip().endswith("=>"):
         if head + 1 < len(code) and code[head + 1].lstrip().startswith("{"):
             start, first = head + 1, code[head + 1]  # `=>` with the body's `{` on the next line

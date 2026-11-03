@@ -2,8 +2,8 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "6804782d03980fa8bb153cc0c7545219f279f605",
-    "syncedAt": "2026-11-02"
+    "commit": "d7366e65b0b6d93062383595b65718d3e7a41f3f",
+    "syncedAt": "2026-11-03"
   },
   "assets": [
     {
@@ -106,10 +106,10 @@
     },
     {
       "path": ".github/ai-smells/detectors/scripts/size_outliers.py",
-      "sha256": "d2809a51d46bf46916d88eb50ac28d2a070a913abe50a136139bcd38b965b4d9",
+      "sha256": "b56ac353f6c977940daf233712672484d09f2a0cecd580051d4224b28dcf4abd",
       "verbatim": true,
-      "commit": "6804782d03980fa8bb153cc0c7545219f279f605",
-      "syncedAt": "2026-11-02"
+      "commit": "472d9e579cf9655d5609fdaf0f236db930ac4ddb",
+      "syncedAt": "2026-11-03"
     },
     {
       "path": ".github/ai-smells/post-smell-threads.ps1",
@@ -148,10 +148,10 @@
     },
     {
       "path": ".github/scripts/assert_gate_coverage.py",
-      "sha256": "2490b1576d9addcb47b8fcff09969af673e4f05aa6b0cddd8e62004a2e69ec01",
+      "sha256": "09a6c7a33167e80de77c5f3b8a15a9329f02c1f22f24fc0a216186e0bc853c7b",
       "verbatim": true,
-      "commit": "6804782d03980fa8bb153cc0c7545219f279f605",
-      "syncedAt": "2026-11-02"
+      "commit": "d7366e65b0b6d93062383595b65718d3e7a41f3f",
+      "syncedAt": "2026-11-03"
     },
     {
       "path": ".github/scripts/assert_workflow_hygiene.py",

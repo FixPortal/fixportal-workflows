@@ -42,6 +42,7 @@ grammar, but which lines are TEXT and which are KEYS, and what `defaults:`, `env
 import json
 import math
 import os
+import posixpath
 import re
 import shlex
 import sys
@@ -1338,7 +1339,7 @@ def ends_non_zero(body, *, allow_throw=False, allow_false=True, powershell=False
     return any(form.fullmatch(segments[-1]) for form in forms)
 
 
-def powershell_ends_non_zero(body, *, throw=True):
+def powershell_ends_non_zero(body, *, throw=True, echo=True):
     """Recognise a final PowerShell `throw`/nonzero `exit` after inert message lines.
 
     The accepted `exit` range is 1-255 on EVERY job, with no Windows arm. There was
@@ -1356,13 +1357,19 @@ def powershell_ends_non_zero(body, *, throw=True):
     step-level key, no `defaults.run.shell`): the runner default is bash off
     Windows, and under bash `throw` resolves through PATH -- see _THROW. `exit`
     1-255 is a builtin under both candidate shells and stays accepted either way.
+
+    `echo=False` drops `echo` for the same unknown-shell body: unlike the cmdlets it RUNS
+    under bash, with bash's quoting, so a body pwsh reads as messages then `exit 1` can
+    hide an `exit 0` from bash (CodeRabbit, mirror PR #140). Such a body falls through to the
+    both-disciplines check in step_can_fail instead.
     """
     string = r"(?:'(?:[^'\n]|'')*'|\"(?:[^`\"\n]|`.)*\")"
     # `echo` is pwsh's alias for Write-Output and the spelling the house one-liner uses,
     # so refusing it reddened a `shell: pwsh` gate that does fail (tax portal review
     # 20261101T004738Z, c02-C5). Admitted with a QUOTED argument or none, like the
     # cmdlets: an expression argument stays refused.
-    message = re.compile(rf"(?:Write-Host|Write-Output|Write-Information|echo)(?:\s+{string})?", re.IGNORECASE)
+    words = "Write-Host|Write-Output|Write-Information" + ("|echo" if echo else "")
+    message = re.compile(rf"(?:{words})(?:\s+{string})?", re.IGNORECASE)
     final = rf"throw(?:\s+{string})?|" if throw else ""
     failure = re.compile(rf"(?:{final}exit\s+{_NONZERO_STATUS})\s*", re.IGNORECASE)
     lines = [line.strip().rstrip(";").strip() for line in body.splitlines() if line.strip()]
@@ -1517,7 +1524,7 @@ def step_can_fail(block, span, key_indent, default_shell=None):
                 probe = probe[: comment.start()] + probe[comment.end() :]
             if "$(" in probe or "${{" in probe:
                 return False, "carries a command subexpression or GitHub expression the checker cannot verify"
-            if powershell_ends_non_zero(probe, throw=shell is not None):
+            if powershell_ends_non_zero(probe, throw=shell is not None, echo=shell is not None):
                 return True, ""
             if shell is not None:
                 where = " (from `defaults.run.shell`)" if shell_from_default else ""
@@ -2140,6 +2147,13 @@ class Slice(list):
         super().__init__(lines)
         self.document = document
         self.offset = offset
+
+    # Equality stays list equality on purpose: document and offset are provenance, and a
+    # slice must compare equal to the plain list of the same lines.
+    def __eq__(self, other):
+        return list.__eq__(self, other)
+
+    __hash__ = None
 
 
 def slice_of(lines, start, end, transform=None):
@@ -3015,7 +3029,178 @@ def _recognised_suffixes(relative):
 
 
 # `npm run <name>` (or `run-script`), with any `--flag` before the script name.
-NPM_RUN = re.compile(r"\bnpm\s+(?:run|run-script)\s+(?:--?[\w-]+\s+)*([\w:.@/-]+)")
+NPM_COMMAND = re.compile(r"\bnpm\s+")
+NPM_NAME = re.compile(r"[\w:.@/-]*")
+NPM_RUN_COMMANDS = {"run", "run-script", "rum", "urn"}
+# Lifecycle commands run the package script of their own name, pre/post hooks included.
+# `npm restart` runs `restart`, or `stop` then `start` when the package has none; that choice
+# is made per package in npm_script_commands.
+NPM_LIFECYCLE_COMMANDS = {
+    "test": ("test",), "t": ("test",), "tst": ("test",), "start": ("start",), "stop": ("stop",),
+    "restart": ("restart",),
+    "install-test": ("test",), "it": ("test",),
+    "install-ci-test": ("test",), "clean-install-test": ("test",), "cit": ("test",), "sit": ("test",),
+}
+# Options that move npm into another package. Each is resolved to that package's directory
+# by npm_package_dirs; a value it cannot resolve statically is refused.
+NPM_DIRECTORY_OPTIONS = ("--prefix", "-C", "--workspace", "-w", "--workspaces", "-ws", "--ws")
+# The directory options that take a separate value, which is not the subcommand.
+NPM_VALUED_DIRECTORY_OPTIONS = ("--prefix", "-C", "--workspace", "-w")
+
+
+def npm_selectors(npm_args):
+    """(option, value) for each directory option among npm's own arguments, in order."""
+    selectors, index = [], 0
+    while index < len(npm_args):
+        option, _, value = npm_args[index].partition("=")
+        if option in ("--include-workspace-root", "--iwr"):
+            selectors.append(("--include-workspace-root", value))
+        elif option in NPM_DIRECTORY_OPTIONS:
+            if option in NPM_VALUED_DIRECTORY_OPTIONS and not value:
+                value = npm_args[index + 1] if index + 1 < len(npm_args) else ""
+                index += 1
+            selectors.append((option, value))
+        index += 1
+    return selectors
+
+
+def npm_workspace_dirs(root, base):
+    """Repository-relative directories of the workspaces the package at `base` declares."""
+    package = root / base / "package.json" if base else root / "package.json"
+    try:
+        declared = json.loads(package.read_text(encoding="utf-8-sig")).get("workspaces")
+    except (OSError, ValueError, AttributeError):
+        return []
+    if isinstance(declared, dict):
+        declared = declared.get("packages")
+    if not isinstance(declared, list):
+        return []
+    found = set()
+    for pattern in declared:
+        if not isinstance(pattern, str) or pattern.startswith("!") or ".." in pattern.split("/"):
+            continue
+        for candidate in (root / base).glob(pattern.rstrip("/")):
+            if (candidate / "package.json").is_file():
+                found.add(candidate.relative_to(root).as_posix())
+    return sorted(found)
+
+
+def npm_package_dirs(root, base, selectors):
+    """(directories, refusal) for an npm command run from `base` with `selectors`.
+
+    `--prefix`/`-C` name a directory relative to the current package; `--workspace`/`-w`
+    name a workspace of it by package name or by path (a parent path selects every
+    workspace under it); `--workspaces`/`--ws` select all of them. Each was refused
+    outright, which reddened every consumer whose gate runs `npm test` over workspaces.
+    A value read from an expression, a path leaving the repository and a workspace the
+    root package does not declare are still refused, since the script npm runs is unknown.
+    The prefix is applied first and the workspaces are those of the prefixed package;
+    `--workspaces=false` selects none; `--include-workspace-root` adds the package itself.
+    """
+    if not selectors:
+        return [base], None
+    current = base
+    prefixes = [(option, value) for option, value in selectors if option in ("--prefix", "-C")]
+    if prefixes:
+        # npm keeps the last value of a repeated option.
+        option, value = prefixes[-1]
+        if not value or re.search(r"[$`{%]", value):
+            return None, f"npm directory option `{option} {value}` is not a literal path"
+        raw = value.replace("\\", "/")
+        target = posixpath.normpath(posixpath.join(base or ".", raw))
+        # A drive-absolute `C:/x` is not absolute to posixpath, and joined to a subdirectory it
+        # reads `sub/C:/x`, so the drive is checked on the raw value.
+        if target == ".." or target.startswith("../") or posixpath.isabs(target) or re.match(r"[A-Za-z]:", raw):
+            return None, f"npm directory option `{option} {value}` leaves the repository"
+        current = "" if target == "." else target
+    include_root = any(option == "--include-workspace-root" and value.lower() in ("", "true") for option, value in selectors)
+    chosen_selectors = [
+        (option, value) for option, value in selectors
+        if option in ("--workspace", "-w") or (option in ("--workspaces", "-ws", "--ws") and value.lower() != "false")
+    ]
+    if not chosen_selectors:
+        return [current], None
+    directories = [current] if include_root else []
+    workspaces = npm_workspace_dirs(root, current)
+    for option, value in chosen_selectors:
+        if option in ("--workspaces", "-ws", "--ws"):
+            if not workspaces:
+                return None, f"npm option `{option}` selects no workspace the package at `{current or '.'}` declares"
+            directories.extend(workspaces)
+            continue
+        if not value or re.search(r"[$`{%]", value):
+            return None, f"npm workspace option `{option} {value}` is not a literal name or path"
+        path = posixpath.normpath(posixpath.join(current or ".", value.replace("\\", "/")))
+        chosen = []
+        for directory in workspaces:
+            try:
+                name = json.loads((root / directory / "package.json").read_text(encoding="utf-8-sig")).get("name")
+            except (OSError, ValueError, AttributeError):
+                name = None
+            if name == value or directory == path or directory.startswith(path + "/"):
+                chosen.append(directory)
+        if not chosen:
+            return None, f"npm workspace `{value}` is not a workspace the package at `{current or '.'}` declares"
+        directories.extend(chosen)
+    return sorted(set(directories)), None
+
+
+def npm_invocations(text):
+    """(offset, script name, selectors) for each `npm` command in `text` that runs a package script.
+
+    `npm test` / `npm t` run `scripts.test` with its hooks just as `npm run test` does, and
+    reading only `run` left the most common gate command unfollowed. A directory option
+    (`--prefix`, `-C`, `--workspace`, `-w`) was read as a flag and its VALUE as the script
+    name, so the real script went untiered (CodeRabbit, mirror PR #140). The options are
+    returned as `selectors` for npm_package_dirs to resolve to the package npm runs in.
+    """
+    for match in NPM_COMMAND.finditer(text):
+        rest = text[match.end():]
+        end = COMMAND_END.search(mask_quoted(rest))
+        tokens = _interpreter_tokens(rest[:end.start()] if end else rest)
+        npm_args = tokens[:tokens.index("--")] if "--" in tokens else tokens
+        index, command = 0, None
+        while index < len(tokens):
+            token = tokens[index]
+            if token.startswith("-"):
+                # `npm --prefix frontend run lint`: the option's value is not the subcommand.
+                index += 2 if token in NPM_VALUED_DIRECTORY_OPTIONS else 1
+                continue
+            # The leading name characters only, so `$(npm run lint)` still reads `lint`.
+            command = NPM_NAME.match(token).group(0)
+            previous = tokens[index - 1] if index else ""
+            if command in NPM_RUN_COMMANDS or command in NPM_LIFECYCLE_COMMANDS or not previous.startswith("-") or "=" in previous:
+                break
+            # `npm --loglevel warn run gate`: an unknown word straight after a bare option is
+            # read as that option's value, so the real subcommand after it is still found.
+            index, command = index + 1, None
+        if command is None:
+            continue
+        if command not in NPM_LIFECYCLE_COMMANDS and command not in NPM_RUN_COMMANDS:
+            # `npm ci --prefix frontend` runs no package script this reading follows.
+            continue
+        selectors = npm_selectors(npm_args)
+        if command in NPM_LIFECYCLE_COMMANDS:
+            for name in NPM_LIFECYCLE_COMMANDS[command]:
+                yield match.start(), name, selectors
+        elif command in NPM_RUN_COMMANDS:
+            index += 1
+            while index < len(tokens) and tokens[index].startswith("-"):
+                index += 1
+            name = NPM_NAME.match(tokens[index]).group(0) if index < len(tokens) else ""
+            if name:
+                yield match.start(), name, selectors
+            # `npm run --loglevel warn gate`: after a bare option the first word may be its
+            # value, so the next word is followed too. A missing script is skipped, so this
+            # only adds candidates.
+            previous = tokens[index - 1] if 0 < index < len(tokens) else ""
+            if name and previous.startswith("-") and "=" not in previous:
+                index += 1
+                while index < len(tokens) and tokens[index].startswith("-"):
+                    index += 1
+                following = NPM_NAME.match(tokens[index]).group(0) if index < len(tokens) else ""
+                if following:
+                    yield match.start(), following, selectors
 
 
 def printed_only(line, start):
@@ -3058,14 +3243,23 @@ def npm_script_commands(root, bases, name, visited):
             continue
         if not isinstance(scripts, dict):
             continue
+        if name == "restart" and not isinstance(scripts.get("restart"), str):
+            # With no `restart` script, `npm restart` runs `stop` then `start` (its own
+            # pre/post hooks still run around them).
+            for fallback in ("stop", "start"):
+                commands.extend(npm_script_commands(root, [base], fallback, visited))
         for hook in (f"pre{name}", name, f"post{name}"):
             command = scripts.get(hook)
             if not isinstance(command, str) or (base, hook) in visited:
                 continue
             visited.add((base, hook))
-            commands.append((base, command))
-            for nested in NPM_RUN.finditer(command):
-                commands.extend(npm_script_commands(root, [base], nested.group(1), visited))
+            commands.append((base, command, None))
+            for _, nested, selectors in npm_invocations(command):
+                directories, refusal = npm_package_dirs(root, base, selectors)
+                if refusal:
+                    commands.append((base, None, refusal))
+                else:
+                    commands.extend(npm_script_commands(root, directories, nested, visited))
     return commands
 
 
@@ -3093,10 +3287,25 @@ def script_references(body, directories, root):
     markers = {directory for directory in directories if directory.startswith("!")}
     for relative, extra in interpreter_references(folded, bases, root):
         yield relative, extra | markers
-    for match in NPM_RUN.finditer(folded):
-        if printed_only(folded, match.start()):
+    for offset, name, selectors in npm_invocations(folded):
+        if printed_only(folded, offset):
             continue
-        for base, command in npm_script_commands(root, bases, match.group(1), set()):
+        packages, refusals = [], []
+        for base in bases:
+            resolved, refusal = npm_package_dirs(root, base, selectors)
+            if refusal:
+                refusals.append(refusal)
+            else:
+                packages.extend(directory for directory in resolved if directory not in packages)
+        # The root is always a candidate beside a working-directory, so a selector is refused
+        # only when it resolves from none of them (`--prefix ../x` leaves the root, not `sub`).
+        if not packages:
+            for refusal in refusals:
+                yield _refusal(refusal)
+        for base, command, nested_refusal in npm_script_commands(root, packages, name, set()):
+            if nested_refusal:
+                yield _refusal(nested_refusal)
+                continue
             for script in GATE_SCRIPT.finditer(command):
                 yield script.group(1).replace("\\", "/"), directories | ({base} if base else set())
             # `"gate": "python3 gate.py"` runs a root-level script GATE_SCRIPT cannot see (CodeRabbit, PR #426).
@@ -3382,12 +3591,12 @@ def gate_script_paths(lines, jobs, needs, gate_job, root):
     """
     found = {}
     seen_bodies = set()
-    for job_id, _, body, directories in gated_run_bodies(lines, jobs, needs, gate_job, root):
-        body_key = (job_id, tuple(body), tuple(sorted(directories)))
+    for job_id, _, body, body_directories in gated_run_bodies(lines, jobs, needs, gate_job, root):
+        body_key = (job_id, tuple(body), tuple(sorted(body_directories)))
         if body_key in seen_bodies:
             continue
         seen_bodies.add(body_key)
-        for relative, directories in script_references(body, directories, root):
+        for relative, directories in script_references(body, body_directories, root):
             unsupported = next((directory for directory in directories if directory.startswith("!unsupported ")), None)
             if unsupported:
                 sys.exit(f"{root}: {unsupported[1:]}")
@@ -3667,7 +3876,7 @@ def reusable_workflow_feeder(lines, jobs, job_id, job_indent, root):
     return None
 
 
-def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty="fail", step_exempt=frozenset()):
+def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty="fail", step_exempt=frozenset(), step_usage=None):
     """Assert one file's full gate contract. Returns True when the file contains the
     gate job (and every assertion ran), False when it has no gate job at all.
 
@@ -3675,6 +3884,12 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
     mode a job named in GATE_EXEMPT exists in exactly one workflow, so validating it
     against a single file's job set here reddened every OTHER workflow that also
     contains the gate job with a false "names jobs that do not exist".
+
+    The same holds for a stale GATE_STEP_EXEMPT entry. `step_usage` is directory mode's
+    (used entries, feeder job ids) pair, shared by every file and judged once after the
+    loop: judged per file, `build/lint` used by ci.yml's `build` read as stale in a
+    release.yml whose own `build` has no tolerated step (CodeRabbit, mirror PR #140; issue #429). Without it
+    (file mode) the file is judged on its own.
 
     READ AS utf-8-sig. A plain utf-8 read leaves a leading BOM in the first character,
     so `JOBS_KEY` -- anchored at `^` -- never matched a BOM'd file's `jobs:` line, and
@@ -3850,7 +4065,8 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             "A tolerated job cannot provide a required check or serve as the aggregate gate."
         )
 
-    used_step_exempt = set()
+    used_step_exempt, step_feeders = step_usage if step_usage is not None else (set(), set())
+    step_feeders |= set(needs) - {gate_job}
     assert_feeder_steps(workflow_path, lines, jobs, set(needs) - {gate_job}, step_exempt, used_step_exempt)
 
     # A feeder that is a LOCAL REUSABLE WORKFLOW runs that file's jobs, and the caller
@@ -3882,16 +4098,8 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             )
         assert_feeder_steps(callee_path, callee_lines, callee_jobs, set(callee_jobs), step_exempt, used_step_exempt, label=f"{feeder}/")
 
-    stale = sorted(
-        entry for entry in step_exempt
-        if entry.split("/", 1)[0] in set(needs) - {gate_job} and entry not in used_step_exempt
-    )
-    if stale:
-        sys.exit(
-            f"{workflow_path}: GATE_STEP_EXEMPT names step(s) that do not exist or are not "
-            f"tolerated: {', '.join(stale)}. Each entry is `<job>/<step id>` for a feeder step "
-            "carrying `continue-on-error`."
-        )
+    if step_usage is None:
+        assert_step_exempt_used(workflow_path, step_exempt, used_step_exempt, step_feeders)
 
     assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs)
     assert_gate_scripts(workflow_path, lines, jobs, needs, gate_job)
@@ -3901,6 +4109,20 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
         "which runs always() and aggregates its needs."
     )
     return True
+
+
+def assert_step_exempt_used(where, step_exempt, used, feeders):
+    """Refuse a GATE_STEP_EXEMPT entry for a gated feeder that exempted no tolerated step."""
+    stale = sorted(
+        entry for entry in step_exempt
+        if entry.split("/", 1)[0] in feeders and entry not in used
+    )
+    if stale:
+        sys.exit(
+            f"{where}: GATE_STEP_EXEMPT names step(s) that do not exist or are not "
+            f"tolerated: {', '.join(stale)}. Each entry is `<job>/<step id>` for a feeder step "
+            "carrying `continue-on-error`."
+        )
 
 
 def split_env(name):
@@ -3985,11 +4207,15 @@ def main(argv):
         )
 
     gated = 0
+    step_usage = (set(), set())
     for workflow_path in files:
         # Same ValueError-to-refusal translation as file mode: a delegated action the
         # checker cannot classify must redden the run with a message, not a traceback.
         try:
-            result = check_file(workflow_path, gate_job, exempt, conditional_exempt, on_empty="skip", step_exempt=step_exempt)
+            result = check_file(
+                workflow_path, gate_job, exempt, conditional_exempt,
+                on_empty="skip", step_exempt=step_exempt, step_usage=step_usage,
+            )
         except ValueError as error:
             sys.exit(str(error))
         if result is None:
@@ -4009,6 +4235,7 @@ def main(argv):
 
     if not gated:
         sys.exit(f"{target}: no file contains a '{gate_job}' job -- refusing to report coverage over nothing.")
+    assert_step_exempt_used(target, step_exempt, *step_usage)
 
 
 if __name__ == "__main__":
