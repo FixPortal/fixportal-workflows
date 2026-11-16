@@ -40,7 +40,6 @@
     ".github/actions/**",
     ".claude/review-policy.json",
     ".coderabbit.yaml",
-    ".github/dependabot.yml",
     ".github/workflows/review-tier.yml"
   ],
 
