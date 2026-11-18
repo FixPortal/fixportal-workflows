@@ -132,6 +132,12 @@ def load(path):
         return yaml.safe_load(handle)
 
 
+# Everything load() can raise on a file the scan was pointed at. The UTF-8 decode and the
+# open are part of reading it: catching only YAMLError let a non-UTF-8 workflow abort the
+# whole scan with a traceback and no `::error file=` annotation.
+LOAD_ERRORS = (yaml.YAMLError, UnicodeDecodeError, OSError)
+
+
 def load_local(path):
     """Parse a local YAML file, or None when it is missing, unparseable, or not a
     mapping. Used on the DELEGATION paths, where a broken file is reported by its own
@@ -140,7 +146,7 @@ def load_local(path):
         return None
     try:
         document = load(Path(path))
-    except yaml.YAMLError:
+    except LOAD_ERRORS:
         return None
     return document if isinstance(document, dict) else None
 
@@ -410,9 +416,11 @@ def workflow_checks_out_code(document):
     content by any means -- not merely that it calls no `actions/checkout`. Read every
     `run:` body in the workflow and in every local action it delegates to, and look for
     `git clone`/`git fetch` of a PR ref, `gh pr checkout`, and any `curl`/`wget` of a
-    tarball or archive URL. A remote reusable workflow is refused outright in an
-    exempted workflow (remote_reusable_workflows), since its YAML is not in the
-    checkout for anyone to follow. A rationale
+    tarball or archive URL. A remote reusable workflow, and any remote action outside
+    `actions/*` (step level, or reached through a local composite or reusable workflow),
+    is refused outright in an exempted workflow (remote_reusable_workflows,
+    remote_third_party_actions), since its YAML is not in the checkout for anyone to
+    follow. A rationale
     that only says "no checkout action" has not
     discharged this.
     """
@@ -485,6 +493,53 @@ def remote_reusable_workflows(document, visited):
     return found
 
 
+def remote_third_party_actions(document, visited):
+    """Step- and job-level `uses:` of a remote action or workflow OUTSIDE `actions/*`, here
+    or reached through a local composite action or a local reusable workflow.
+
+    The sibling of remote_reusable_workflows, for the same reason and with the same
+    consequence: a remote action's action.yml is not in the checkout, so a composite that
+    calls actions/checkout internally (or a third-party checkout action) cannot be seen by
+    checks_out_code, and an exempted workflow would be certified as never checking out head
+    code while doing exactly that (review 20261116T000000Z AR-2). `actions/*` is exempt: it
+    is GitHub's own namespace, held to the vN rule in check_ref, and the one checkout action
+    in it is detected by name. Anything else is refused.
+    """
+    found = []
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return found
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        refs = [job["uses"]] if isinstance(job.get("uses"), str) else []
+        steps = job.get("steps")
+        if isinstance(steps, list):
+            refs += [s["uses"] for s in steps if isinstance(s, dict) and isinstance(s.get("uses"), str)]
+        for ref in refs:
+            found.extend(_remote_third_party_in_ref(ref, visited))
+    return found
+
+
+def _remote_third_party_in_ref(ref, visited):
+    if not ref.startswith("./"):
+        return [] if ref_owner(ref).startswith("actions/") else [ref]
+    key = local_key(ref)
+    if key in visited:
+        return []
+    visited.add(key)
+    if is_reusable_workflow_ref(ref):
+        inner = load_local(ref)
+        return remote_third_party_actions(inner, visited) if inner is not None else []
+    inner = load_local(local_manifest(ref))
+    if inner is None:
+        return []
+    found = []
+    for inner_ref in composite_step_refs(inner):
+        found.extend(_remote_third_party_in_ref(inner_ref, visited))
+    return found
+
+
 def composite_checks_out_code(document, visited):
     """The same question asked of a composite action manifest, recursively."""
     for ref in composite_step_refs(document):
@@ -524,8 +579,11 @@ def check_ref(job, ref, origin, unpinned):
     # pin with an `@sha256:` digest; an action pins to a bare 40-hex commit. So the
     # digest settles the cases the other two miss.
     revision = ref.split("@", 1)[1] if "@" in ref else ""
+    # Case-folded ONLY for the digest tell, as is_pinned and is_digest_ref do. The vN rule
+    # below stays case-sensitive: git tags are, so `actions/checkout@V7` is not `@v7`.
+    is_digest = revision.lower().startswith("sha256:")
     action_shaped = (
-        not revision.startswith("sha256:")
+        not is_digest
         and "/" in owner
         and "." not in owner.split("/", 1)[0]
         and ":" not in owner
@@ -565,7 +623,7 @@ def check_ref(job, ref, origin, unpinned):
     # Digest-pinned refs are excluded: only a container IMAGE pins with `@sha256:`,
     # and an image that happens to sit under an `actions/` name is not an action the
     # major-tag rule speaks about.
-    if owner.startswith("actions/") and not revision.startswith("sha256:"):
+    if owner.startswith("actions/") and not is_digest:
         if re.fullmatch(r"v\d+(\.\d+)*", revision):
             # Conformant -- a vN release tag (major or dotted minor/patch). Counted
             # only so the summary shows the split.
@@ -653,8 +711,8 @@ def check_local_action(job, ref, origin, unpinned, visited):
         return True, unpinned
     try:
         inner = load(manifest)
-    except yaml.YAMLError as error:
-        print(f"::error file={manifest}::Not parseable as YAML: {error}")
+    except LOAD_ERRORS as error:
+        print(f"::error file={manifest}::Not parseable as YAML (or not readable UTF-8): {error}")
         return True, unpinned
     if not isinstance(inner, dict):
         # Reported, not skipped. Returning clean here made a manifest that parses to a
@@ -705,8 +763,8 @@ def main():
     for path in paths:
         try:
             document = load(path)
-        except yaml.YAMLError as error:
-            print(f"::error file={path}::Not parseable as YAML: {error}")
+        except LOAD_ERRORS as error:
+            print(f"::error file={path}::Not parseable as YAML (or not readable UTF-8): {error}")
             failed = True
             continue
         if not isinstance(document, dict):
@@ -725,16 +783,22 @@ def main():
 
         exempted = path.name in PRIVILEGED_TRIGGER_NO_CHECKOUT
         uses_checkout = workflow_checks_out_code(document)
-        remote_calls = remote_reusable_workflows(document, set()) if exempted else []
+        remote_calls = (
+            remote_reusable_workflows(document, set()) + remote_third_party_actions(document, set())
+            if exempted
+            else []
+        )
         for event in events:
             if event in PRIVILEGED_TRIGGERS:
                 if exempted and remote_calls:
                     print(
                         f"::error file={path}::This workflow is named in "
                         "PRIVILEGED_TRIGGER_NO_CHECKOUT but calls a non-local reusable "
-                        f"workflow ({', '.join(sorted(set(remote_calls)))}). Its YAML is not in "
+                        "workflow or a remote action outside actions/* "
+                        f"({', '.join(sorted(set(remote_calls)))}). Its YAML is not in "
                         "this checkout, so whether it checks out head code cannot be verified. "
-                        "Vendor it under .github/workflows/, or remove the exemption."
+                        "Vendor it under .github/workflows/ or .github/actions/, or remove the "
+                        "exemption."
                     )
                     failed = True
                     continue

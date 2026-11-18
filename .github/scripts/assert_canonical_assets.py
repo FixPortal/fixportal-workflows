@@ -23,13 +23,17 @@ Hash contract (shared with sync-canonical-asset-manifest.ps1, which writes what 
 reads): UTF-8 with BOM tolerated, line endings normalised CRLF/CR -> LF, hashed as UTF-8
 with no BOM. Line endings and BOM are normalised -- git flips those per
 .gitattributes, and a hash that red-lines a CRLF checkout is a false-positive factory.
-One more thing is masked: on a `uses: owner/repo@<40-hex sha>` line, the SHA and any
-trailing `# vX` comment are replaced by a fixed token before hashing. Dependabot bumps
-those pins in consuming repos on its own schedule; hashing them red-lined every bump of
-a canonical workflow. The action NAME stays hashed, and a non-SHA ref (`@v3`, `@main`)
-is not masked, so swapping the action or unpinning it still reads DIVERGED -- and
-assert_workflow_hygiene.py separately enforces SHA pinning. Everything else is exact,
-because exactness is the point.
+Two things more are masked, both on `uses:` lines, and in both the revision and any
+trailing `# vX` comment are replaced by a fixed token before hashing:
+  - `uses: owner/repo@<40-hex sha>` -- any owner. Third-party actions are SHA-pinned.
+  - `uses: actions/<name>@vN[.M...]` -- first-party release tags. House policy pins
+    `actions/*` by tag, not SHA (assert_workflow_hygiene.py enforces that), so a SHA-only
+    mask left every first-party bump hashed: Dependabot's next major red-lined CI Gate.
+Dependabot bumps those pins in consuming repos on its own schedule; hashing them
+red-lined every bump of a canonical workflow. The action NAME stays hashed, and any other
+ref (`@main`, a third-party `@v3`, `@v7-evil`) is not masked, so swapping the action or
+unpinning it still reads DIVERGED. Everything else is exact, because exactness is the
+point.
 
 Pure Python, stdlib only, read-only, no network -- same reasons as
 assert_gate_coverage.py (a shell wrapper cannot survive CRLF; Python does not care).
@@ -68,14 +72,21 @@ this repository, so an edit made here alone cannot be merged.
 """
 
 
-# Must stay equivalent to the generator's $PinnedUses pattern -- both sides of the contract.
+# Must stay equivalent to the generator's $PinnedUses and $PinnedFirstPartyTag patterns --
+# both sides of the contract.
 PINNED_USES = re.compile(r"^([ \t]*(?:-[ \t]+)?uses:[ \t]*[^\s@#]+@)[0-9a-f]{40}(?:[ \t]+#.*)?$", re.M)
+# First-party actions are pinned by release tag (`actions/checkout@v7`), not by SHA: house
+# policy, enforced by assert_workflow_hygiene.py. Dependabot moves those tags too.
+PINNED_FIRST_PARTY_TAG = re.compile(
+    r"^([ \t]*(?:-[ \t]+)?uses:[ \t]*actions/[^\s@#]+@)v\d+(?:\.\d+)*(?:[ \t]+#.*)?$", re.M
+)
 
 
 def asset_hash(path: Path) -> str:
     text = path.read_bytes().decode("utf-8-sig")
     normalised = text.replace("\r\n", "\n").replace("\r", "\n")
     normalised = PINNED_USES.sub(r"\1<pinned>", normalised)
+    normalised = PINNED_FIRST_PARTY_TAG.sub(r"\1<pinned>", normalised)
     return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
 

@@ -85,7 +85,11 @@ COMMENT_OR_BLANK = re.compile(r"^\s*(?:\#.*)?$")
 # can never reach the failing step and leaves the required gate green.
 FAILURE_CONDITION_ATOM = re.compile(
     rf"(?:contains\(needs\.({ID}|\*)\.result,['\"](failure|cancelled)['\"]\)|"
-    rf"needs\.({ID})\.result(?:==['\"](failure|cancelled)['\"]|!=['\"]success['\"]))"
+    rf"needs\.({ID})\.result(?:==['\"](failure|cancelled)['\"]|!=['\"]success['\"]))",
+    # GitHub compares strings case-insensitively (github_equal below does too), so
+    # `contains(needs.*.result, 'Failure')` is a correct gate. Callers casefold the
+    # captured outcome before comparing it with the lowercase adverse names.
+    re.IGNORECASE,
 )
 # A REFINEMENT, not a coverage atom: `needs.<job>.result != 'skipped'` narrows a
 # `!= 'success'` atom about the same job rather than covering an outcome of its own.
@@ -95,7 +99,7 @@ FAILURE_CONDITION_ATOM = re.compile(
 # legitimately skips must not fail the gate by skipping, which is exactly what
 # GATE_CONDITIONAL_EXEMPT is for. Refusing every residual conjunction rejected that, and
 # a correct gate of this shape then reads as "aggregates nothing".
-CONDITION_REFINEMENT = re.compile(rf"needs\.({ID})\.result!=['\"]skipped['\"]")
+CONDITION_REFINEMENT = re.compile(rf"needs\.({ID})\.result!=['\"]skipped['\"]", re.IGNORECASE)
 BACKSLASH = "\\"
 
 # The gate step's failing command, in the forms this checker will vouch for. Anything
@@ -890,7 +894,7 @@ def strip_outer_parentheses(expression):
 
 
 _UNKNOWN = object()
-_LITERAL = r"(?:true|false|null|-?[0-9]+(?:\.[0-9]+)?|'(?:''|[^'])*'|\"(?:\\.|[^\"\\])*\")"
+_LITERAL = r"(?:true|false|null|-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|'(?:''|[^'])*'|\"(?:\\.|[^\"\\])*\")"
 
 
 def literal_value(value):
@@ -940,9 +944,64 @@ def github_equal(left, right):
     return not (math.isnan(left_number) or math.isnan(right_number)) and left_number == right_number
 
 
+def negated_literal_readings(operand):
+    """(`(!lhs) op rhs`, `!(lhs op rhs)`) for a negated comparison of two LITERALS, else None.
+
+    Both are folded with the same literal rules as an un-negated comparison. A side that
+    is not a literal, or whose fold is unknown, makes the pair unreadable (None).
+    """
+    match = re.fullmatch(rf"\s*({_LITERAL})\s*(==|!=|<=|>=|<|>)\s*({_LITERAL})\s*", operand, re.IGNORECASE)
+    if not match:
+        return None
+    # A string operand is coerced to a number by the runner (`' '` is 0, `'1'` is 1) and
+    # github_equal does not model every such conversion, so a string comparison is left UNKNOWN
+    # rather than folded on a coercion this checker may get wrong.
+    if match.group(1)[:1] in ("'", '"') or match.group(3)[:1] in ("'", '"'):
+        return None
+    left_truth = static_truth(match.group(1), True)
+    whole = static_truth(operand, True)
+    if left_truth is _UNKNOWN or whole is _UNKNOWN:
+        return None
+    negated = not left_truth
+    # `(!lhs)` is a boolean; an ordered comparison coerces it to 1 or 0 first.
+    operand_text = ("1" if negated else "0") if match.group(2) in ("<", "<=", ">", ">=") else ("true" if negated else "false")
+    unary_first = static_truth(f"{operand_text} {match.group(2)} {match.group(3)}", True)
+    if unary_first is _UNKNOWN:
+        return None
+    return unary_first, not whole
+
+
+def ambiguous_negated_literal(condition):
+    """True for a literal-only negated comparison whose two precedence readings disagree.
+
+    `!1 == 2` is `(!1) == 2` (false) or `!(1 == 2)` (true). The runner's precedence is
+    UNVERIFIED here, so static_truth leaves it UNKNOWN; on a feeder step that would pass an
+    expression no real workflow writes on purpose, so assert_feeder_steps refuses it.
+    """
+    if static_truth(condition) is not _UNKNOWN:
+        # Folded already (`true || !1 == 2` is true), so the ambiguous branch cannot affect the result.
+        return False
+
+    def ambiguous(expression):
+        expression = strip_outer_parentheses(expression.strip())
+        for operator in ("||", "&&"):
+            parts = split_top_level(expression, operator)
+            if len(parts) > 1:
+                return any(ambiguous(part) for part in parts)
+        if not expression.startswith("!"):
+            return False
+        readings = negated_literal_readings(expression[1:])
+        return readings is not None and readings[0] is not readings[1]
+
+    expression = decode_yaml_scalar(strip_inline_comment(condition).strip()).strip()
+    if expression.startswith("${{") and expression.endswith("}}"):
+        expression = expression[3:-2].strip()
+    return ambiguous(expression)
+
+
 def static_truth(condition, _nested=False):
     """Fold only literal boolean branches; unknown GitHub context/function values stay unknown."""
-    expression = (condition if _nested else decode_yaml_scalar(strip_comment(condition).strip())).strip()
+    expression = (condition if _nested else decode_yaml_scalar(strip_inline_comment(condition).strip())).strip()
     if expression.startswith("${{") and expression.endswith("}}"):
         expression = expression[3:-2].strip()
     expression = strip_outer_parentheses(expression)
@@ -967,8 +1026,13 @@ def static_truth(condition, _nested=False):
         # `!` is UNARY and binds tighter than a comparison, so `!1 == 2` is `(!1) == 2`,
         # not `!(1 == 2)`. Folding the latter credited coverage to a step that never runs
         # The precedence is UNVERIFIED against
-        # the runner, so a negated comparison is left UNKNOWN rather than folded either way.
+        # the runner, so a negated comparison folds only when BOTH readings agree: `!1 == 1`
+        # is false as `(!1) == 1` and as `!(1 == 1)`, so a step guarded by it never runs and
+        # must meet the always-skipped refusal. Where they disagree it stays UNKNOWN.
         if any(len(split_top_level(operand, operator)) > 1 for operator in ("==", "!=", "<=", ">=", "<", ">")):
+            readings = negated_literal_readings(operand)
+            if readings is not None and readings[0] is readings[1]:
+                return readings[0]
             return _UNKNOWN
         value = static_truth(operand, True)
         return not value if value is True or value is False else _UNKNOWN
@@ -982,7 +1046,7 @@ def static_truth(condition, _nested=False):
     # A bare number or null folds by GitHub truthiness: `0` and `null` are false, every
     # other number true. Left UNKNOWN, `if: ${{ 0 }}` on a feeder step never met the
     # always-skipped refusal.
-    if re.fullmatch(r"-?[0-9]+(?:\.[0-9]+)?|null", expression, re.IGNORECASE):
+    if re.fullmatch(r"-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|null", expression, re.IGNORECASE):
         return bool(literal_value(expression.lower()))
     # `always()` is unconditionally true in GitHub Actions, so it is a literal boolean here
     # in every sense that matters. Leaving it UNKNOWN made failure_atoms keep it as a
@@ -1263,6 +1327,56 @@ def mask_quoted(line, *, powershell=False):
     return "".join(out)
 
 
+# U+2018-U+201B and U+201C-U+201E. PowerShell treats every one of these as a quote
+# character, so `Write-Host "a<U+201C>; exit 0; <U+201C>b"` closes its string at the curly
+# quote and runs `exit 0`, while an ASCII-only reading sees one harmless string. Refusing the
+# characters fails closed and costs nothing: a gate body has no reason to carry them.
+TYPOGRAPHIC_QUOTES = re.compile("[‘-„]")
+
+
+def comment_hides_code(text, disciplines=(False, True)):
+    """True when an UNQUOTED `#` comment contains a quote or ends in a backslash.
+
+    A shell ends a comment at the newline, so a trailing `\\` continues nothing and a quote
+    inside it opens nothing. The checker folds backslash-newline and masks quotes BEFORE it
+    drops comments, so a hidden line (`echo x # see logs \\` / `exit 0`) or a quote that
+    appears to span lines can make a body read as a failing form when it exits zero. Rather
+    than re-implement each shell's comment rules, refuse the two spellings that expose the
+    ordering: a comment that ends in a backslash or holds a quote character.
+
+    Scanned left to right with the quote state of each discipline in `disciplines` in turn
+    (False is bash, True is PowerShell). A caller that has resolved the effective shell passes
+    only that one: reading `\\"` as an escape in a body pwsh runs, or a backtick as one in a body
+    bash runs, mis-tracks the quotes. With the shell unknown both are tried and either counts.
+    """
+    for powershell in disciplines:
+        quote = None
+        i = 0
+        while i < len(text):
+            char = text[i]
+            if quote is not None:
+                if char == ("`" if powershell else "\\") and quote == '"':
+                    i += 2
+                    continue
+                if char == quote:
+                    quote = None
+            elif char in "'\"":
+                quote = char
+            elif char == ("`" if powershell else "\\"):
+                i += 2
+                continue
+            elif char == "#" and (i == 0 or text[i - 1].isspace()):
+                end = text.find("\n", i)
+                end = len(text) if end == -1 else end
+                comment = text[i:end]
+                if comment.rstrip().endswith("\\") or "'" in comment or '"' in comment:
+                    return True
+                i = end
+                continue
+            i += 1
+    return False
+
+
 def ends_non_zero(body, *, allow_throw=False, allow_false=True, powershell=False):
     """True when the gate body is a RECOGNISED failing form, as a WHOLE.
 
@@ -1502,6 +1616,18 @@ def step_can_fail(block, span, key_indent, default_shell=None):
         # with its own quote state is what let `echo "\n exit 1 \n"` and a
         # backslash-continued echo read as failable commands.
         joined = "\n".join(body)
+        if TYPOGRAPHIC_QUOTES.search(joined):
+            return False, (
+                "carries a typographic quote (U+2018-U+201E), which PowerShell reads as a "
+                "string delimiter and an ASCII-only reading does not; use ASCII quotes"
+            )
+        comment_disciplines = (False, True) if shell is None else ((True,) if shell.startswith("pwsh") else (False,))
+        if comment_hides_code(joined, comment_disciplines):
+            return False, (
+                "has a `#` comment that contains a quote or ends in a backslash, which the "
+                "checker and the shell read differently; move the quote out of the comment "
+                "and do not end a comment line with a backslash"
+            )
         joined = re.sub(r"\\\n\s*", " ", joined)
         if shell is None or shell.startswith("pwsh"):
             # STRIP COMMENTS BEFORE THE FULLMATCH, the way the bash path already does.
@@ -1608,9 +1734,16 @@ def step_conditions(block, indent):
     """
     step_if_value = step_key_pattern(indent, "if")
     other_block_key = other_block_key_pattern(indent)
+    # The parser knows which lines are TEXT: the continuation lines of any multi-line scalar.
+    # A multi-line quoted `name:` can hold a line shaped like `if: <condition>` at the step's
+    # own key column; read as a key it was credited to a step whose real `if:` is narrower.
+    payloads = run_payload_indexes(block)
     index = 0
     skip_until_indent = None
     while index < len(block):
+        if index in payloads:
+            index += 1
+            continue
         line = block[index]
 
         if skip_until_indent is not None:
@@ -1629,7 +1762,21 @@ def step_conditions(block, indent):
                 prefix = block[prior].lstrip()
                 prior_indent = len(block[prior]) - len(prefix)
                 if prefix.startswith("- ") and prior_indent < key_column:
-                    key_column = prior_indent + 2
+                    # The step's keys start at the first non-space after the dash, not
+                    # always two columns on: `-   if: ...` is valid YAML. A dash that
+                    # carries only a comment (`-  # note`) puts its keys on the next
+                    # lines, two columns in, so the comment's own column is not one.
+                    rest = prefix[1:].lstrip()
+                    if rest and not rest.startswith("#"):
+                        key_column = prior_indent + len(prefix) - len(rest)
+                    else:
+                        # The keys follow on later lines, at whatever column the first of
+                        # them uses: read it, rather than assuming two columns in.
+                        key_column = prior_indent + 2
+                        for follower in block[prior + 1 :]:
+                            if follower.strip() and not follower.lstrip().startswith("#"):
+                                key_column = len(follower) - len(follower.lstrip())
+                                break
                     break
             if len(match.group(1)) != key_column:
                 index += 1
@@ -1739,7 +1886,7 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
             for match in matches:
                 job_id = match.group(1) or match.group(3)
                 outcome = match.group(2) or match.group(4)
-                if outcome and outcome != adverse:
+                if outcome and outcome.casefold() != adverse:
                     continue
                 outcomes = {adverse}
                 referenced.setdefault(job_id, set()).update(outcomes)
@@ -2252,16 +2399,39 @@ def assert_readable_shapes(root, text, name=None):
       * a flow collection on the line AFTER its key reads as an empty value, so `needs:`
         loses its list (XM1; simulator-frontend 20261101T004730Z, S2).
 
-    Anchors, aliases and tags are NOT refused: the composer resolves them, the parsed
-    reads below see through them, and the job-level forms are accepted by existing
+    Also refused:
+
+      * a PLAIN (unquoted) multi-line value for `if`, `run`, `shell` or `continue-on-error`:
+        YAML folds the continuation lines into one value (`if: always()` then `&& false`
+        is `always() && false`), while every line reader takes the first line as the whole
+        value. Write the value on one line or as a block scalar;
+      * a step that is an ALIAS of another step or of a whole `steps:` sequence: the alias
+        line carries no `run:`/`uses:` key, so a scan over lines never examines the step
+        it stands for (a tolerated or skipped step hides there).
+
+    Anchors, aliases and tags are otherwise NOT refused: the composer resolves them, the
+    parsed reads below see through them, and the job-level forms are accepted by existing
     fixtures. Raises ValueError, which every caller turns into a fail-closed exit.
     """
     where = f"{name}: " if name else ""
+    step_nodes_seen = set()
     for node in iter_nodes(root):
         if not isinstance(node, yaml.MappingNode):
             continue
         for key, value in node.value:
             line = key.start_mark.line + 1
+            if (
+                isinstance(key, yaml.ScalarNode)
+                and key.value in ("if", "run", "shell", "continue-on-error")
+                and isinstance(value, yaml.ScalarNode)
+                and value.style is None
+                and value.end_mark.line > value.start_mark.line
+            ):
+                raise ValueError(
+                    f"{where}line {line}: a plain multi-line value for `{key.value}` is unsupported; "
+                    "YAML folds it into one value that a line scan reads as its first line. "
+                    "Write it on one line, or as a block scalar (`|` or `>-`)"
+                )
             if key.tag == MERGE_TAG:
                 raise ValueError(f"{where}line {line}: YAML merge key `<<` is unsupported; spell the keys out")
             raw_key = text[key.start_mark.index : key.end_mark.index]
@@ -2272,7 +2442,17 @@ def assert_readable_shapes(root, text, name=None):
             if isinstance(key, yaml.ScalarNode) and key.value == "steps" and isinstance(value, yaml.SequenceNode):
                 if value.flow_style and value.value:
                     raise ValueError(f"{where}line {line}: flow-style `steps:` is unsupported; write each step as a `- ` block item")
+                # An alias resolves to the node where its ANCHOR was written, so a node that
+                # sits outside the span it is used in is an alias, wherever the anchor lives
+                # (matrix data, another job). A node met twice is an alias within the same
+                # span. Position catches the first, identity the second.
+                if id(value) in step_nodes_seen or value.start_mark.index < key.end_mark.index:
+                    raise ValueError(f"{where}line {line}: a `steps:` sequence that is an alias of another is unsupported; write the steps out")
+                step_nodes_seen.add(id(value))
                 for item in value.value:
+                    if id(item) in step_nodes_seen or not (value.start_mark.index <= item.start_mark.index <= value.end_mark.index):
+                        raise ValueError(f"{where}line {item.start_mark.line + 1}: a step that is an alias of another step is unsupported; write the step out")
+                    step_nodes_seen.add(id(item))
                     if isinstance(item, yaml.MappingNode) and item.flow_style:
                         raise ValueError(f"{where}line {item.start_mark.line + 1}: a flow-mapping step `{{...}}` is unsupported; write the step as a block mapping")
 
@@ -2963,6 +3143,10 @@ def changes_directory(body):
             mask_quoted("\n".join(body), powershell=powershell)
         )
         for visible in unquoted.split("\n"):
+            # A comment changes no directory: `python3 gate.py # ; cd sub` must not read as
+            # one. Quoted spans are already masked, so an unquoted `#` at a word start
+            # really does open a comment.
+            visible = re.sub(r"(?:^|(?<=\s))#.*$", "", visible)
             if DIRECTORY_CHANGE.search(visible):
                 return True
     text = "\n".join(body)
@@ -2972,6 +3156,10 @@ def changes_directory(body):
             if not (SEGMENT_DIRECTORY_CHANGE.search(opening_backticks_only(content)) and GATE_SCRIPT.search(content)):
                 continue
             line_start = text.rfind("\n", 0, start) + 1
+            # Judged on the WHOLE-body masked copy, so a `#` inside an earlier multi-line
+            # string is not read as a comment that discards a real quoted command.
+            if re.search(r"(?:^|[ \t])#", masked[line_start:start]):
+                continue
             line_end = text.find("\n", end)
             # MASKED, so an earlier string that already closed on this line (`echo "$(date)";`)
             # cannot leak its `$(` into this one's test; an unquoted `$(` stays visible.
@@ -3429,6 +3617,85 @@ def interpreter_references(text, bases, root):
             yield from _pytest_references(root, bases, args)
         else:
             yield from _module_references(root, bases, module)
+    yield from _other_interpreter_references(text, bases, root)
+
+
+# Non-Python interpreters as a command word. `bash ./gate.sh`, `pwsh gate.ps1` and `node
+# gate.mjs` name a script GATE_SCRIPT cannot see when it sits at the root or outside
+# `scripts/`, `build/` and `tools/`, so a merge-blocking gate script could be edited in a
+# NORMAL-tier PR. Python already read these; this widens the same read to a short list.
+OTHER_INTERPRETER_COMMAND = re.compile(r"(?<![\w.-])(?:bash|sh|zsh|pwsh|powershell|node)(?:\.exe)?(?=[\"']?[ \t])")
+# Flags after which the rest of the command is inline code or a value, not a script path.
+_INLINE_FLAGS = {
+    # `-s` reads the commands from stdin, so the word after it is an argument, not the script.
+    "bash": {"-c", "-s"}, "sh": {"-c", "-s"}, "zsh": {"-c", "-s"},
+    "pwsh": {"-c", "-command", "-e", "-ec", "-encodedcommand"},
+    "powershell": {"-c", "-command", "-e", "-ec", "-encodedcommand"},
+    "node": {"-e", "--eval", "-p", "--print"},
+}
+# The script extensions each interpreter's gate scripts carry. GATE_SCRIPT draws the same line
+# for scripts under `scripts/` (`.jsx` is deliberately not a gate script), so an existing file
+# with another extension is not named here either.
+_SCRIPT_EXTENSIONS = {
+    "bash": (".sh", ".bash"), "sh": (".sh", ".bash"), "zsh": (".sh", ".zsh"),
+    "pwsh": (".ps1",), "powershell": (".ps1",),
+    "node": (".js", ".mjs", ".cjs"),
+}
+_VALUE_FLAGS = {"-executionpolicy", "-ep", "-workingdirectory", "-wd", "-r", "--require", "-o", "-w", "-configurationname"}
+
+
+def _other_interpreter_target(interpreter, tokens):
+    """The script named by an interpreter command's tokens, or None when it runs inline code."""
+    inline = _INLINE_FLAGS.get(interpreter, set())
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        folded = token.lower()
+        if not token.startswith("-"):
+            return token
+        if folded in inline:
+            return None
+        # Grouped short options (`bash -es gate.sh`, `bash -ec '...'`): a `c` or `s` anywhere in
+        # the group selects inline code or stdin, exactly as the lone flag does.
+        if interpreter in ("bash", "sh", "zsh") and re.fullmatch(r"-[A-Za-z]+", token) and set(token[1:]) & {"c", "s"}:
+            return None
+        if interpreter in ("bash", "sh", "zsh") and re.fullmatch(r"-[A-Za-z]*o", token):
+            index += 2  # `-eo pipefail`: a group ending in `o` takes the next word as its option name
+            continue
+        if folded == "-file":
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+        index += 2 if folded in _VALUE_FLAGS else 1
+    return None
+
+
+def _other_interpreter_references(text, bases, root):
+    """(relative path, directories) for each script a bash/sh/pwsh/node command runs.
+
+    Only an EXISTING committed file is yielded, so this can only add detections: an argument
+    that is not a path in the checkout (`bash --version`, `sh -c ...`) adds nothing.
+    """
+    for match in OTHER_INTERPRETER_COMMAND.finditer(text):
+        if printed_only(text, match.start()) or _in_shell_comment(text, match.start()):
+            continue
+        rest = text[match.end():].lstrip("\"'")
+        end = COMMAND_END.search(mask_quoted(rest))
+        segment = rest[:end.start()] if end else rest
+        comment = re.search(r"(?:^|[ \t])#", mask_quoted(segment))
+        if comment:
+            segment = segment[:comment.start()]
+        interpreter = re.sub(r"(?i)\.exe$", "", match.group(0).strip("\"'")).lower()
+        target = _other_interpreter_target(interpreter, _interpreter_tokens(segment))
+        if not target or not target.lower().endswith(_SCRIPT_EXTENSIONS[interpreter]):
+            continue
+        target, rooted = WORKSPACE_PREFIX.subn("", target.replace("\\", "/"))
+        found = _resolve_under_bases(root, [""] if rooted else bases, target)
+        for relative in found:
+            yield relative, set()
+        # Unresolved here, a relative target is still yielded raw so gate_script_paths applies
+        # its directory-change refusal, exactly as the Python branch does: `cd sub` then
+        # `bash gate.sh` runs sub/gate.sh, which nothing above resolves.
+        if not found and not rooted and not re.match(r"^(?:[/~$]|[A-Za-z]:)", target):
+            yield target, {base for base in bases if base}
 
 
 def _in_shell_comment(text, start):
@@ -3769,8 +4036,10 @@ def assert_gate_scripts(workflow_path, lines, jobs, needs, gate_job):
 STARTUP_ENV_KEYS = ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS")
 # The same routes spelled inside a GATE JOB run body -- a GITHUB_ENV write, or a write to
 # pwsh's `$PROFILE`, which the runner loads because its pwsh template omits -NoProfile.
+# `GITHUB_PATH` is the same route by another door: an earlier step that prepends a directory
+# holding a fake `bash` or `pwsh` replaces the shell the failing step then runs under.
 STARTUP_OVERRIDE_TOKEN = re.compile(
-    r"(?i)\b(?:BASH_ENV|SHELLOPTS|BASHOPTS|BASH_FUNC_\w*)\b|(?<![\w$:])ENV(?=\s*[=<])|\$(?:env:)?PROFILE\b"
+    r"(?i)\b(?:BASH_ENV|SHELLOPTS|BASHOPTS|BASH_FUNC_\w*|GITHUB_PATH)\b|(?<![\w$:])ENV(?=\s*[=<])|\$(?:env:)?PROFILE\b"
 )
 
 
@@ -3783,7 +4052,65 @@ def startup_env_keys(mapping):
     return [name for name, _ in mapping_entries(mapping) if name in STARTUP_ENV_KEYS or name.startswith("BASH_FUNC_")]
 
 
-def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_exempt, label=""):
+def assert_composite_steps(workflow_path, root, ref, feeder, step_exempt, used_exempt, visited):
+    """Hold the steps of a LOCAL composite action to the feeder-step rules.
+
+    A feeder whose check lives in `uses: ./.github/actions/quality` was judged on the
+    calling step alone, which carries neither `continue-on-error` nor a false `if:`. The
+    action's own steps could swallow the failure or never run and the feeder still reported
+    success. The action's manifest is in the checkout, so it is read here: a step with
+    `continue-on-error` (unless it is exempted like a workflow step, by `<job>/<step id>`)
+    or a statically false `if:` is refused, and a nested local composite is followed.
+    """
+    target = root / ref[2:]
+    if target.is_dir():
+        target = next((target / name for name in ("action.yml", "action.yaml") if (target / name).is_file()), None)
+    if target is None or not target.is_file():
+        return
+    key = target.resolve().as_posix()
+    if key in visited:
+        return
+    visited.add(key)
+    manifest_lines = target.read_text(encoding="utf-8-sig").splitlines()
+    document, _, _ = parsed_document(manifest_lines, target)
+    steps = mapping_get(mapping_get(document, "runs"), "steps")
+    if not isinstance(steps, yaml.SequenceNode):
+        return
+    for step in steps.value:
+        if not isinstance(step, yaml.MappingNode):
+            continue
+        step_id = mapping_get(step, "id")
+        identifier = step_id.value if isinstance(step_id, yaml.ScalarNode) else None
+        tolerance = mapping_get(step, "continue-on-error")
+        if isinstance(tolerance, yaml.ScalarNode) and static_truth(tolerance.value) is not False:
+            entry = f"{feeder}/{identifier}" if identifier else None
+            if entry in step_exempt:
+                used_exempt.add(entry)
+            else:
+                sys.exit(
+                    f"{workflow_path}: feeder '{feeder}' runs local action '{ref}', whose step"
+                    + (f" (id '{identifier}')" if identifier else "")
+                    + " has `continue-on-error`. A step whose failure is swallowed checks nothing "
+                    "the gate can see. Remove it, or give the step an `id:` and name "
+                    "`<job>/<step id>` in GATE_STEP_EXEMPT with a written rationale."
+                )
+        condition = mapping_get(step, "if")
+        if isinstance(condition, yaml.ScalarNode) and static_truth(condition.value) is False:
+            sys.exit(f"{workflow_path}: feeder '{feeder}' runs local action '{ref}', which has an always-skipped step.")
+        if isinstance(condition, yaml.ScalarNode) and ambiguous_negated_literal(condition.value):
+            sys.exit(
+                f"{workflow_path}: feeder '{feeder}' runs local action '{ref}', which has a step whose `if:` "
+                "negates a literal comparison. Its two precedence readings disagree, so the checker cannot "
+                "say whether the step runs. Write the intended comparison with explicit parentheses."
+            )
+        used = mapping_get(step, "uses")
+        if isinstance(used, yaml.ScalarNode):
+            nested = decode_yaml_scalar(used.value)
+            if nested.startswith(("./", "$/")):
+                assert_composite_steps(workflow_path, root, nested, feeder, step_exempt, used_exempt, visited)
+
+
+def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_exempt, label="", root=None):
     """Refuse a feeder step that can never fail its job or never runs.
 
     `continue-on-error: true` on a step is the step-level spelling of a tolerated job:
@@ -3823,10 +4150,10 @@ def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_e
                 for offset in range(*span):
                     entry = pattern.match(block[offset]) if offset not in payloads else None
                     if entry and len(entry.group(1)) == indent:
-                        value = strip_comment(entry.group(2)).strip()
+                        value = strip_inline_comment(entry.group(2)).strip()
                         if not value or is_block_scalar_header(value):
                             body, _ = continuation_lines(block, offset, indent)
-                            value = " ".join(strip_comment(part).strip() for part in body)
+                            value = " ".join(strip_inline_comment(part).strip() for part in body)
                         return value
                 return None
 
@@ -3847,9 +4174,25 @@ def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_e
             condition = own_key("if")
             if condition is not None and static_truth(condition) is False:
                 sys.exit(f"{workflow_path}: feeder '{label}{feeder}' has an always-skipped {kind}.")
+            if condition is not None and ambiguous_negated_literal(condition):
+                sys.exit(
+                    f"{workflow_path}: feeder '{label}{feeder}' has a {kind} whose `if:` negates a literal "
+                    "comparison. Its two precedence readings disagree, so the checker cannot say whether "
+                    "the step runs. Write the intended comparison with explicit parentheses."
+                )
+            used_ref = own_key("uses")
+            if used_ref is not None and root is not None:
+                composite = decode_yaml_scalar(used_ref)
+                # A STEP-level local `uses:` is never a reusable-workflow call (that is job
+                # level), so the `.github/workflows/` carve-out does not apply: a composite
+                # action may live there.
+                if composite.startswith(("./", "$/")):
+                    assert_composite_steps(
+                        workflow_path, root, composite, f"{label}{feeder}", step_exempt, used_exempt, set()
+                    )
 
 
-def reusable_workflow_feeder(lines, jobs, job_id, job_indent, root):
+def reusable_workflow_feeder(lines, jobs, job_id, job_indent, root, workflow_path=None):
     """(path, lines, jobs, job indent) of the LOCAL reusable workflow `job_id` calls, or None."""
     indent = job_body_indent(lines, jobs, job_id, job_indent)
     if indent is None:
@@ -3859,7 +4202,13 @@ def reusable_workflow_feeder(lines, jobs, job_id, job_indent, root):
         match = uses_key.match(line)
         if not match:
             continue
-        ref = decode_yaml_scalar(strip_comment(match.group(1)).strip())
+        raw_ref = strip_comment(match.group(1)).strip()
+        if is_block_scalar_header(raw_ref):
+            sys.exit(
+                f"{workflow_path}: job '{job_id}' spells `uses:` as a block scalar, so this checker cannot follow the "
+                "reusable workflow it calls and would skip its jobs. Write the path on the `uses:` line."
+            )
+        ref = decode_yaml_scalar(raw_ref)
         # `./` and `$/` are the two local spellings LOCAL_USES admits.
         if not (ref.startswith(("./", "$/")) and ref[2:].startswith(".github/workflows/")):
             return None
@@ -3968,8 +4317,8 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             f"{workflow_path}: {', '.join(sorted(set(overrides)))} can neutralise the gate's "
             "accepted exit command: BASH_ENV/ENV load a start-up file, SHELLOPTS/BASHOPTS set "
             "shell options such as noexec, BASH_FUNC_* imports a function over a builtin, and "
-            "$PROFILE is loaded by the runner's pwsh. Remove the override or use a separately "
-            "verified gate shell."
+            "$PROFILE is loaded by the runner's pwsh, and GITHUB_PATH can put a fake shell "
+            "ahead of the real one. Remove the override or use a separately verified gate shell."
         )
 
     gate_line = lines[jobs[gate_job]]
@@ -4067,7 +4416,7 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
 
     used_step_exempt, step_feeders = step_usage if step_usage is not None else (set(), set())
     step_feeders |= set(needs) - {gate_job}
-    assert_feeder_steps(workflow_path, lines, jobs, set(needs) - {gate_job}, step_exempt, used_step_exempt)
+    assert_feeder_steps(workflow_path, lines, jobs, set(needs) - {gate_job}, step_exempt, used_step_exempt, root=root)
 
     # A feeder that is a LOCAL REUSABLE WORKFLOW runs that file's jobs, and the caller
     # reports success when every callee job succeeds OR SKIPS. A conditional, tolerated or
@@ -4075,16 +4424,21 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
     # the feeder itself, and nothing looked inside.
     # The callee's jobs get the feeder's own checks; a feeder named in
     # GATE_CONDITIONAL_EXEMPT may skip, so its callee may be conditional too.
-    for feeder in sorted(set(needs) - {gate_job}):
-        callee = reusable_workflow_feeder(lines, jobs, feeder, job_indent, root)
+    # A callee job can itself call another local reusable workflow, and the same hole
+    # reopens one hop down, so the walk recurses with a visited set (a cycle ends it).
+    def check_callee(caller_path, caller_lines, caller_jobs, caller_indent, feeder, label, exempt, visited):
+        callee = reusable_workflow_feeder(caller_lines, caller_jobs, feeder, caller_indent, root, caller_path)
         if callee is None:
-            continue
+            return
         callee_path, callee_lines, callee_jobs, callee_indent = callee
-        if feeder not in conditional_exempt:
+        if callee_path in visited:
+            return
+        visited = visited | {callee_path}
+        if not exempt:
             skippable = sorted(conditional_jobs(callee_lines, callee_jobs, callee_indent))
             if skippable:
                 sys.exit(
-                    f"{workflow_path}: feeder '{feeder}' calls {callee_path}, whose job(s) "
+                    f"{workflow_path}: feeder '{label}{feeder}' calls {callee_path}, whose job(s) "
                     f"{', '.join(skippable)} carry a job-level 'if:'. A skipped callee job passes the "
                     "caller and so the gate; remove the condition, or name the feeder in "
                     "GATE_CONDITIONAL_EXEMPT with a written rationale."
@@ -4092,11 +4446,16 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
         tolerated = sorted(tolerant_jobs(callee_lines, callee_jobs, callee_indent))
         if tolerated:
             sys.exit(
-                f"{workflow_path}: feeder '{feeder}' calls {callee_path}, whose job(s) "
+                f"{workflow_path}: feeder '{label}{feeder}' calls {callee_path}, whose job(s) "
                 f"{', '.join(tolerated)} carry 'continue-on-error'. A tolerated callee job cannot fail "
                 "the feeder."
             )
-        assert_feeder_steps(callee_path, callee_lines, callee_jobs, set(callee_jobs), step_exempt, used_step_exempt, label=f"{feeder}/")
+        assert_feeder_steps(callee_path, callee_lines, callee_jobs, set(callee_jobs), step_exempt, used_step_exempt, label=f"{label}{feeder}/", root=root)
+        for nested in sorted(callee_jobs):
+            check_callee(callee_path, callee_lines, callee_jobs, callee_indent, nested, f"{label}{feeder}/", exempt, visited)
+
+    for feeder in sorted(set(needs) - {gate_job}):
+        check_callee(workflow_path, lines, jobs, job_indent, feeder, "", feeder in conditional_exempt, frozenset({workflow_path}))
 
     if step_usage is None:
         assert_step_exempt_used(workflow_path, step_exempt, used_step_exempt, step_feeders)
