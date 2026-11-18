@@ -2,16 +2,16 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "d7366e65b0b6d93062383595b65718d3e7a41f3f",
-    "syncedAt": "2026-11-03"
+    "commit": "1fdcdfe41634576aea3683d67364c13afc05fedf",
+    "syncedAt": "2026-11-18"
   },
   "assets": [
     {
       "path": ".github/ai-smells/detect.ps1",
-      "sha256": "b449311f887f8f086c14b46a892941ce79a37df7c80b171f5801d5d2b71eb28c",
+      "sha256": "e2749ad707f85d27bfd668ba1e348fd5ef4ccea1f98e8587dbdce665ccc81ac3",
       "verbatim": true,
-      "commit": "6804782d03980fa8bb153cc0c7545219f279f605",
-      "syncedAt": "2026-11-02"
+      "commit": "1fdcdfe41634576aea3683d67364c13afc05fedf",
+      "syncedAt": "2026-11-18"
     },
     {
       "path": ".github/ai-smells/detectors/rules/S10.yml",
@@ -99,24 +99,24 @@
     },
     {
       "path": ".github/ai-smells/detectors/scripts/registry_check.py",
-      "sha256": "c88cf68b29932ee1cf1c831a5bec7c10829e7bb40843592c630cbe504c1ea316",
+      "sha256": "ee7006936e44d2a480862799f6998e1f4cc158f7eacf2fcdc0e95dbab7ac7529",
       "verbatim": true,
-      "commit": "6804782d03980fa8bb153cc0c7545219f279f605",
-      "syncedAt": "2026-11-02"
+      "commit": "1fdcdfe41634576aea3683d67364c13afc05fedf",
+      "syncedAt": "2026-11-18"
     },
     {
       "path": ".github/ai-smells/detectors/scripts/size_outliers.py",
-      "sha256": "b56ac353f6c977940daf233712672484d09f2a0cecd580051d4224b28dcf4abd",
+      "sha256": "b9ed0ae6da01f383192ac06e460c8039bbf5f95151c91f1bdff718b59da251e5",
       "verbatim": true,
-      "commit": "472d9e579cf9655d5609fdaf0f236db930ac4ddb",
-      "syncedAt": "2026-11-03"
+      "commit": "1fdcdfe41634576aea3683d67364c13afc05fedf",
+      "syncedAt": "2026-11-18"
     },
     {
       "path": ".github/ai-smells/post-smell-threads.ps1",
-      "sha256": "d8f66623a8018a79897b7f82c3bd9f0d9fe6e3c650b2749cb035b86fcc6bd755",
+      "sha256": "d27b8612ddb20b40dc1557ad48b7892fa988d20a821b6cc471639695f86b9f2a",
       "verbatim": true,
-      "commit": "6804782d03980fa8bb153cc0c7545219f279f605",
-      "syncedAt": "2026-11-02"
+      "commit": "1fdcdfe41634576aea3683d67364c13afc05fedf",
+      "syncedAt": "2026-11-18"
     },
     {
       "path": ".github/ai-smells/pr-detect.ps1",
@@ -141,38 +141,38 @@
     },
     {
       "path": ".github/scripts/assert_canonical_assets.py",
-      "sha256": "e6491c2a54d45b57656cfc832a3e1940529c97e3735aa4831e38105472e99f1e",
+      "sha256": "b024d9860c6ebd96e072e8f14ab0dcb173b22430d6969e763865b05667b97df5",
       "verbatim": true,
-      "commit": "a2ddae4b9c194ac31e54f857dedcbe1b9614823e",
-      "syncedAt": "2026-10-12"
+      "commit": "1fdcdfe41634576aea3683d67364c13afc05fedf",
+      "syncedAt": "2026-11-18"
     },
     {
       "path": ".github/scripts/assert_gate_coverage.py",
-      "sha256": "09a6c7a33167e80de77c5f3b8a15a9329f02c1f22f24fc0a216186e0bc853c7b",
+      "sha256": "b698ad9a7f11f4c9e4ef15ca0f12531d78c93a5bb2630192a8a639f4571093e7",
       "verbatim": true,
-      "commit": "d7366e65b0b6d93062383595b65718d3e7a41f3f",
-      "syncedAt": "2026-11-03"
+      "commit": "1fdcdfe41634576aea3683d67364c13afc05fedf",
+      "syncedAt": "2026-11-18"
     },
     {
       "path": ".github/scripts/assert_workflow_hygiene.py",
-      "sha256": "947ea554491ba10d18c104c1aada58289838b8b6fe78d1f85105b35fe9cfdd00",
+      "sha256": "45537429fdb7df4e29c38ea458273745a31cad8c56c3e8f75b45624e78e8251a",
       "verbatim": true,
-      "commit": "6804782d03980fa8bb153cc0c7545219f279f605",
-      "syncedAt": "2026-11-02"
+      "commit": "1fdcdfe41634576aea3683d67364c13afc05fedf",
+      "syncedAt": "2026-11-18"
     },
     {
       "path": ".github/workflows/ai-smells.yml",
-      "sha256": "05d86d3aba444c358a37b7e1b5f55abaf58f56ef099d5c91a90254c12942515a",
+      "sha256": "0f87e8ca3a60f7dc58c970da9c92952422ac9582235a5d839e73ea7fb25272c3",
       "verbatim": false,
-      "commit": "a2ddae4b9c194ac31e54f857dedcbe1b9614823e",
-      "syncedAt": "2026-10-12"
+      "commit": "1fdcdfe41634576aea3683d67364c13afc05fedf",
+      "syncedAt": "2026-11-18"
     },
     {
       "path": ".github/workflows/review-policy-guard.yml",
-      "sha256": "fb00848a7c3f9ee0a74f388cc83f2e79621776fbbe7e4b6f2131a929fabc56da",
+      "sha256": "2e7322a2dd5efd98a6b4114bb7c998492213d70d670063ee0a9719a82eaa4119",
       "verbatim": false,
-      "commit": "540c74515ab6d687b2fc4f58e43a59c35b848ee8",
-      "syncedAt": "2026-10-13"
+      "commit": "1fdcdfe41634576aea3683d67364c13afc05fedf",
+      "syncedAt": "2026-11-18"
     },
     {
       "path": ".github/workflows/review-tier.yml",

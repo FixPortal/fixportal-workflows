@@ -20,19 +20,36 @@ OPENER = re.compile(r"^\s*(?:[\w$]+\s*:\s*)?(public|private|protected|internal|s
 CONST_OPENER = re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:const|let|var)\s+[\w$]+\s*(?::[^=]+)?=\s*(?:async\s+)?(?:[\w$.]+\s*\(\s*)?(?:async\s+)?(?:\(|(?=[\w$]+\s*=>))")
 CONST_SIGNATURE = re.compile(CONST_OPENER.pattern + r".*=>\s*\{?\s*$")
 ARROW_END = re.compile(r"=>\s*\{?\s*$")
+# A signature that starts with a return type or a bare name instead of a modifier: TS class
+# methods (`render() {`), C# members with default accessibility, local functions and explicit
+# interface implementations (`void IFoo.Bar()`). Control flow, `new` and `return` are not
+# functions, and a callback argument (`it("x", function () {`) is not a declaration. The tail is
+# accepted only with a `{`/`=>` or a `{` on the next line, so a call statement is never read.
+# shortcut: a `where T : ...` constraint clause is not read; upgrade to a parser.
+NAMED_HEAD = r"^\s*(?!(?:if|for|foreach|while|switch|catch|lock|using|return|new|else|do|try|finally|throw|await|yield|fixed|with|case|default|typeof|nameof|sizeof|checked|unchecked)\b)(?![^(]*\b(?:class|record|struct|interface|enum)\s+\w+)(?:[\w$<>\[\],.?]+\s+)*[\w$]+(?:<[^()]*>)?(?:\.[\w$]+)*\s*\("
+NAMED_OPENER = re.compile(NAMED_HEAD)
+# A callback argument starts with `function` or an arrow; a parameter whose type is a function
+# (`visit(cb: () => void) {`) starts with a name, so it is a declaration.
+NAMED = re.compile(NAMED_HEAD + r"(?![^;]*\bfunction\b)(?!\s*(?:async\s+)?(?:\([^()]*\)|[\w$]+)\s*=>)[^;{}]*\)\s*(?::[^;{}=]*)?\s*(\{|=>)?\s*$")
+# A name-form signature whose `{` is on the next line is read only with a return type before the
+# name or a `: ReturnType` after the parameters, so a bare call statement before a block is not.
+# shortcut: an Allman-style TS method with no return type (`render()` then `{`) is not read.
+NAMED_TYPED = re.compile(r"^\s*(?:[\w$<>\[\],.?]+\s+)+[\w$.<>]+\s*\(|\)\s*:\s*\S")
 # Strings, char literals, template literals and comments, blanked before braces are counted.
 # shortcut: a regex literal holding a quote or `//` can desynchronise this; upgrade to a tokenizer.
 LITERAL = re.compile(r'//[^\n]*|/\*.*?\*/|@"(?:""|[^"])*"|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|`(?:\\.|[^`\\])*`', re.S)
-KEEP = re.compile(r"[^\r\n\x0b\x0c\x1c-\x1e\x85  ]")
+KEEP = re.compile(r"[^\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 WRAP_LIMIT = 30  # a parameter list longer than this many lines is not a signature
 SOURCE = (".cs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py")
 UNSUPPORTED = (".ps1", ".psm1", ".go", ".java", ".rs", ".rb", ".kt", ".swift", ".cpp", ".c")
 
 def python_hits(rel, source):
+    """(hits, parsed). parsed is False when the source does not parse: the caller records the
+    file as not assessed, and the file-size check in main() still applies."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
-        return []  # Unparseable: the file-size check above still applies.
+        return [], False
     lines = source.splitlines()
     hits = []
     for node in ast.walk(tree):
@@ -41,7 +58,7 @@ def python_hits(rel, source):
             if span > FUNC_MAX:
                 signature = " ".join(lines[node.lineno - 1:node.body[0].lineno - 1]).strip() or lines[node.lineno - 1].strip()
                 hits.append({"file": rel, "line": node.lineno, "endLine": node.end_lineno, "text": f"function spans {span} lines: {signature}"})
-    return hits
+    return hits, True
 
 def blank_literals(source):
     return LITERAL.sub(lambda m: KEEP.sub(" ", m.group()), source)
@@ -49,13 +66,18 @@ def blank_literals(source):
 def signature_end(lines, i):
     """Index of the last line of the signature that starts at lines[i], or None. A parameter
     list wrapped over several lines is joined up to its closing ')' before matching."""
-    if not (OPENER.match(lines[i]) or CONST_OPENER.match(lines[i])):
+    if not (OPENER.match(lines[i]) or CONST_OPENER.match(lines[i]) or NAMED_OPENER.match(lines[i])):
         return None
     joined, k = lines[i], i
     while joined.count("(") > joined.count(")") and not ARROW_END.search(joined) and k + 1 < len(lines) and k - i < WRAP_LIMIT:
         k += 1
         joined += " " + lines[k].strip()
-    return k if (SIGNATURE.match(joined) or CONST_SIGNATURE.match(joined)) else None
+    if SIGNATURE.match(joined) or CONST_SIGNATURE.match(joined):
+        return k
+    named = NAMED.match(joined)
+    if named and (named.group(1) or (NAMED_TYPED.search(joined) and k + 1 < len(lines) and lines[k + 1].lstrip().startswith("{"))):
+        return k
+    return None
 
 def params_close(code, i, head):
     """Column on code[head] just past the `)` where the signature's parentheses first balance.
@@ -81,6 +103,18 @@ def params_close(code, i, head):
                 return col + 1
     return code[head].rfind(")") + 1
 
+def is_braced_type(tail):
+    """True when tail is `: { ... }` and that one brace group is the whole return type, so the
+    body's `{` is on the next line. `: number { return 0 }` is an inline body, not a type."""
+    if not re.match(r":\s*\{", tail):
+        return False
+    depth = 0
+    for col, ch in enumerate(tail):
+        depth += (ch == "{") - (ch == "}")
+        if depth == 0 and ch == "}":
+            return col == len(tail) - 1
+    return False
+
 def block_end(code, i, head):
     """Index of the line that closes the block opened by the signature at code[i..head], or
     None. A `=>` signature with no `{` (`lazy(() =>`) is closed by its parentheses instead."""
@@ -92,6 +126,12 @@ def block_end(code, i, head):
             start, first = head + 1, code[head + 1]  # `=>` with the body's `{` on the next line
         else:
             open_c, close_c, start, first = "(", ")", i, code[i]
+    else:
+        # `f(): { a: string }` with the body's `{` on the next line: the return type's braces
+        # balance, so without this the signature line itself would be taken as the whole block.
+        tail = first.strip()
+        if is_braced_type(tail) and head + 1 < len(code) and code[head + 1].lstrip().startswith("{"):
+            start, first = head + 1, code[head + 1]
     depth, opened = 0, False
     for j in range(start, len(code)):
         text = first if j == start else code[j]
@@ -106,7 +146,7 @@ def main():
     ap.add_argument("--root", required=True); ap.add_argument("--files", required=True); ap.add_argument("--smell", required=True)
     a = ap.parse_args()
     root = pathlib.Path(a.root)
-    hits, unread, skipped = [], [], []
+    hits, unread, skipped, unparsed = [], [], [], []
     for rel in pathlib.Path(a.files).read_text(encoding="utf-8").splitlines():
         rel = rel.strip()
         if rel.lower().endswith(UNSUPPORTED):
@@ -126,7 +166,10 @@ def main():
         if len(lines) > FILE_MAX:
             hits.append({"file": rel, "line": 1, "endLine": len(lines), "text": f"file is {len(lines)} lines"})
         if rel.lower().endswith(".py"):
-            hits += python_hits(rel, source)
+            py_hits, parsed = python_hits(rel, source)
+            hits += py_hits
+            if not parsed:
+                unparsed.append(rel)
             continue
         code = blank_literals(source).splitlines()
         i = 0
@@ -139,9 +182,8 @@ def main():
                     hits.append({"file": rel, "line": i + 1, "endLine": j + 1, "text": f"function spans {j - i + 1} lines: {signature}"})
                     i = j
             i += 1
-    status, reason = ("not assessed", "could not read " + ", ".join(unread)) if unread else ("assessed", "")
-    if skipped:
-        status, reason = "not assessed", "; ".join(filter(None, [reason, "unsupported source: " + ", ".join(skipped)]))
+    notes = [f"{label}: " + ", ".join(paths) for label, paths in (("could not read", unread), ("could not parse, function sizes not measured", unparsed), ("unsupported source", skipped)) if paths]
+    status, reason = ("not assessed", "; ".join(notes)) if notes else ("assessed", "")
     print(json.dumps({"status": status, "reason": reason, "hits": sorted(hits, key=lambda h: (h["file"], h["line"]))}))
 
 if __name__ == "__main__":

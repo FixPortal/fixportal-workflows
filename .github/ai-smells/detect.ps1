@@ -114,7 +114,7 @@ function Read-GeneratedSourceFile {
 function Get-ScanFiles {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $TreePath, [string[]] $Pathspec, [switch] $IncludeGenerated,
-        [Collections.Generic.Dictionary[string,bool]] $GeneratedCache)
+        [Collections.Generic.Dictionary[string,bool]] $GeneratedCache, [Collections.Generic.List[string]] $Rejected)
     # Batched: pr-detect passes every file a PR touches, and ~1000 paths overflowed the
     # command line before git started. Exclude pathspecs go in every batch, or a batch
     # holding only includes would list the excluded files.
@@ -159,7 +159,7 @@ function Get-ScanFiles {
         $leaf = $segments[-1]
         foreach ($g in $script:ExcludeGlobs) { if ($leaf -like $g) { return $false } }
         try { $null = Resolve-SourceFilePath $TreePath $rel }
-        catch { return $false }
+        catch { if ($null -ne $Rejected) { $Rejected.Add($rel) }; return $false }
         if (-not $IncludeGenerated -and (Test-GeneratedSourceFile $TreePath $rel $GeneratedCache)) { return $false }
         return $true
     } | Sort-Object)
@@ -286,7 +286,8 @@ function Invoke-SmellDetectors {
     # Explicit invocation scope: reusable dot-sourced helpers and a later scan of
     # the same tree must observe edits. Ordinal keys preserve Linux case distinctions.
     $generatedCache = [Collections.Generic.Dictionary[string,bool]]::new([StringComparer]::Ordinal)
-    $files = @(Get-ScanFiles -TreePath $TreePath -Pathspec $Pathspec -GeneratedCache $generatedCache)
+    $rejected = [System.Collections.Generic.List[string]]::new()
+    $files = @(Get-ScanFiles -TreePath $TreePath -Pathspec $Pathspec -GeneratedCache $generatedCache -Rejected $rejected)
     $raw = [System.Collections.Generic.List[object]]::new()
     $coverage = [System.Collections.Generic.List[object]]::new()
     $tools = @{}
@@ -569,6 +570,19 @@ function Invoke-SmellDetectors {
 
     foreach ($s in @($smells | Where-Object { $_.detector.kind -eq 'judgment' })) {
         $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'judgment'; reason = '' })
+    }
+
+    # A path Resolve-SourceFilePath rejected (a link, or a file gone since it was listed) was never scanned.
+    # Only a smell that reads that path's language (or every language) has a gap: a rejected Markdown link
+    # says nothing about a Python-only detector.
+    if ($rejected.Count) {
+        foreach ($s in @($smells | Where-Object { $_.detector.kind -ne 'judgment' })) {
+            $langs = @($s.languages)
+            $affected = @($rejected | Where-Object { $langs -contains 'any' -or $langs -contains $script:LanguageByExtension[[IO.Path]::GetExtension($_).ToLowerInvariant()] })
+            if (-not $affected.Count) { continue }
+            $note = "source path rejected, not scanned: $(($affected | Select-Object -First 3) -join ', ')$(if ($affected.Count -gt 3) { " (+$($affected.Count - 3) more)" })"
+            $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'not assessed'; reason = $note })
+        }
     }
 
     $sorted = @($raw | Sort-Object smell, file, line, text)

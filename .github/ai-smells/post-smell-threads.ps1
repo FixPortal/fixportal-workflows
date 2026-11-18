@@ -64,9 +64,11 @@ $gaps = @($result.coverage | Where-Object status -eq 'not assessed')
 if ($gaps) {
     # A green check means the detectors ran, not that every smell was assessed. Say so in the log
     # and as a run annotation, not only in the job summary page nobody opens from the pull request.
-    Write-Host "ai-smells: $($gaps.Count) smell(s) not assessed (not the same as clean):"
+    # Coverage rows are per smell and language, so count and list distinct smell ids.
+    $gapIds = @($gaps.smell | Sort-Object -Unique)
+    Write-Host "ai-smells: $($gapIds.Count) smell(s) not assessed (not the same as clean):"
     $gaps | ForEach-Object { Write-Host "  $($_.smell): $(Format-SafeLogText $_.reason)" }
-    if ($env:GITHUB_ACTIONS) { Write-Host "::warning title=ai-smells coverage gap::$($gaps.Count) smell(s) not assessed: $(@($gaps.smell) -join ', '). Not the same as clean; see the job summary." }
+    if ($env:GITHUB_ACTIONS) { Write-Host "::warning title=ai-smells coverage gap::$($gapIds.Count) smell(s) not assessed: $($gapIds -join ', '). Not the same as clean; see the job summary." }
 }
 
 if ($env:GITHUB_STEP_SUMMARY) {
@@ -76,3 +78,5 @@ if ($env:GITHUB_STEP_SUMMARY) {
     Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $summary
 }
 if ($pick.Post.Count -gt 0 -and $failed -eq $pick.Post.Count) { exit 1 }
+# Tolerated gh failures leave $LASTEXITCODE non-zero, and the Actions pwsh wrapper exits with it.
+exit 0
