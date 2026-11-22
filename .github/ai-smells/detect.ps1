@@ -114,14 +114,19 @@ function Read-GeneratedSourceFile {
 function Get-ScanFiles {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $TreePath, [string[]] $Pathspec, [switch] $IncludeGenerated,
-        [Collections.Generic.Dictionary[string,bool]] $GeneratedCache, [Collections.Generic.List[string]] $Rejected)
+        [Collections.Generic.Dictionary[string,bool]] $GeneratedCache, [Collections.Generic.List[string]] $Rejected,
+        # Every -Pathspec entry is a real file path, never exclusion magic: pr-detect passes changed
+        # paths, and one that merely looks like ':!x' must not become an exclusion (or, alone, widen
+        # the listing to the whole tree). Nothing to list means nothing is scanned.
+        [switch] $LiteralPathspec)
     # Batched: pr-detect passes every file a PR touches, and ~1000 paths overflowed the
     # command line before git started. Exclude pathspecs go in every batch, or a batch
     # holding only includes would list the excluded files.
     # Short form takes '/', '!' and '^' in any order (':!x', ':/!x', ':^/x'): exclusion is a '!' or '^' anywhere in that prefix.
     $excludeMagic = '^:(?:[/!^]*[!^]|\((?:[^)]*,)?exclude(?:,[^)]*)?\))'
-    $exclude = @($Pathspec | Where-Object { $_ -match $excludeMagic })
-    $include = @($Pathspec | Where-Object { $_ -and $_ -notmatch $excludeMagic })
+    $exclude = @($Pathspec | Where-Object { -not $LiteralPathspec -and $_ -match $excludeMagic })
+    $include = @($Pathspec | Where-Object { $_ -and ($LiteralPathspec -or $_ -notmatch $excludeMagic) })
+    if ($LiteralPathspec -and -not $include.Count) { return @() }
     $budget = 24000 - (($exclude | ForEach-Object { $_.Length + 3 } | Measure-Object -Sum).Sum)
     # Includes are literal: a name that starts with ':' would otherwise parse as pathspec magic.
     # The prefix is added BEFORE batching so Split-ByLength budgets the length git actually receives.
@@ -278,7 +283,9 @@ function Invoke-SmellDetectors {
         [string] $PythonCommand = (@('python3', 'python') | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1),
         # Tree-relative globs jscpd must ignore. jscpd scans the whole tree, not $files, so a
         # caller that excludes paths (pr-detect -Exclude) has to say so here too.
-        [string[]] $JscpdExclude = @()
+        [string[]] $JscpdExclude = @(),
+        # -Pathspec holds literal file paths (see Get-ScanFiles).
+        [switch] $LiteralPathspec
     )
     New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
     $OutDir = (Resolve-Path -LiteralPath $OutDir).Path
@@ -287,7 +294,7 @@ function Invoke-SmellDetectors {
     # the same tree must observe edits. Ordinal keys preserve Linux case distinctions.
     $generatedCache = [Collections.Generic.Dictionary[string,bool]]::new([StringComparer]::Ordinal)
     $rejected = [System.Collections.Generic.List[string]]::new()
-    $files = @(Get-ScanFiles -TreePath $TreePath -Pathspec $Pathspec -GeneratedCache $generatedCache -Rejected $rejected)
+    $files = @(Get-ScanFiles -TreePath $TreePath -Pathspec $Pathspec -LiteralPathspec:$LiteralPathspec -GeneratedCache $generatedCache -Rejected $rejected)
     $raw = [System.Collections.Generic.List[object]]::new()
     $coverage = [System.Collections.Generic.List[object]]::new()
     $tools = @{}

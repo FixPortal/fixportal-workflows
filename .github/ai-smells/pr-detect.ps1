@@ -39,7 +39,7 @@ $files = @($added.Keys | Where-Object { -not (Test-PathExcluded $_ $Exclude) } |
 $sizeSmells = @('S30', 'S41')
 
 function Get-HitKey($h) {
-    $identity = ([string]$h.text) -replace '^function spans \d+ lines:', 'function spans # lines:' -replace '^file is \d+ lines$', 'file is # lines' -replace '^\d+% of \d+ non-blank lines', '#% of # non-blank lines'
+    $identity = ([string]$h.text) -replace '^function spans \d+ lines', 'function spans # lines' -replace '^file is \d+ lines$', 'file is # lines' -replace '^\d+% of \d+ non-blank lines', '#% of # non-blank lines'
     return "$($h.smell)|$($h.file)|$identity"
 }
 
@@ -47,7 +47,7 @@ $hits = @(); $coverage = @()
 if ($files.Count) {
     $work = Join-Path ([IO.Path]::GetTempPath()) "ai-smells-$([guid]::NewGuid().ToString('N'))"
     try {
-        $det = Invoke-SmellDetectors -TreePath $RepoPath -Catalogue ([pscustomobject]@{ Smells = $smells }) -SkillRoot $SkillRoot -OutDir $work -Pathspec $files -JscpdExclude $Exclude
+        $det = Invoke-SmellDetectors -TreePath $RepoPath -Catalogue ([pscustomobject]@{ Smells = $smells }) -SkillRoot $SkillRoot -OutDir $work -Pathspec $files -LiteralPathspec -JscpdExclude $Exclude
         $coverage = @($det.Coverage)
         # Anchoring is exclusion-aware (a clone prefers a non-excluded side that has added
         # lines), so the exclusion filter runs ONCE, after it, not before it.

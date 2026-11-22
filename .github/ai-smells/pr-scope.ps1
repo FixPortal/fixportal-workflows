@@ -201,16 +201,28 @@ function Add-HitOccurrence {
 function Get-MarkersFromBodies {
     [CmdletBinding()]
     param([string[]] $Body)
-    return @($Body | ForEach-Object { [regex]::Matches([string]$_, '<!-- ai-smell:(\S+) -->') | ForEach-Object { $_.Groups[1].Value } })
+    # Only the body's final line: the poster always ends with its marker, so a marker anywhere else
+    # was written by someone else (or came in with embedded hit text).
+    return @($Body | ForEach-Object {
+        $last = ([string]$_).TrimEnd() -split '\r?\n' | Select-Object -Last 1
+        if ($last -match '^\s*<!-- ai-smell:(\S+) -->$') { $Matches[1] }
+    })
 }
 
 function Get-LiveMarkers {
     # A nearby edit outdates a thread even when its line survives, and the gate ignores
     # outdated threads, so an outdated unresolved marker must not block a re-post.
     # Resolved threads keep their marker: a declined smell stays declined.
+    # -Author is the identity the poster runs as: any author can open a thread and paste a marker, so
+    # only that identity's threads count. GraphQL reports a bot without the REST "[bot]" suffix. An
+    # empty -Author (identity unknown) reads every thread, as before.
     [CmdletBinding()]
-    param([object[]] $Thread)
-    return Get-MarkersFromBodies @($Thread | Where-Object { $_.isResolved -or -not $_.isOutdated } | ForEach-Object { [string]$_.body })
+    param([object[]] $Thread, [string] $Author = '')
+    $mine = $Author -replace '\[bot\]$', ''
+    return Get-MarkersFromBodies @($Thread |
+        Where-Object { $_.isResolved -or -not $_.isOutdated } |
+        Where-Object { -not $mine -or (([string]$_.author) -replace '\[bot\]$', '') -eq $mine } |
+        ForEach-Object { [string]$_.body })
 }
 
 function Select-NewSmellHits {
@@ -221,16 +233,24 @@ function Select-NewSmellHits {
     return @{ Post = @($new | Select-Object -First $Cap); Overflow = @($new | Select-Object -Skip $Cap) }
 }
 
+function Format-CodeFence {
+    # Hit text comes from the PR. Fenced, it renders as code, and the fence is longer than any
+    # backtick run inside so the text cannot close it.
+    [CmdletBinding()]
+    param([AllowNull()] [string] $Text)
+    $longest = ([regex]::Matches([string]$Text, '`+') | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
+    $fence = '`' * [Math]::Max(3, [int]$longest + 1)
+    return "$fence`n$Text`n$fence"
+}
+
 function Format-SmellThreadBody {
     [CmdletBinding()]
     param([Parameter(Mandatory)] $Hit)
-    $detail = if (([string]$Hit.text).Trim() -and ([string]$Hit.text).Trim() -ne ([string]$Hit.lineText).Trim()) { "$(([string]$Hit.text).Trim())`n`n" } else { '' }
+    $detail = if (([string]$Hit.text).Trim() -and ([string]$Hit.text).Trim() -ne ([string]$Hit.lineText).Trim()) { "$(Format-CodeFence ([string]$Hit.text).Trim())`n`n" } else { '' }
     return @"
 **AI smell $($Hit.smell): $($Hit.name)**
 
-$detail``````
-$($Hit.lineText)
-``````
+$detail$(Format-CodeFence ([string]$Hit.lineText))
 
 Fix the line (this thread then goes outdated), or reply with the reason it stays and resolve the thread.
 
