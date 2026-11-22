@@ -1,9 +1,10 @@
 """S19: hallucinated package. Every dependency declared in csproj / Directory.Packages.props,
 package.json, requirements*.txt and pyproject.toml is looked up in its public registry.
 Not found => hit. A failed lookup => the whole smell is 'not assessed', never a pass.
-A package the repository resolves from a private source -- a root nuget.config
-packageSourceMapping, or a root .npmrc scoped registry -- is skipped, not looked up: the
-public registry cannot know it, so its absence there says nothing."""
+A package the repository resolves from a private source -- a nuget.config
+packageSourceMapping, or an .npmrc scoped registry, in the manifest's directory or any
+ancestor up to the root -- is skipped, not looked up: the public registry cannot know it,
+so its absence there says nothing."""
 import argparse, json, os, pathlib, posixpath, re, shlex, urllib.request, urllib.error
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
@@ -25,30 +26,51 @@ def host_is(url, *hosts):
 
 NUGET_HOSTS, NPM_HOSTS, PYPI_HOSTS = ("api.nuget.org", "nuget.org", "www.nuget.org"), ("registry.npmjs.org",), ("pypi.org",)
 
-def nuget_sources(root):
-    """(pattern -> True when it maps to a non-nuget.org source, unmapped) where unmapped is True
-    when a non-nuget.org source is declared with no packageSourceMapping, so no id can be told
-    private from hallucinated. Raises ET.ParseError on a malformed nuget.config: the caller
-    then skips NuGet lookups only."""
-    nuget, unmapped = {}, False
-    # Case-variant configs at one root: NuGet reads a single file per directory, so sort by name
-    # and read them in that order; a pattern listed on several sources is private when any of them is.
-    for f in sorted(root.iterdir(), key=lambda p: p.name):
-        if f.name.lower() == "nuget.config" and f.is_file():
-            cfg = ET.fromstring(f.read_bytes())
-            # Source keys compare case-insensitively. A disabled source serves nothing, so its mapped
-            # patterns still rank but are never private: the id is looked up (ide review, RV-39).
-            disabled = {a.get("key", "").lower() for a in cfg.findall("disabledPackageSources/add") if a.get("value", "").lower() == "true"}
-            urls = {a.get("key").lower(): a.get("value", "") for a in cfg.findall("packageSources/add") if a.get("key")}
-            mapped = False
-            for src in cfg.iter("packageSource"):
-                mapped = True
-                key = (src.get("key") or "").lower()
-                private = key not in disabled and not host_is(urls.get(key, ""), *NUGET_HOSTS)
-                for p in src.iter("package"):
-                    pattern = p.get("pattern", "").lower(); nuget[pattern] = nuget.get(pattern, False) or private
-            if not mapped and any(not host_is(v, *NUGET_HOSTS) for k, v in urls.items() if k not in disabled):
-                unmapped = True
+def nuget_configs(directory):
+    """The parsed nuget.config files in one directory. Case-variant names at one directory are read
+    in name order. Raises ET.ParseError on a malformed file: the caller skips NuGet lookups for the
+    manifests under it only."""
+    return [ET.fromstring(f.read_bytes()) for f in sorted(directory.iterdir(), key=lambda p: p.name)
+            if f.name.lower() == "nuget.config" and f.is_file()]
+
+def nuget_sources(configs):
+    """(pattern -> True when it maps to a non-nuget.org source, unmapped) for configs applied root
+    first, as NuGet merges them: a later file adds to what came before, and a section's `<clear />`
+    drops everything inherited for that section. A mapping may name a source an ancestor defines.
+    unmapped is True when a non-nuget.org source is in effect with no packageSourceMapping, so no id
+    can be told private from hallucinated."""
+    urls, disabled, mapping = {}, set(), {}
+    stores = {"packageSources": urls, "disabledPackageSources": disabled, "packageSourceMapping": mapping}
+    for cfg in configs:
+        seen_in_file = set()
+        for section, store in stores.items():
+            node = cfg.find(section)
+            for child in (node if node is not None else []):
+                if child.tag == "clear":
+                    store.clear()
+                elif child.tag == "add" and section == "packageSources" and child.get("key"):
+                    urls[child.get("key").lower()] = child.get("value", "")
+                elif child.tag == "add" and section == "disabledPackageSources":
+                    # Source keys compare case-insensitively. A disabled source serves nothing, so its mapped
+                    # patterns still rank but are never private: the id is looked up (ide review, RV-39).
+                    key = child.get("key", "").lower()
+                    if child.get("value", "").lower() == "true":
+                        disabled.add(key)
+                    else:
+                        disabled.discard(key)
+                elif child.tag == "packageSource" and section == "packageSourceMapping":
+                    # A nearer file's packageSource REPLACES the same key's inherited patterns (NuGet's
+                    # VirtualSettingSection); within one file, repeats of a key add up (CodeRabbit, PR #503).
+                    key = (child.get("key") or "").lower()
+                    patterns = [p.get("pattern", "").lower() for p in child.iter("package")]
+                    mapping[key] = (mapping.get(key, []) + patterns) if key in seen_in_file else patterns
+                    seen_in_file.add(key)
+    nuget = {}
+    for key, patterns in mapping.items():
+        private = key not in disabled and not host_is(urls.get(key, ""), *NUGET_HOSTS)
+        for pattern in patterns:
+            nuget[pattern] = nuget.get(pattern, False) or private  # private when any source mapping it is
+    unmapped = not mapping and any(not host_is(v, *NUGET_HOSTS) for k, v in urls.items() if k not in disabled)
     return nuget, unmapped
 
 def npm_scopes(root):
@@ -63,6 +85,26 @@ def npm_scopes(root):
                 url = m.group(2) if "://" in m.group(2) else "https://" + m.group(2)
                 npm[(m.group(1) or ":")[:-1].lower()] = not host_is(url, *NPM_HOSTS)
     return npm
+
+def config_dirs(root, rel):
+    """The manifest's own directory, then each ancestor up to root: where its nuget.config and .npmrc live."""
+    parts = pathlib.PurePosixPath(rel).parent.parts
+    return [root.joinpath(*parts[:n]) for n in range(len(parts), -1, -1)]
+
+def sources_for(dirs, configs_by_dir, scopes_by_dir):
+    """((nuget map, unmapped), npm scopes) in effect for a manifest whose config dirs are `dirs`,
+    nearest first. Either half is None when a config in that manifest's chain could not be read.
+    NuGet configs merge root first (nuget_sources); the nearest .npmrc that names a scope decides it."""
+    chain = list(reversed(dirs))
+    nuget = None if any(configs_by_dir.get(d) is None for d in chain if d in configs_by_dir) else \
+        nuget_sources([cfg for d in chain for cfg in configs_by_dir.get(d, [])])
+    npm = {}
+    for d in dirs:
+        if d in scopes_by_dir and scopes_by_dir[d] is None:
+            return nuget, None
+        for scope, private in scopes_by_dir.get(d, {}).items():
+            npm.setdefault(scope, private)
+    return nuget, npm
 
 def is_private(eco, pkg, nuget, npm):
     pkg = pkg.lower()
@@ -103,7 +145,7 @@ def poetry_off_pypi(spec, explicit):
     specs = spec if isinstance(spec, list) else [spec]
     return all(isinstance(s, dict) and (any(k in s for k in ("path", "git", "url")) or s.get("source") in explicit) for s in specs)
 
-PEP508_DIRECT = re.compile(r"\s*[A-Za-z0-9][A-Za-z0-9._-]*(\[[^\]]*\])?\s*@\s*\S")  # `name @ url`: installed from the URL
+PEP508_DIRECT = re.compile(r"\s*[A-Za-z0-9][A-Za-z0-9._-]*\s*(\[[^\]]*\])?\s*@\s*\S")  # `name @ url`: installed from the URL
 # A find-links source serves packages pypi.org does not hold, and --no-index forbids pypi.org outright,
 # so both read like a non-PyPI index.
 # A short option may carry its value attached (`-fwheels`), as pip's optparse accepts; a long one needs a separator.
@@ -141,13 +183,13 @@ def pip_lines(text):
     return out
 
 def locate(text, token, after=None):
-    """1-based line of the first match of regex `token` at or after the first match of `after`
+    """1-based line of the first match of regex `token` after the first match of `after`
     (1 when none). Scoping to the section the dependency was parsed from keeps an earlier mention
     of the name (a keyword, an override, a description) from taking the line."""
     start = 0
     if after:
         m = re.search(after, text, re.M)
-        start = m.start() if m else 0
+        start = m.end() if m else 0
     m = re.compile(token, re.M).search(text, start)
     return text.count("\n", 0, m.start()) + 1 if m else 1
 
@@ -155,7 +197,8 @@ def pip_options(line, rel, indexes, includes):
     """Records what one requirements line says about where packages come from: a non-PyPI index
     or find-links source marks rel private, and -r/-c names a file pip applies the same options to."""
     idx = PYPI_INDEX.match(line)
-    if (NO_INDEX.match(line) or (idx and not host_is(idx.group(1), *PYPI_HOSTS))) and indexes is not None:
+    # pip 26.2.1 read `-i "https://pypi.org/simple"` and `-i"..."` as the bare URL.
+    if (NO_INDEX.match(line) or (idx and not host_is(idx.group(1).strip("\"'"), *PYPI_HOSTS))) and indexes is not None:
         indexes.append(rel)
     inc = REQ_INCLUDE.match(line)
     # pip tokenises an option's value with shlex, so `-r "a b.txt"` names `a b.txt`; pip_lines has already
@@ -172,6 +215,13 @@ def read_included_options(root, includes, indexes, done, problems):
     `done` set ends a cycle."""
     tree = root.resolve()
     queue = [child for children in list(includes.values()) for child in children]
+    # Resolved identities as well: through a directory link to `.`, `again/options.txt` and
+    # `again/again/options.txt` are one file, and textual paths alone never stopped (Linux, Python 3.12).
+    # A second spelling is not re-read but is linked to the first, so a parent that includes either
+    # one still takes the file's index options. The key is the file AND the directory its spelling
+    # names: pip 26.2.1 resolves a child against that directory, so two file links to one file are
+    # two includes with different children.
+    read = {}
     while queue:
         rel = queue.pop()
         if rel in done:
@@ -179,8 +229,13 @@ def read_included_options(root, includes, indexes, done, problems):
         done.add(rel)
         try:
             path = (root / rel).resolve()
+            identity = (path, (root / rel).parent.resolve())
+            if identity in read:
+                includes.setdefault(rel, []).append(read[identity])
+                continue
             if not path.is_relative_to(tree) or not path.is_file():
                 continue
+            read[identity] = rel
             text = path.read_bytes().decode("utf-8-sig", errors="replace")
             for _, line in pip_lines(text):
                 pip_options(line, rel, indexes, includes)
@@ -258,7 +313,18 @@ def declared(root, rel, indexes=None, includes=None):
                 if PEP508_DIRECT.match(dep_str):
                     continue
                 pkg = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)", dep_str).group(1)
-                out.append(("pypi", pkg, locate(text, rf'["\']\s*{re.escape(pkg)}(?![\w.-])', r"optional-dependencies")))
+                # Located from its own group's key, so a name two groups share takes each group's line.
+                # The key starts a line or follows `{`/`,`, so `# b = [...]` is not group b.
+                group = rf"optional-dependencies[\s\S]*?(?:^|[{{,])[ \t]*[\"']?{re.escape(section)}[\"']?[ \t]*="
+                out.append(("pypi", pkg, locate(text, rf'["\']\s*{re.escape(pkg)}(?![\w.-])', group)))
+        # PEP 735 groups. An `{include-group = ...}` entry names another group, read in its own right.
+        for deps in (data.get("dependency-groups") or {}).values():
+            for dep_str in deps:
+                if not isinstance(dep_str, str) or PEP508_DIRECT.match(dep_str):
+                    continue
+                # A specifier may carry surrounding whitespace (`" pytest>=8"`, CodeRabbit PR #503).
+                pkg = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)", dep_str.strip()).group(1)
+                out.append(("pypi", pkg, locate(text, rf'["\']\s*{re.escape(pkg)}(?![\w.-])', r"^\s*\[dependency-groups\]")))
         poetry_deps = data.get("tool", {}).get("poetry", {}).get("dependencies") or {}
         for pkg, spec in poetry_deps.items():
             if pkg != "python" and not poetry_off_pypi(spec, explicit):
@@ -296,34 +362,34 @@ def main():
     fx_path = os.environ.get("AAQ_REGISTRY_FIXTURE")
     fixture = json.loads(pathlib.Path(fx_path).read_text(encoding="utf-8")) if fx_path else None
     hits, failed, skipped, public = [], [], set(), []
-    parse_errors, nuget_skipped, npm_skipped = [], False, False
+    parse_errors = []
     # Ecosystems whose public registry cannot vouch for a name, and the reason. The reason is
     # reported only when a manifest of that ecosystem is actually seen.
-    blocked, blocked_seen, index_files = {}, set(), []
-    try:
-        scopes = npm_scopes(root)
-    except OSError as e:
-        # Same reasoning as nuget.config below: without the scope map a private npm package
-        # reads as hallucinated, so npm lookups are skipped rather than guessed.
-        scopes, npm_skipped = {}, True
-        parse_errors.append(f"failed to read .npmrc: {type(e).__name__}")
-    # A private unscoped `registry=` hides unscoped names only: a scope mapped in .npmrc still
-    # resolves to its own registry, public or private, so scoped names are judged by is_private.
-    npm_default_private = scopes.get("", False)
-    try:
-        nuget_map, nuget_unmapped = nuget_sources(root)
-    except (ET.ParseError, OSError) as e:
-        # Without the source mapping a private NuGet id is indistinguishable from a
-        # hallucinated one, so NuGet lookups are skipped. npm and PyPI are unaffected.
-        nuget_map, nuget_skipped, nuget_unmapped = {}, True, False
-        parse_errors.append(f"failed to parse nuget.config: {type(e).__name__}")
-    if nuget_unmapped:
-        blocked["nuget"] = "nuget not assessed: nuget.config declares a non-nuget.org source without packageSourceMapping"
+    blocked = {"nuget": "nuget not assessed: nuget.config declares a non-nuget.org source without packageSourceMapping"}
+    blocked_seen, index_files = set(), []
+    rels = [rel.strip() for rel in pathlib.Path(a.files).read_text(encoding="utf-8").splitlines() if rel.strip()]
+    # A manifest's own directory and its ancestors, not the root alone: a subdirectory .npmrc or
+    # nuget.config makes its packages private too (observatory review, C2-X3).
+    dirs = sorted({d for rel in rels for d in config_dirs(root, rel) if d.is_dir()} | {root})
+    # An unreadable config is None for its directory: only manifests whose chain holds it skip (CodeRabbit, PR #503).
+    scopes_by_dir, configs_by_dir = {}, {}
+    for d in dirs:
+        try:
+            scopes_by_dir[d] = npm_scopes(d)
+        except OSError as e:
+            # Same reasoning as nuget.config below: without the scope map a private npm package
+            # reads as hallucinated, so npm lookups are skipped rather than guessed.
+            scopes_by_dir[d] = None
+            parse_errors.append(f"failed to read .npmrc: {type(e).__name__}")
+        try:
+            configs_by_dir[d] = nuget_configs(d)
+        except (ET.ParseError, OSError) as e:
+            # Without the source mapping a private NuGet id is indistinguishable from a
+            # hallucinated one, so NuGet lookups are skipped. npm and PyPI are unaffected.
+            configs_by_dir[d] = None
+            parse_errors.append(f"failed to parse nuget.config: {type(e).__name__}")
     includes, decl_by_file = {}, []
-    for rel in pathlib.Path(a.files).read_text(encoding="utf-8").splitlines():
-        rel = rel.strip()
-        if not rel:
-            continue
+    for rel in rels:
         try:
             decls = declared(root, rel, index_files, includes)
         except (ValueError, KeyError, AttributeError, OSError, RuntimeError, ET.ParseError) as e:
@@ -349,10 +415,15 @@ def main():
                 private_index.add(other)
                 queue.append(other)
     for rel, decls in decl_by_file:
+        nuget, scopes = sources_for(config_dirs(root, rel), configs_by_dir, scopes_by_dir)
+        nuget_map, nuget_unmapped = nuget or ({}, False)
+        # A private unscoped `registry=` hides unscoped names only: a scope mapped in .npmrc still
+        # resolves to its own registry, public or private, so scoped names are judged by is_private.
+        npm_default_private = (scopes or {}).get("", False)
         for eco, pkg, line in decls:
-            if (nuget_skipped and eco == "nuget") or (npm_skipped and eco == "npm"):
+            if (nuget is None and eco == "nuget") or (scopes is None and eco == "npm"):
                 continue
-            if eco in blocked:
+            if eco == "nuget" and nuget_unmapped:
                 blocked_seen.add(eco)
                 continue
             if eco == "npm" and npm_default_private and not (pkg.startswith("@") and pkg.lower().split("/")[0] in scopes):

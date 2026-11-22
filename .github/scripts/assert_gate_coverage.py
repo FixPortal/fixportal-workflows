@@ -38,13 +38,24 @@ YAML STRUCTURE IS READ THROUGH PyYAML, which assert_workflow_hygiene.py already 
 on the same runners. The line regexes below still read shell bodies and the job/needs/if
 grammar, but which lines are TEXT and which are KEYS, and what `defaults:`, `env:` and
 `working-directory:` actually hold, come from the parser -- see compose_yaml.
+
+SCRIPTS A GATED JOB RUNS must be HIGH in .claude/review-policy.json. They are found by a
+word rule, not a shell parser: every word in a gated run body, or in a package script that
+body runs, that names a tracked repository script is required HIGH. A script named in a
+comment, an echo or an argument counts too; that over-approximation is accepted. A body or
+package script with a directory command at command position that names a script is
+refused (see DIRECTORY_CHANGE). A script reached only
+through a variable, a dynamic launch, or code a gate script imports is not derived. See
+ScriptWords and scaffold-ci/references/review-policy.md.
 """
+import fnmatch
 import json
 import math
 import os
 import posixpath
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -580,6 +591,11 @@ def read_gate_contract(lines, gate_job):
 
 
 def runs_unconditionally(condition):
+    # `always() && !cancelled()` runs exactly when `!cancelled()` does: judge what is left once
+    # the conjuncts that fold to true are dropped (observatory review, C1-F4).
+    rest = [part for part in split_top_level(strip_outer_parentheses(condition), "&&") if static_truth(part, True) is not True]
+    if [strip_outer_parentheses(part) for part in rest] == ["!cancelled()"]:
+        return True
     return condition == "!cancelled()" or (
         re.search(r"\balways\(\s*\)", mask_quoted(condition)) is not None
         and static_truth(condition) is True
@@ -930,6 +946,8 @@ def github_equal(left, right):
         if isinstance(value, float):
             return value
         if isinstance(value, str):
+            # The runner trims before converting, so ' ' is 0, not NaN (CodeRabbit, observatory PR #468).
+            value = value.strip()
             if not value:
                 return 0.0
             try:
@@ -1753,7 +1771,7 @@ def step_can_fail(block, span, key_indent, default_shell=None):
         # under bash, but under pwsh the backtick escapes the quote and the string runs
         # on to the `"` on the last line, swallowing `exit 1`: the step exits ZERO on a
         # Windows runner while the bash reading vouched for it (adversarial review
-        # 20261031T213036Z, M1). Same both-disciplines rule changes_directory applies.
+        # 20261031T213036Z, M1).
         disciplines = (False,) if shell is not None else (False, True)
         if all(
             ends_non_zero(
@@ -1956,7 +1974,13 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
 
     referenced = {}
     failing = []
+    # Only an item of the job's own `steps:` is a step: a `- if:`/`run:` pair under
+    # strategy.matrix.include is data, and was credited as the failing step (observatory review, C1-F7).
+    steps = mapping_get(job_node(document, gate_job), "steps")
+    step_lines = range(steps.start_mark.line, steps.end_mark.line + 1) if isinstance(steps, yaml.SequenceNode) else range(0)
     for condition, index in step_conditions(block, step_indent):
+        if getattr(block, "offset", 0) + index not in step_lines:
+            continue
         # A condition that is statically false never enforces anything, however
         # well-formed its atoms look, so it cannot count toward coverage.
         if static_truth(condition) is False:
@@ -2077,45 +2101,6 @@ def parse_jobs(workflow_path):
     return set(jobs)
 
 
-# A repo-local script invoked from a `run:` body. Deliberately a small, closed set of
-# directory roots rather than "any path with a script extension": the point is to catch
-# a checker the repository authored and wired into the merge barrier, and widening this
-# to every path-shaped token would start matching tool arguments and report files.
-#
-# The candidate is only ever a CANDIDATE -- it must also exist on disk before anything
-# is asserted about it (see gate_script_paths). That existence test is what keeps a
-# script name inside an `echo` message, or a path that a later commit deleted, from
-# reddening a repository over a file it does not have.
-#
-# BOTH SEPARATORS, EITHER CASE. Windows resolves a path case-insensitively and accepts
-# `\` as well as `/`, so on a windows-latest runner `.\scripts\probe.ps1` and
-# `./scripts/probe.PS1` run the repo-local script exactly as the POSIX spelling does.
-# Admitting only `/` and lowercase extensions meant gate_script_paths never saw either,
-# assert_gate_scripts asserted nothing, and a repo-authored gate script stayed editable
-# in a NORMAL-tier pull request -- reachable by punctuation rather than by deleting
-# anything, which is the precise hole assert_gate_scripts exists to close. Widening here
-# widens DETECTION only: more scripts are required HIGH, never fewer. That is the
-# opposite error direction from widening an accept-list, which is why it is safe to do
-# and an ACCEPTED_FAILING_FORMS widening was not.
-#
-# Probed on a mini-repo: `.\scripts\probe.ps1` and `./scripts/probe.PS1`
-# both exited 0 -- green, ungated -- while the POSIX control `./scripts/probe.ps1`
-# exited 1 with "not tiered HIGH".
-GATE_SCRIPT = re.compile(
-    # The extension set is deliberately closed: these are the gate-script languages
-    # supported by the estate checker. Add a new extension here and to the policy
-    # review before wiring it into a merge barrier. Spelled as character classes rather
-    # than an inline `(?i:...)` group, which needs Python 3.11 -- this asset runs on
-    # whatever python3 a consuming repository's runner provides.
-    #
-    # `.mjs`/`.js` are admitted on review evidence: a JavaScript gate script
-    # (`node scripts/gate.mjs`) matched nothing here, so gate_script_paths never saw
-    # it and the script stayed editable in a NORMAL-tier pull request. Widening here
-    # widens DETECTION only -- more scripts required HIGH, never fewer. The trailing
-    # `\b` is what keeps `.jsx` out: `js` followed by a word character never matches.
-    r"""(?<![\w.-])(?:\.[\\/])?[\\/]?((?:[\w.-]+[\\/])*(?:\.github[\\/]scripts|scripts|build|tools)[\\/]"""
-    r"""[\w.\\/-]*\.(?:[Pp][Ss][Mm]1|[Pp][Ss]1|[Pp][Yy]|[Ss][Hh]|[Bb][Aa][Ss][Hh]|[Mm][Jj][Ss]|[Cc][Jj][Ss]|[Jj][Ss]|[Tt][Ss]))\b"""
-)
 # A `run:` key at any depth. Group 1 is everything before the key, so its LENGTH is the
 # key's own column -- which is what continuation_lines needs to find a block scalar's
 # body. Same reasoning as step_key_pattern, and the same dash-form hazard: a `- run: |`
@@ -2527,7 +2512,14 @@ def assert_readable_shapes(root, text, name=None):
         id(value)
         for node in iter_nodes(root) if isinstance(node, yaml.MappingNode) and node is not jobs_node
         for key, value in node.value if isinstance(key, yaml.ScalarNode) and key.value in ("with", "env")
+        # Only a mapping written in place: `env: *step` aliases an executable mapping, and exempting
+        # it hid that step's off-line `uses` and the action it calls.
+        and value.start_mark.index > key.end_mark.index
     }
+    # Everything under a `matrix:` is data too: a `uses` there names no action (CodeRabbit, observatory PR #468).
+    data_mappings |= {id(inner) for node in iter_nodes(root) if isinstance(node, yaml.MappingNode) and node is not jobs_node
+                      for key, value in node.value if isinstance(key, yaml.ScalarNode) and key.value == "matrix"
+                      for inner in iter_nodes(value) if isinstance(inner, yaml.MappingNode)}
     for node in iter_nodes(root):
         if not isinstance(node, yaml.MappingNode):
             continue
@@ -2586,7 +2578,9 @@ def assert_readable_shapes(root, text, name=None):
                     raise ValueError(f"{where}line {line}: a `steps:` sequence that is an alias of another is unsupported; write the steps out")
                 step_nodes_seen.add(id(value))
                 for item in value.value:
-                    if id(item) in step_nodes_seen or not (value.start_mark.index <= item.start_mark.index <= value.end_mark.index):
+                    # A step that is also a `with:`/`env:` mapping (`env: &x` ... `- *x`) is an alias the
+                    # data exemption would hide from the `uses` check.
+                    if id(item) in step_nodes_seen or id(item) in data_mappings or not (value.start_mark.index <= item.start_mark.index <= value.end_mark.index):
                         raise ValueError(f"{where}line {item.start_mark.line + 1}: a step that is an alias of another step is unsupported; write the step out")
                     step_nodes_seen.add(id(item))
                     if isinstance(item, yaml.MappingNode) and item.flow_style:
@@ -2951,20 +2945,11 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root, include_directories=Tru
     job cannot neuter the barrier, so requiring it to be HIGH would be a cost with no
     control behind it.
     """
-    job_indent = len(lines[jobs[gate_job]]) - len(lines[jobs[gate_job]].lstrip(" "))
     document, _, _ = parsed_document(lines)
     # Only workflow-level `defaults.run` -- outside the jobs mapping, before or after
     # it -- can set a working directory for this job's steps.
     workflow_directories = working_directories(document, exclude={"jobs"}) if include_directories else set()
-    pending = list(set(needs) | {gate_job})
-    seen = set()
-    while pending:
-        job_id = pending.pop()
-        if job_id in seen:
-            continue
-        seen.add(job_id)
-        if job_id not in jobs:
-            continue
+    for job_id in gated_jobs_in_order(lines, jobs, needs, gate_job):
         block = job_block(lines, jobs, job_id)
         job = job_node(document, job_id)
         # Directories that apply to EVERY step of this job: workflow- and job-level
@@ -3004,7 +2989,25 @@ def gated_run_bodies(lines, jobs, needs, gate_job, root, include_directories=Tru
                 for delegated_body, directories in delegated:
                     for body_line in delegated_body:
                         yield job_id, body_line, delegated_body, directories
-        pending.extend(job_needs(lines, jobs, job_id, job_indent) - seen)
+
+
+def gated_jobs_in_order(lines, jobs, needs, gate_job):
+    """The gate job and every job it transitively needs, in the order the workflow declares them.
+
+    Workflow order, not set order: the report names the first job that runs a script, and a set of
+    job ids iterates in hash-seed order, so the same scripts were reported under a different job
+    from run to run.
+    """
+    job_indent = len(lines[jobs[gate_job]]) - len(lines[jobs[gate_job]].lstrip(" "))
+    reachable, pending = set(), [gate_job, *needs]
+    while pending:
+        job_id = pending.pop()
+        if job_id in reachable:
+            continue
+        reachable.add(job_id)
+        if job_id in jobs:
+            pending.extend(job_needs(lines, jobs, job_id, job_indent) - reachable)
+    return sorted((job_id for job_id in reachable if job_id in jobs), key=jobs.get)
 
 
 def resolve_committed_paths(root, relative, allow_outside_repository=False):
@@ -3013,10 +3016,8 @@ def resolve_committed_paths(root, relative, allow_outside_repository=False):
 
     Windows resolves a path case-insensitively, so a windows-latest job runs
     `./scripts/probe.PS1` against a file committed as `scripts/probe.ps1`. This checker
-    runs on ubuntu, where the exact lookup fails -- so admitting the mixed-case spelling
-    in GATE_SCRIPT without resolving it would capture the reference and then silently
-    drop it. That is the same fail-open the widening exists to close, moved one step
-    later and harder to see, because detection would LOOK correct.
+    runs on ubuntu, where the exact lookup fails -- so a mixed-case word that was not
+    resolved here would be read and then silently dropped, which is fail-open.
 
     The COMMITTED spelling is what is returned, not what the workflow typed, because the
     review policy is matched against what is in the repository -- an exact policy entry
@@ -3144,1216 +3145,404 @@ def resolve_committed_paths(root, relative, allow_outside_repository=False):
     return sorted({*matches, *resolved_matches})
 
 
-# A directory change at a COMMAND position: line start, after a separator, inside a
-# subshell or brace group (`(cd x && ...)`, `{ cd x; ...; }`), after `!`, or after a
-# compound keyword (`if cd x; then`). Those are ordinary ways to write one, so missing them
-# let a gate script run from a directory the checker never considered.
-# A compound keyword starts a command only when it is itself at a command position, so the
-# keywords are an optional chain AFTER a real command start: `echo then cd sub` is an echo.
-# `!` is the same: a separate token at a command position (`! cd x`), not a character
-# inside an argument (`echo hi! cd x`).
-_KEYWORDS = r"(?:(?:then|do|else|if|elif|while|until|!)\s+)*"
-# The command word ends where a shell word ends, at whitespace or a metacharacter, not at
-# any `\b`: `${cd:-x}`, `${cd}` and `{cd,ls}` name a `cd` without running one, and a `{`
-# anchor followed by `\b` read all three as a directory change. A redirection ends the word
-# too (`cd>log` is `cd` to $HOME); `#` does not, since `cd#x` is one word, not a comment.
-# A `$` expansion does end it, in effect: `cd$X`, `cd${SUB}` and `cd$(...)` run `cd` when
-# the expansion is empty or begins with whitespace (word splitting), so they fail closed.
-# An assignment prefix. The BARE value alternative admits EMPTY (`*`, not `+`):
-# mask_quoted blanks a quoted value to spaces, so `A="x y" B=1 cd sub` reads as
-# `A=      B=1 cd sub` in the masked copy DIRECTORY_CHANGE runs against -- with `+`
-# the first assignment failed to parse there, the whole prefix chain collapsed, and
-# the directory change was missed. Empty is also REAL shell: `A= cd sub` runs cd with
-# A empty. The masked read now covers every spelling, so the raw-line second pattern
-# that used to paper over this (QUOTED_ASSIGNMENT_DIRECTORY_CHANGE) is gone -- keeping
-# two patterns in agreement was a cost with no coverage behind it.
-_ASSIGNMENT_WORD = r"[A-Za-z_][A-Za-z0-9_]*=(?:'(?:[^']|'')*'|\"(?:\\.|[^\"])*\"|[^\s;&|]*)"
-# `sl` and `chdir` are pwsh's built-in aliases for Set-Location, so a Windows gate can
-# change directory without spelling `cd`.
-_DIRECTORY_COMMAND = r"(?:(?:command|builtin)\s+|" + _ASSIGNMENT_WORD + r"\s+)*(?P<directory>cd|chdir|sl|pushd|Push-Location|Set-Location)(?=[\s;&|()`<>$]|$)"
-# An unquoted backtick opens a command substitution just as `$(` does, so it anchors too.
-DIRECTORY_CHANGE = re.compile(r"(?:^|[;&|(`{])\s*" + _KEYWORDS + _DIRECTORY_COMMAND, re.IGNORECASE)
-# A directory change as a command INSIDE a quoted string, which may span lines. An opening
-# `$(` or backtick starts a command too: a substitution runs even inside printed text.
-SEGMENT_DIRECTORY_CHANGE = re.compile(
-    r"(?:^|[;&|\n(`{])\s*" + _KEYWORDS + _DIRECTORY_COMMAND,
-    re.IGNORECASE,
-)
-# A single pipe (not `||`), which feeds printed text onward to another command.
-PIPE = re.compile(r"(?<!\|)\|(?!\|)")
-# The command a quoted string is an argument to, when that command only prints it.
-MESSAGE_COMMAND = re.compile(
-    r"(?:^|[;&|\n])\s*(?:echo|printf|Write-Host|Write-Output|Write-Warning|Write-Error|Write-Verbose)\b[^;&|\n]*$",
-    re.IGNORECASE,
-)
-
-
-def quoted_segments(text, powershell=False):
-    """(start, end, content) of every quoted ARGUMENT in `text`, by mask_quoted's rules.
-
-    `start` is the opening quote's index and `end` the closing quote's.
-
-    Spans that touch with nothing between them (`"cd sub; "'python3 x.py'`) are one shell
-    argument, so they are returned as one segment. An unterminated quote runs to the end
-    of the text, as it does in mask_quoted.
-
-    The escape rules are mask_quoted's and must stay in step with it: in PowerShell
-    mode a backtick escapes inside `"..."` and a doubled `''` escapes inside `'...'`;
-    in bash mode a backslash escapes anywhere outside single quotes. The caller cuts
-    `before`/`after` spans out of mask_quoted's output at THESE offsets, so a drift
-    between the two would cut the original at the wrong place.
-    """
-    segments = []
-    quote = None
-    start = 0
-    last_end = -2
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if powershell and quote == "'" and char == "'" and text[index + 1:index + 2] == "'":
-            index += 2
-            continue
-        if (
-            (powershell and quote == '"' and char == "`")
-            or (not powershell and quote != "'" and char == BACKSLASH)
-        ) and index + 1 < len(text):
-            index += 2
-            continue
-        if quote is None and char in "'\"":
-            quote = char
-            start = index
-        elif quote == char:
-            content = text[start + 1:index]
-            if segments and start == last_end + 1:
-                previous_start, _, previous = segments.pop()
-                segments.append((previous_start, index, previous + content))
-            else:
-                segments.append((start, index, content))
-            last_end = index
-            quote = None
-        index += 1
-    if quote is not None:
-        segments.append((start, len(text), text[start + 1:]))
-    return segments
-
-
-def opening_backticks_only(text):
-    """`text` with every CLOSING backtick blanked, so only an opening one anchors a command.
-
-    Backticks pair up, and only the first of each pair starts a substitution: in
-    `` echo `pwd` cd sub `` the second `cd` is an argument to echo, not a command.
-    The placeholder is not whitespace: a substitution closing at the start of a later line
-    must not leave that line's `cd` looking like the first word of a command.
-    """
-    parts = text.split("`")
-    return "".join(part + ("`" if index % 2 == 0 else "_") for index, part in enumerate(parts[:-1])) + parts[-1]
-
-
-def changes_directory(body):
-    """True when a run body may change directory before a gate script runs.
-
-    Unquoted text is read line by line with quoted spans masked, so a `cd` inside
-    `echo "step1; cd scripts is deprecated"` is not a directory change.
-
-    A quoted COMMAND string is different: `bash -c "cd sub; python3 scripts/gate.py"`
-    really does run the script from `sub`, and masking it would resolve the path against
-    the root instead -- the fail-open direction. So every quoted string in the WHOLE body
-    is read as well (it may span lines of a block scalar), and one that both changes
-    directory and names a gate script counts -- unless it is only the argument of a
-    command that prints it (`echo`, `printf`, `Write-Host`, ...), where the same words are
-    a message. The exemption covers PLAINLY printed text only: not a string holding a
-    command substitution (`$(...)` or backticks), not one inside a substitution opened
-    earlier on its line (`echo $(bash -c "cd sub; ...")`), and not one piped onward
-    (`echo "cd sub; ..." | bash`) -- each of those runs the text. Adjacent quoted spans
-    are read as the one argument they are.
-
-    BOTH quoting disciplines are tried, bash and PowerShell, and either verdict counts.
-    Which shell runs a body is not reliably known here -- a step with no `shell:` key
-    runs bash off Windows and pwsh on it -- and the disciplines differ exactly where it
-    matters: pwsh does not treat `\"` as an escape, so bash masking never closes
-    `Write-Host "cache: C:\" ; Set-Location sub` and the real directory change after the
-    string stays masked. Testing both can only ADD a detection; a wrong positive costs a
-    refused workflow while a wrong negative costs an untiered gate script, and those are
-    not symmetric.
-
-    THE BOUNDARY, stated so a pass is not read as more than it is: this is a line-level
-    heuristic, not a shell parser. It covers the ways a workflow author ordinarily writes a
-    directory change -- `cd`/`pushd`/`Set-Location` as a command, in a quoted `-c` string,
-    or in a substitution. A deliberately obfuscated one (`eval "c""d sub"`, a variable
-    holding the command, an alias, a nested interpreter reading a file) is out of scope:
-    the workflow change that introduces it is itself HIGH-tier and reviewed, and review is
-    the control for intent. Further spellings of that kind are declined, not chased.
-    """
-    # Backtick pairs are counted across the whole body, not per line: a substitution may
-    # close on a later line, and its closing backtick must not read as an opening one.
-    for powershell in (False, True):
-        unquoted = opening_backticks_only(
-            mask_quoted("\n".join(body), powershell=powershell)
-        )
-        for visible in unquoted.split("\n"):
-            # A comment changes no directory: `python3 gate.py # ; cd sub` must not read as
-            # one. Quoted spans are already masked, so an unquoted `#` at a word start
-            # really does open a comment.
-            visible = re.sub(r"(?:^|(?<=\s))#.*$", "", visible)
-            if DIRECTORY_CHANGE.search(visible):
-                return True
-    text = "\n".join(body)
-    for powershell in (False, True):
-        masked = mask_quoted(text, powershell=powershell)
-        for start, end, content in quoted_segments(text, powershell=powershell):
-            if not (SEGMENT_DIRECTORY_CHANGE.search(opening_backticks_only(content)) and GATE_SCRIPT.search(content)):
-                continue
-            line_start = text.rfind("\n", 0, start) + 1
-            # Judged on the WHOLE-body masked copy, so a `#` inside an earlier multi-line
-            # string is not read as a comment that discards a real quoted command.
-            if re.search(r"(?:^|[ \t])#", masked[line_start:start]):
-                continue
-            line_end = text.find("\n", end)
-            # MASKED, so an earlier string that already closed on this line (`echo "$(date)";`)
-            # cannot leak its `$(` into this one's test; an unquoted `$(` stays visible.
-            before = masked[line_start:start]
-            after = masked[end + 1:line_end if line_end != -1 else len(text)]
-            executed = (
-                "$(" in content or "`" in content          # a substitution inside the string
-                or "$(" in before or "`" in before         # the string sits inside a substitution
-                or PIPE.search(after) is not None          # the string is piped onward
-            )
-            # `before`, not the whole body up to here: an `echo` on the line ABOVE is not
-            # the command this string is an argument to (C1-F14).
-            if MESSAGE_COMMAND.search(before) and not executed:
-                continue
-            return True
-    return False
-
-
-def _recognised_suffixes(relative):
-    """Every suffix of `relative` starting at a segment GATE_SCRIPT recognises.
-
-    GATE_SCRIPT's prefix classes are greedy, so a reference like
-    `$GITHUB_WORKSPACE/scripts/gate.py` is captured WITH its prefix
-    (`GITHUB_WORKSPACE/scripts/gate.py`), and finditer never retries inside a consumed
-    match -- the suffix that actually exists in the checkout is never seen, and the
-    prefixed spelling resolves to nothing and is dropped. Yielding each suffix that
-    begins at a `scripts`/`build`/`tools` segment (or a `.github` segment followed by
-    `scripts`, mirroring the regex) recovers it. More candidates, never fewer.
-
-    A prefix that CLIMBS ABOVE ITS OWN START disqualifies every later suffix:
-    `scripts/../../scripts/probe.ps1` escapes the checkout, and its `scripts/probe.ps1`
-    suffix is a DIFFERENT file at run time -- one the repository may legitimately carry.
-    Asserting it would redden the checkout over a script that never runs, which is the
-    false-RED direction. A BALANCED climb does not disqualify: in
-    `$GITHUB_WORKSPACE/x/../scripts/gate.py` the `..` only undoes `x`, and the suffix
-    names exactly the file that runs. A flag that stayed set after ANY `..` yielded
-    nothing there, so the script was never required HIGH (adversarial review
-    20261031T213036Z, H4). Depth is tracked instead, and the suffix is refused only once
-    the prefix has gone below where it started.
-    """
-    segments = relative.split("/")
-    depth = 0
-    escaped = False
-    for index, segment in enumerate(segments):
-        if segment == "..":
-            depth -= 1
-            escaped = escaped or depth < 0
-            continue
-        if escaped:
-            continue
-        if segment in ("scripts", "build", "tools") or (
-            segment == ".github" and segments[index + 1:index + 2] == ["scripts"]
-        ):
-            yield "/".join(segments[index:])
-        if segment and segment != ".":
-            depth += 1
-
-
-# `npm run <name>` (or `run-script`), with any `--flag` before the script name.
-NPM_COMMAND = re.compile(r"\bnpm\s+")
-NPM_NAME = re.compile(r"[\w:.@/-]*")
-NPM_RUN_COMMANDS = {"run", "run-script", "rum", "urn"}
-# Lifecycle commands run the package script of their own name, pre/post hooks included.
-# `npm restart` runs `restart`, or `stop` then `start` when the package has none; that choice
-# is made per package in npm_script_commands.
-# `npm ci` and `npm install` run the package's own preinstall..postprepare hooks unless
-# --ignore-scripts is set (npm lib/commands/ci.js), and the *-test commands run them before
-# `test` (ide review, RV-40). npm_script_commands adds pre/post around each name.
-# shortcut: that also names preprepublish/postprepublish, which npm does not run; a superset.
-NPM_INSTALL_HOOKS = ("install", "prepublish", "prepare")
-NPM_LIFECYCLE_COMMANDS = {
-    "test": ("test",), "t": ("test",), "tst": ("test",), "start": ("start",), "stop": ("stop",),
-    "restart": ("restart",),
-    **{alias: NPM_INSTALL_HOOKS for alias in (
-        "ci", "clean-install", "ic", "install-clean", "isntall-clean",
-        "install", "i", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal", "isntall", "add",
-    )},
-    **{alias: NPM_INSTALL_HOOKS + ("test",) for alias in (
-        "install-test", "it", "install-ci-test", "clean-install-test", "cit", "sit",
-    )},
+# Gate script discovery: the WORD RULE. Every word in a gated run body, or in a package
+# script that body runs, that names a repository script must be HIGH. There is no shell
+# parser and no interpreter option table, so a word in a comment, an echo or an argument
+# counts too. That over-approximation is the accepted cost: more scripts required HIGH,
+# never fewer.
+SCRIPT_EXTENSIONS = (".ps1", ".psm1", ".py", ".sh", ".bash", ".mjs", ".cjs", ".js")
+# `.ts` is a script only under a script-root segment (`tsx scripts/x.ts`), so a config file
+# such as `vitest.config.ts` is not.
+SCRIPT_ROOTS = ("scripts", "build", "tools")
+WORD = re.compile(r"""[^\s'"`;|&()<>=,]+""")
+TEST_RUNNERS = {"unittest", "pytest", "py.test"}
+# pytest options whose value is the next argument (core options and aliases, plus the common
+# xdist/cov ones), so `pytest -k smoke` or `pytest --maxfail 1` names no collection target.
+PYTEST_VALUE_OPTIONS = {
+    "-k", "-m", "-c", "-p", "-o", "-n", "-W", "-r", "--rootdir", "--confcutdir", "--basetemp", "--junitxml",
+    "--junit-xml", "--junit-prefix", "--cov", "--cov-report", "--ignore", "--ignore-glob", "--deselect", "--maxfail",
+    "--capture", "--tb", "--durations", "--durations-min", "--color", "--code-highlight", "--pastebin",
+    "--show-capture", "--import-mode", "--override-ini", "--config-file", "--inifile", "--pythonwarnings",
+    "--doctest-glob", "--doctest-report", "--assert", "--log-level", "--log-format", "--log-date-format",
+    "--log-cli-level", "--log-cli-format", "--log-cli-date-format", "--log-file", "--log-file-mode", "--log-file-level",
+    "--log-file-format", "--log-file-date-format", "--log-auto-indent", "--verbosity", "--numprocesses",
+    "--maxprocesses", "--dist", "--tx", "--rsyncdir", "--deselect", "--last-failed-no-failures", "--lfnf",
 }
+SHELL_OPERATOR = re.compile(r"[();|&]+")
+# shlex merges adjacent punctuation, so `&>`, `&>>`, `>|` and `>&` arrive as one token.
+REDIRECTION = re.compile(r"&?[<>]+[&|]?")
+# Words that run the next word as the command (`command pytest`, `env CI=1 pytest`).
+COMMAND_WRAPPERS = {"command", "exec", "env", "time"}
 
 
-_INSTALL_HOOK_REPOS = {}
-
-
-def repository_defines_install_hook(root):
-    """True when a package.json in the checkout (outside node_modules) defines an install hook.
-
-    With none, `npm ci` runs no script this checker could tier, wherever it runs, so `cd x &&
-    npm ci` and an unresolvable `npm install -w x` stay accepted. An unreadable package.json
-    counts as defining one: the fail-closed direction.
-    """
-    if root not in _INSTALL_HOOK_REPOS:
-        names = {prefix + name for name in NPM_INSTALL_HOOKS for prefix in ("pre", "", "post")}
-        found = False
-        for directory, subdirectories, files in os.walk(root):
-            subdirectories[:] = [name for name in subdirectories if name not in ("node_modules", ".git")]
-            if "package.json" not in files:
-                continue
-            try:
-                scripts = json.loads((Path(directory) / "package.json").read_text(encoding="utf-8-sig")).get("scripts") or {}
-                found = bool(names & set(scripts))
-            except (OSError, ValueError, AttributeError, TypeError):
-                found = True
-            if found:
-                break
-        _INSTALL_HOOK_REPOS[root] = found
-    return _INSTALL_HOOK_REPOS[root]
-# Options that move npm into another package. Each is resolved to that package's directory
-# by npm_package_dirs; a value it cannot resolve statically is refused.
-NPM_DIRECTORY_OPTIONS = ("--prefix", "-C", "--workspace", "-w", "--workspaces", "-ws", "--ws")
-# The directory options that take a separate value, which is not the subcommand.
-NPM_VALUED_DIRECTORY_OPTIONS = ("--prefix", "-C", "--workspace", "-w")
-
-
-def npm_selectors(npm_args):
-    """(option, value) for each directory option among npm's own arguments, in order."""
-    selectors, index = [], 0
-    while index < len(npm_args):
-        option, _, value = npm_args[index].partition("=")
-        if option in ("--include-workspace-root", "--iwr"):
-            selectors.append(("--include-workspace-root", value))
-        elif option in NPM_DIRECTORY_OPTIONS:
-            if option in NPM_VALUED_DIRECTORY_OPTIONS and not value:
-                value = npm_args[index + 1] if index + 1 < len(npm_args) else ""
-                index += 1
-            selectors.append((option, value))
+def pytest_targets(arguments):
+    """The collection targets among a pytest command's arguments: option values are not targets."""
+    targets, index = [], 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument.startswith("-"):
+            index += 2 if argument in PYTEST_VALUE_OPTIONS else 1
+            continue
+        targets.append(argument)
         index += 1
-    return selectors
+    return targets
 
 
-def npm_workspace_dirs(root, base):
-    """Repository-relative directories of the workspaces the package at `base` declares."""
-    package = root / base / "package.json" if base else root / "package.json"
+def shell_commands(line):
+    """A line's commands as token lists, split at unquoted `; | & && || ( )` as the shell splits them.
+    A redirection and its target (`> out.txt`, `2>&1`) are dropped. None when the quoting is unbalanced."""
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
     try:
-        declared = json.loads(package.read_text(encoding="utf-8-sig")).get("workspaces")
-    except (OSError, ValueError, AttributeError):
-        return []
-    if isinstance(declared, dict):
-        declared = declared.get("packages")
-    if not isinstance(declared, list):
-        return []
-    found = set()
-    for pattern in declared:
-        if not isinstance(pattern, str) or pattern.startswith("!") or ".." in pattern.split("/"):
-            continue
-        for candidate in (root / base).glob(pattern.rstrip("/")):
-            if (candidate / "package.json").is_file():
-                found.add(candidate.relative_to(root).as_posix())
-    return sorted(found)
-
-
-def npm_package_dirs(root, base, selectors):
-    """(directories, refusal) for an npm command run from `base` with `selectors`.
-
-    `--prefix`/`-C` name a directory relative to the current package; `--workspace`/`-w`
-    name a workspace of it by package name or by path (a parent path selects every
-    workspace under it); `--workspaces`/`--ws` select all of them. Each was refused
-    outright, which reddened every consumer whose gate runs `npm test` over workspaces.
-    A value read from an expression, a path leaving the repository and a workspace the
-    root package does not declare are still refused, since the script npm runs is unknown.
-    The prefix is applied first and the workspaces are those of the prefixed package;
-    `--workspaces=false` selects none; `--include-workspace-root` adds the package itself.
-    """
-    if not selectors:
-        return [base], None
-    current = base
-    prefixes = [(option, value) for option, value in selectors if option in ("--prefix", "-C")]
-    if prefixes:
-        # npm keeps the last value of a repeated option.
-        option, value = prefixes[-1]
-        if not value or re.search(r"[$`{%]", value):
-            return None, f"npm directory option `{option} {value}` is not a literal path"
-        raw = value.replace("\\", "/")
-        target = posixpath.normpath(posixpath.join(base or ".", raw))
-        # A drive-absolute `C:/x` is not absolute to posixpath, and joined to a subdirectory it
-        # reads `sub/C:/x`, so the drive is checked on the raw value.
-        if target == ".." or target.startswith("../") or posixpath.isabs(target) or re.match(r"[A-Za-z]:", raw):
-            return None, f"npm directory option `{option} {value}` leaves the repository"
-        current = "" if target == "." else target
-    include_root = any(option == "--include-workspace-root" and value.lower() in ("", "true") for option, value in selectors)
-    chosen_selectors = [
-        (option, value) for option, value in selectors
-        if option in ("--workspace", "-w") or (option in ("--workspaces", "-ws", "--ws") and value.lower() != "false")
-    ]
-    if not chosen_selectors:
-        return [current], None
-    directories = [current] if include_root else []
-    workspaces = npm_workspace_dirs(root, current)
-    for option, value in chosen_selectors:
-        if option in ("--workspaces", "-ws", "--ws"):
-            if not workspaces:
-                return None, f"npm option `{option}` selects no workspace the package at `{current or '.'}` declares"
-            directories.extend(workspaces)
-            continue
-        if not value or re.search(r"[$`{%]", value):
-            return None, f"npm workspace option `{option} {value}` is not a literal name or path"
-        path = posixpath.normpath(posixpath.join(current or ".", value.replace("\\", "/")))
-        chosen = []
-        for directory in workspaces:
-            try:
-                name = json.loads((root / directory / "package.json").read_text(encoding="utf-8-sig")).get("name")
-            except (OSError, ValueError, AttributeError):
-                name = None
-            if name == value or directory == path or directory.startswith(path + "/"):
-                chosen.append(directory)
-        if not chosen:
-            return None, f"npm workspace `{value}` is not a workspace the package at `{current or '.'}` declares"
-        directories.extend(chosen)
-    return sorted(set(directories)), None
-
-
-def npm_invocations(text, root=None):
-    """(offset, script name, selectors, installs) for each `npm` command in `text` that runs a package script.
-
-    `installs` is True when the name is a hook an install command runs, as opposed to the same
-    script run by name (`npm run prepare`): only an install also runs the workspaces' hooks.
-
-    `npm test` / `npm t` run `scripts.test` with its hooks just as `npm run test` does, and
-    reading only `run` left the most common gate command unfollowed. A directory option
-    (`--prefix`, `-C`, `--workspace`, `-w`) was read as a flag and its VALUE as the script
-    name, so the real script went untiered (CodeRabbit, mirror PR #140). The options are
-    returned as `selectors` for npm_package_dirs to resolve to the package npm runs in.
-    """
-    for match in NPM_COMMAND.finditer(text):
-        # `ls # npm run gate` runs no script (C1-F19).
-        if _in_shell_comment(text, match.start()):
-            continue
-        rest = text[match.end():]
-        end = COMMAND_END.search(mask_quoted(rest))
-        tokens = _interpreter_tokens(rest[:end.start()] if end else rest)
-        npm_args = tokens[:tokens.index("--")] if "--" in tokens else tokens
-        index, command = 0, None
-        while index < len(tokens):
-            token = tokens[index]
-            if token.startswith("-"):
-                # `npm --prefix frontend run lint`: the option's value is not the subcommand.
-                index += 2 if token in NPM_VALUED_DIRECTORY_OPTIONS else 1
-                continue
-            # The leading name characters only, so `$(npm run lint)` still reads `lint`.
-            command = NPM_NAME.match(token).group(0)
-            previous = tokens[index - 1] if index else ""
-            if command in NPM_RUN_COMMANDS or command in NPM_LIFECYCLE_COMMANDS or not previous.startswith("-") or "=" in previous:
-                break
-            # `npm --loglevel warn run gate`: an unknown word straight after a bare option is
-            # read as that option's value, so the real subcommand after it is still found.
-            index, command = index + 1, None
-        if command is None:
-            continue
-        if command not in NPM_LIFECYCLE_COMMANDS and command not in NPM_RUN_COMMANDS:
-            # `npm audit --prefix ui` runs no package script this reading follows.
-            continue
-        selectors = npm_selectors(npm_args)
-        if command in NPM_LIFECYCLE_COMMANDS:
-            # --ignore-scripts skips the install hooks (an explicit `test` still runs), and a
-            # global install never runs the local package's. Without a root nothing hook-shaped
-            # is known about the checkout, so the hooks are followed.
-            skip_hooks = (root is not None and not repository_defines_install_hook(root)) or any(
-                arg in ("-g", "--global", "--global=true", "--ignore-scripts", "--ignore-scripts=true") for arg in npm_args
-            )
-            for name in NPM_LIFECYCLE_COMMANDS[command]:
-                if not (skip_hooks and name in NPM_INSTALL_HOOKS):
-                    yield match.start(), name, selectors, name in NPM_INSTALL_HOOKS
-        elif command in NPM_RUN_COMMANDS:
-            index += 1
-            while index < len(tokens) and tokens[index].startswith("-"):
-                index += 1
-            name = NPM_NAME.match(tokens[index]).group(0) if index < len(tokens) else ""
-            if name:
-                yield match.start(), name, selectors, False
-            # `npm run --loglevel warn gate`: after a bare option the first word may be its
-            # value, so the next word is followed too. A missing script is skipped, so this
-            # only adds candidates.
-            previous = tokens[index - 1] if 0 < index < len(tokens) else ""
-            if name and previous.startswith("-") and "=" not in previous:
-                index += 1
-                while index < len(tokens) and tokens[index].startswith("-"):
-                    index += 1
-                following = NPM_NAME.match(tokens[index]).group(0) if index < len(tokens) else ""
-                if following:
-                    yield match.start(), following, selectors, False
-
-
-def printed_only(line, start):
-    """True when the text at `start` of `line` is merely the ARGUMENT of a printing command.
-
-    `echo "see scripts/report.py"` names a script it never runs. Reading the path out of
-    raw text forced that file HIGH and, beside a `cd`, reddened the required check
-    outright (tax portal review 20261101T004738Z, M18). The exemption is the one
-    changes_directory already applies to quoted strings: the command must be echo/printf/
-    Write-*, nothing before the text may open a substitution, and nothing after it may
-    pipe the text onward -- each of those EXECUTES the text. An unquoted `(` in the
-    printing command's own arguments counts as a substitution too: `echo (cmd)` and
-    `Write-Host (cmd)` run cmd under pwsh, `echo <(cmd)` runs it under bash (CodeRabbit,
-    PR #425).
-    """
-    if _holds_substitution(line):
-        return False
-    # BOTH quoting disciplines must agree, as changes_directory requires: the shell is not
-    # known here, and under bash rules the pwsh string `"C:\out\"` never closes, so a
-    # script run after it read as part of the printed string (C1-F8).
-    return all(_printed_under(line, start, powershell) for powershell in (False, True))
-
-
-def _printed_under(line, start, powershell):
-    masked = mask_quoted(line, powershell=powershell)
-    if PIPE.search(masked[start:].split("\n", 1)[0]):
-        return False
-    # The printing command must be on the reference's OWN logical line. A `before` that
-    # runs back to the start of the body lets MESSAGE_COMMAND's `$` match just before a
-    # trailing newline: an `echo` on the line above a script that starts its own line
-    # marks the script "only printed", and it escapes tiering (C1-F14). A quoted
-    # string that opened on an earlier line belongs to that line's command, and under
-    # bash a backslash-newline continues one. Under pwsh it does not (the continuation
-    # character there is a backtick, which printed_only refuses outright), so
-    # `Write-Host see \` then a script on the next line RUNS the script.
-    anchor = next(
-        (opened for opened, closed, _ in quoted_segments(line, powershell=powershell) if opened < start <= closed),
-        start,
-    )
-    line_start = anchor
-    while True:
-        line_start = line.rfind("\n", 0, line_start)
-        if powershell or line_start <= 0 or line[line_start - 1] != BACKSLASH:
-            break
-    before = masked[line_start + 1:start].replace("\n", " ")
-    command = MESSAGE_COMMAND.search(before)
-    return command is not None and "(" not in command.group(0)
-
-
-def npm_script_commands(root, bases, name, visited):
-    """(package directory, command) for every package.json script `npm run <name>` runs.
-
-    Resolved from each `base` directory's package.json, with the `pre<name>` and
-    `post<name>` hooks npm runs around it, and followed transitively through nested
-    `npm run` calls. A script reached only this way was invisible to the checker: the
-    frontend's `npm run lint:ratchet` ran `scripts/lintRatchet.mjs`, the file that
-    enforces a HIGH-tiered ratchet, and nothing required the script itself to be HIGH
-    (simulator-frontend review 20261101T004730Z, S7).
-    """
-    commands = []
-    for base in bases:
-        package = root / base / "package.json" if base else root / "package.json"
-        try:
-            scripts = json.loads(package.read_text(encoding="utf-8-sig")).get("scripts")
-        except (OSError, ValueError, AttributeError):
-            continue
-        if not isinstance(scripts, dict):
-            continue
-        if name == "restart" and not isinstance(scripts.get("restart"), str):
-            # With no `restart` script, `npm restart` runs `stop` then `start` (its own
-            # pre/post hooks still run around them).
-            for fallback in ("stop", "start"):
-                commands.extend(npm_script_commands(root, [base], fallback, visited))
-        for hook in (f"pre{name}", name, f"post{name}"):
-            command = scripts.get(hook)
-            if not isinstance(command, str) or (base, hook) in visited:
-                continue
-            visited.add((base, hook))
-            commands.append((base, command, None))
-            nested_runs = list(npm_invocations(command, root))
-            if nested_runs and changes_directory([command]):
-                # After a `cd` the nested npm runs in an unknown package (ide review, RV-13).
-                commands.append((base, None, f"cannot verify gate script paths after a directory change in package script `{hook}`; drop the `cd` and use npm --prefix"))
-                continue
-            for _, nested, selectors, installs in nested_runs:
-                # `"gate": "npm ci --workspace=pkg"` runs the root's install hooks too, as the same
-                # command written in `run:` does (issue 496). From one base, no package means a refusal.
-                directories, refusals = npm_command_packages(root, [base], selectors, installs)
-                if directories:
-                    commands.extend(npm_script_commands(root, directories, nested, visited))
-                commands.extend((base, None, refusal) for refusal in ([] if directories else refusals))
-    return commands
-
-
-def npm_command_packages(root, bases, selectors, installs):
-    """(packages, refusals): the package directories an npm command with `selectors` runs
-    scripts in, from any of `bases`, and the refusal from each base it does not resolve from.
-
-    An install runs more hooks than its selectors name (observed with npm 11.14; CodeRabbit,
-    PR #495): the package it runs from always, so `npm ci --workspace=pkg` still ran the root's
-    postinstall and prepare, and, with no workspace selector, every workspace's as well.
-    `npm run prepare` runs the one package's script only, so it does not expand.
-    """
-    every_workspace = not any(option in ("--workspace", "-w", "--workspaces", "-ws", "--ws") for option, _ in selectors)
-    prefixes = [(option, value) for option, value in selectors if option in ("--prefix", "-C")]
-    packages, refusals = [], []
-    for base in bases:
-        resolved, refusal = npm_package_dirs(root, base, selectors)
-        if refusal:
-            refusals.append(refusal)
-            continue
-        if installs:
-            # The prefix resolved above, so it resolves alone too: that is the package npm runs from.
-            for install_root in npm_package_dirs(root, base, prefixes)[0]:
-                resolved = resolved + [install_root] + (npm_workspace_dirs(root, install_root) if every_workspace else [])
-        packages.extend(directory for directory in resolved if directory not in packages)
-    return packages, refusals
-
-
-def script_references(body, directories, root):
-    """(relative path, applicable directories) for every gate-script reference `body`
-    makes, directly or through `npm run`.
-
-    Three readings, each only ADDING candidates (more scripts required HIGH, never fewer):
-    each physical line, as before; the body with bash line continuations folded, because
-    `scripts/ga\\` + newline + `te.py` is `scripts/gate.py` to bash and matched nothing
-    per line (adversarial review 20261031T213036Z, XL1); and the package.json commands
-    behind each `npm run <name>`, resolved against the package's own directory as well
-    as the body's. A reference that is only PRINTED is skipped -- see printed_only.
-    """
-    text = "\n".join(body)
-    folded = re.sub(r"\\\n[ \t]*", "", text)
-    for source in {text, folded}:
-        for match in GATE_SCRIPT.finditer(source):
-            # `npm test # was scripts/report.py` runs no script either (C1-CX4).
-            if printed_only(source, match.start(1)) or _in_shell_comment(source, match.start(1)):
-                continue
-            yield match.group(1).replace("\\", "/"), directories
-    bases = [""] + sorted(directory for directory in directories if directory and not directory.startswith("!"))
-    # Unsupported working-directory markers travel with every interpreter reference, so
-    # `working-directory: ${{ matrix.path }}` + `python gate.py` is refused, not resolved at the root.
-    markers = {directory for directory in directories if directory.startswith("!")}
-    for relative, extra in interpreter_references(folded, bases, root):
-        yield relative, extra | markers
-    for offset, name, selectors, installs in npm_invocations(folded, root):
-        if printed_only(folded, offset):
-            continue
-        packages, refusals = npm_command_packages(root, bases, selectors, installs)
-        # The root is always a candidate beside a working-directory, so a selector is refused
-        # only when it resolves from none of them (`--prefix ../x` leaves the root, not `sub`).
-        if not packages:
-            for refusal in refusals:
-                yield _refusal(refusal)
-        for base, command, nested_refusal in npm_script_commands(root, packages, name, set()):
-            if nested_refusal:
-                yield _refusal(nested_refusal)
-                continue
-            direct = list(GATE_SCRIPT.finditer(command))
-            references = [(script.group(1).replace("\\", "/"), directories | ({base} if base else set())) for script in direct]
-            # `"gate": "python3 gate.py"` runs a root-level script GATE_SCRIPT cannot see (CodeRabbit, PR #426).
-            # npm runs it from the package's own directory.
-            interpreted = [(relative, extra | markers) for relative, extra in interpreter_references(command, [base], root)]
-            # `"gate": "cd frontend && node gate.mjs"` runs frontend/gate.mjs, which nothing resolves
-            # from the package directory, so it was dropped untiered (ide review, RV-13). Refused
-            # exactly as a `cd` in the run body is: only when the script names something to run, so a
-            # path that is merely printed (`cd frontend && echo scripts/report.py`) does not refuse.
-            runs = interpreted or any(not printed_only(command, script.start()) and not _in_shell_comment(command, script.start()) for script in direct)
-            if runs and changes_directory([command]):
-                yield _refusal(f"cannot verify gate script paths after a directory change in package script `{name}`; drop the `cd` and use npm --prefix or working-directory:")
-                continue
-            yield from references + interpreted
-
-
-# A Python interpreter as a command word. The target after it is read by
-# interpreter_references; GATE_SCRIPT alone saw none of `-m`, `unittest discover -s` or a
-# root-level `python3 gate.py` (tax portal review 20261101T004738Z, M36).
-# A path prefix is allowed (`.venv/bin/python`, `/usr/bin/python3`; CodeRabbit, PR #426).
-# A closing quote may follow (`"C:\Program Files\Python\python.exe" gate.py`).
-PYTHON_COMMAND = re.compile(r"(?<![\w.-])python(?:3(?:\.\d+)*)?(?:\.exe)?(?=[\"']?[ \t])")
-# Spellings of the checkout root in a target path, read as the repository root.
-WORKSPACE_PREFIX = re.compile(r"^(?:\$\{?GITHUB_WORKSPACE\}?|\$\{\{\s*github\.workspace\s*\}\}|\$env:GITHUB_WORKSPACE)/")
-# A shell redirection token: complete on its own (`2>&1`, `>out.txt`), or one that takes the next
-# token as its file (`>`, `2>>`). Neither is an interpreter argument.
-REDIRECT_COMPLETE = re.compile(r"\d*>&(?:\d+|-)|&>>?\S+|\d*>>?\S+|\d*<\S+")
-REDIRECT_OPEN = re.compile(r"\d*>>?|&>>?|\d*<")
-# Interpreter options that consume the next token.
-PYTHON_VALUE_OPTIONS = {"-X", "-W", "-Q"}
-# pytest options whose value is a separate token, so it is not read as a path.
-PYTEST_VALUE_OPTIONS = {"-k", "-m", "-c", "-p", "-o", "-n", "-W", "-r", "--rootdir", "--confcutdir", "--basetemp", "--junitxml", "--cov", "--cov-report", "--ignore", "--deselect"}
-# unittest options whose value is a separate token (`-k smoke`), so it is not read as a target (Gitar, PR #426).
-UNITTEST_VALUE_OPTIONS = {"-k"}
-# Shell separators that end one command, searched in quote-masked text.
-COMMAND_END = re.compile(r";|&&|\|\||\||\n")
-
-
-def _resolve_under_bases(root, bases, relative):
-    """Root-relative committed paths of `relative` under each base directory."""
-    found = []
-    for base in bases:
-        candidate = f"{base}/{relative}" if base else relative
-        found.extend(resolve_committed_paths(root, candidate, allow_outside_repository=True))
-    return found
-
-
-def _glob_under_bases(root, bases, pattern, extensions):
-    """Root-relative committed files a shell glob names under each base directory.
-
-    The shell expands `node --test scripts/*.test.mjs`; the checker reads one literal name,
-    so every matching file would stay untiered (adversarial review 20261119T121117Z, C1-F2).
-    Only in-checkout files with a script extension count, as for a literal target.
-    """
-    found = []
-    root_resolved = root.resolve()
-    patterns = [pattern]
-    while any(re.search(r"\{[^{}]*,[^{}]*\}", item) for item in patterns):  # shell braces: `scripts/*.{mjs,js}`
-        expanded_patterns = []
-        for item in patterns:
-            brace = re.search(r"\{([^{}]*,[^{}]*)\}", item)
-            if brace:
-                expanded_patterns.extend(item[:brace.start()] + option + item[brace.end():] for option in brace.group(1).split(","))
-            else:
-                expanded_patterns.append(item)
-        patterns = expanded_patterns
-    # A brace group with no comma (`ci/{smoke}`) is literal to the shell; pathlib reads `{` as plain text too.
-    for base in bases:
-        matches = []
-        for item in patterns:
-            try:
-                matches.extend((root / base if base else root).glob(item))
-            except (NotImplementedError, ValueError, OSError):
-                continue  # an absolute or empty pattern: not a path under this base
-        for path in matches:
-            try:
-                path.resolve().relative_to(root_resolved)  # containment only: a symlink may point anywhere
-                relative = path.relative_to(root).as_posix()  # the spelling the shell was given, which resolve_committed_paths keeps
-            except (ValueError, OSError):
-                continue  # outside the checkout
-            if path.is_file() and relative.lower().endswith(extensions):
-                found.extend(resolve_committed_paths(root, relative, allow_outside_repository=True))
-    return sorted(set(found))
-
-
-def _files_matching(root, bases, start, patterns):
-    """(start resolved, files): every file under `start` (per base) matching a pattern.
-
-    Recursive. unittest discovery only descends into importable packages, so this can name
-    more files than ever run -- the fail-closed direction, more scripts required HIGH.
-    """
-    resolved_start = False
-    files = set()
-    root_resolved = root.resolve()
-    for base in bases:
-        directory = (root / base / start) if base else (root / start)
-        try:
-            directory = directory.resolve()
-        except OSError:
-            continue
-        if not directory.is_dir() or not is_within(directory, root_resolved):
-            continue
-        resolved_start = True
-        for pattern in patterns:
-            for path in directory.rglob(pattern):
-                if path.is_file() and ".git" not in path.relative_to(root_resolved).parts:
-                    files.add(path.relative_to(root_resolved).as_posix())
-    return resolved_start, files
-
-
-def interpreter_references(text, bases, root):
-    """(relative path, directories) for every repo file a `python ...` command runs.
-
-    Covers what GATE_SCRIPT's path pattern cannot see: `python -m unittest discover -s D
-    -p P` (every file the pattern matches under D), `python -m pytest <paths>` (each
-    file, or each test module and conftest.py under a directory), `python -m pkg.mod`
-    when `pkg/mod.py` or its package is in the checkout, and `python <file>.py` at any
-    path, root level included.
-
-    FAIL-CLOSED where the target names repository content that cannot be resolved: a
-    discover start directory or a pytest path that does not exist, or a `-m` module whose
-    top-level package is in the checkout but whose file is not. Those are refused rather
-    than passed, because an unresolved target is a gate script nobody can require HIGH
-    (owner decision, PR #425 M36). A module with no trace in the checkout (`pip`, `venv`,
-    `pytest` itself) is an installed tool, not repo code, and passes.
-
-    THE BOUNDARY: a module reached only through PYTHONPATH or an installed editable
-    package is read as a tool. Review of the workflow change is the control there.
-    """
-    for match in PYTHON_COMMAND.finditer(text):
-        if printed_only(text, match.start()) or _in_shell_comment(text, match.start()):
-            continue
-        rest = text[match.end():].lstrip("\"'")
-        end = COMMAND_END.search(mask_quoted(rest))
-        segment = rest[:end.start()] if end else rest
-        # A shell comment is not an argument (`python -m pytest ci # run tests`).
-        comment = re.search(r"(?:^|[ \t])#", mask_quoted(segment))
-        if comment:
-            segment = segment[:comment.start()]
-        tokens = _interpreter_tokens(segment)
-        index = 0
-        while index < len(tokens) and tokens[index].startswith("-") and tokens[index] not in ("-m", "-c"):
-            index += 2 if tokens[index] in PYTHON_VALUE_OPTIONS else 1
-        if index >= len(tokens) or tokens[index] == "-c":
-            continue
-        if tokens[index] != "-m":
-            target, rooted = WORKSPACE_PREFIX.subn("", tokens[index].replace("\\", "/"))
-            if target.endswith(".py"):
-                # A workspace-rooted target names the root file only, whatever working-directory says (CodeRabbit, PR #426).
-                found = _resolve_under_bases(root, [""] if rooted else bases, target)
-                for relative in found:
-                    yield relative, set()
-                # Unresolved here, a relative target is still yielded raw so gate_script_paths
-                # applies its directory-change refusal: `cd sub` then `python3 gate.py` runs
-                # sub/gate.py, which nothing above resolves (CodeRabbit, PR #426). An absolute,
-                # home or variable path is outside the checkout and is not a repo gate script,
-                # and a workspace-rooted one that is absent is not in the checkout at all.
-                if not found and not rooted and not re.match(r"^(?:[/~$]|[A-Za-z]:)", target):
-                    yield target, {base for base in bases if base}
-            continue
-        if index + 1 >= len(tokens):
-            continue
-        module, args = tokens[index + 1], tokens[index + 2:]
-        if module == "unittest":
-            yield from _unittest_references(root, bases, args)
-        elif module in ("pytest", "py.test"):
-            yield from _pytest_references(root, bases, args)
-        else:
-            yield from _module_references(root, bases, module)
-    yield from _other_interpreter_references(text, bases, root)
-
-
-# Non-Python interpreters as a command word. `bash ./gate.sh`, `pwsh gate.ps1` and `node
-# gate.mjs` name a script GATE_SCRIPT cannot see when it sits at the root or outside
-# `scripts/`, `build/` and `tools/`, so a merge-blocking gate script could be edited in a
-# NORMAL-tier PR. Python already read these; this widens the same read to a short list.
-OTHER_INTERPRETER_COMMAND = re.compile(r"(?<![\w.-])(?:bash|sh|zsh|pwsh|powershell|node)(?:\.exe)?(?=[\"']?[ \t])")
-# Flags after which the rest of the command is inline code or a value, not a script path.
-_INLINE_FLAGS = {
-    # `-s` reads the commands from stdin, so the word after it is an argument, not the script.
-    "bash": {"-c", "-s"}, "sh": {"-c", "-s"}, "zsh": {"-c", "-s"},
-    "pwsh": {"-c", "-command", "-e", "-ec", "-encodedcommand"},
-    "powershell": {"-c", "-command", "-e", "-ec", "-encodedcommand"},
-    "node": {"-e", "--eval", "-p", "--print"},
-}
-# The script extensions each interpreter's gate scripts carry. GATE_SCRIPT draws the same line
-# for scripts under `scripts/` (`.jsx` is deliberately not a gate script), so an existing file
-# with another extension is not named here either.
-_SCRIPT_EXTENSIONS = {
-    "bash": (".sh", ".bash"), "sh": (".sh", ".bash"), "zsh": (".sh", ".zsh"),
-    "pwsh": (".ps1",), "powershell": (".ps1",),
-    "node": (".js", ".mjs", ".cjs"),
-}
-# Options that take the next token as their value, per interpreter: one shared table read
-# `bash -r gate.sh` (restricted shell, no value) as node's `-r <module>` and swallowed the
-# script (ide review, RV-15). pwsh is matched case-folded, the others as written (node `-C` is
-# --conditions and takes a value; `-c` is --check and does not).
-_VALUE_FLAGS = {
-    "bash": {"-O", "--rcfile", "--init-file"}, "sh": {"-O"}, "zsh": {"-O"},
-    "pwsh": {"-executionpolicy", "-ep", "-workingdirectory", "-wd", "-o", "-w", "-configurationname"},
-    "node": {"-r", "--require", "--import", "--loader", "--experimental-loader", "-C", "--conditions"},
-}
-_VALUE_FLAGS["powershell"] = _VALUE_FLAGS["pwsh"]
-
-
-def _other_interpreter_target(interpreter, tokens):
-    """The script named by an interpreter command's tokens, or None when it runs inline code."""
-    inline = _INLINE_FLAGS.get(interpreter, set())
-    index = 0
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    commands, current, index = [], [], 0
     while index < len(tokens):
         token = tokens[index]
-        folded = token.lower()
-        if not token.startswith("-"):
-            return token
-        if folded in inline:
-            return None
-        # Grouped short options (`bash -es gate.sh`, `bash -ec '...'`): a `c` or `s` anywhere in
-        # the group selects inline code or stdin, exactly as the lone flag does.
-        if interpreter in ("bash", "sh", "zsh") and re.fullmatch(r"-[A-Za-z]+", token) and set(token[1:]) & {"c", "s"}:
-            return None
-        if interpreter in ("bash", "sh", "zsh") and re.fullmatch(r"-[A-Za-z]*o", token):
-            index += 2  # `-eo pipefail`: a group ending in `o` takes the next word as its option name
-            continue
-        if folded == "-file":
-            return tokens[index + 1] if index + 1 < len(tokens) else None
-        index += 2 if (folded if interpreter in ("pwsh", "powershell") else token) in _VALUE_FLAGS[interpreter] else 1
-    return None
-
-
-def _other_interpreter_references(text, bases, root):
-    """(relative path, directories) for each script a bash/sh/pwsh/node command runs.
-
-    Only an EXISTING committed file is yielded, so this can only add detections: an argument
-    that is not a path in the checkout (`bash --version`, `sh -c ...`) adds nothing.
-    """
-    for match in OTHER_INTERPRETER_COMMAND.finditer(text):
-        if printed_only(text, match.start()) or _in_shell_comment(text, match.start()):
-            continue
-        rest = text[match.end():].lstrip("\"'")
-        end = COMMAND_END.search(mask_quoted(rest))
-        segment = rest[:end.start()] if end else rest
-        comment = re.search(r"(?:^|[ \t])#", mask_quoted(segment))
-        if comment:
-            segment = segment[:comment.start()]
-        interpreter = re.sub(r"(?i)\.exe$", "", match.group(0).strip("\"'")).lower()
-        target = _other_interpreter_target(interpreter, _interpreter_tokens(segment))
-        # A glob may end in `*`, `}` or `/*` (`node --test scripts/*`): its extension is judged on
-        # each file it matches, in _glob_under_bases, not on the pattern text.
-        is_glob = bool(target) and re.search(r"[*?\[{]", target) is not None
-        if not target or not (is_glob or target.lower().endswith(_SCRIPT_EXTENSIONS[interpreter])):
-            continue
-        target, rooted = WORKSPACE_PREFIX.subn("", target.replace("\\", "/"))
-        found = _resolve_under_bases(root, [""] if rooted else bases, target)
-        if is_glob:
-            # The shell expands an unquoted glob even when a file is literally named like it.
-            # One that matches nothing here is still yielded raw below: after `cd ci`, bash expands
-            # `checks/*` from `ci`, so only the directory-change refusal can catch it (issue 496).
-            found = sorted(set(found) | set(_glob_under_bases(root, [""] if rooted else bases, target, _SCRIPT_EXTENSIONS[interpreter])))
-        for relative in found:
-            yield relative, set()
-        # Unresolved here, a relative target is still yielded raw so gate_script_paths applies
-        # its directory-change refusal, exactly as the Python branch does: `cd sub` then
-        # `bash gate.sh` runs sub/gate.sh, which nothing above resolves.
-        if not found and not rooted and not re.match(r"^(?:[/~$]|[A-Za-z]:)", target):
-            yield target, {base for base in bases if base}
-
-
-def _in_shell_comment(text, start):
-    """True when `start` follows an unquoted `#` on its line: `# python3 -m pytest ci` runs nothing (CodeRabbit, PR #426).
-
-    Under BOTH quoting disciplines, since the shell is not known here: a `#` that only one
-    of them reads as unquoted may be string content under the shell that runs the body.
-    The text is read from its START, not from the start of the line: a string opened on
-    an earlier line can still be open here, and a `#` inside it is not a comment. A quote
-    inside an earlier comment opens nothing (see _comment_indexes).
-    """
-    if _holds_substitution(text):
-        return False
-    return all(start in _comment_indexes(text, powershell) for powershell in (False, True))
-
-
-def _holds_substitution(text):
-    """True when `text` holds a command substitution, `$(...)` or backticks, or an ANSI-C string `$'..'`.
-
-    An ANSI-C string keeps `\'` inside the string, which neither quote scanner models, so
-    `label=$'can\'t # note'; python3 scripts/gate.py` reads the command as a comment
-    (fixportal-agents-skills#486).
-
-    A substitution runs its commands wherever it sits, a comment included in a string, and
-    its own quotes nest inside the string around it: in `echo "$(echo " # "; python3
-    scripts/gate.py;)"` the second quote does not close the first. Neither quote scanner
-    models that nesting, so with a substitution anywhere in the text nothing is vouched for
-    as a comment. The cost is a script named in a real comment being required HIGH.
-    printed_only draws the same line.
-    """
-    return "$(" in text or "`" in text or "$'" in text
-
-
-def _comment_indexes(text, powershell):
-    """The indexes of `text` inside an unquoted `#` comment, by one shell's quoting rules.
-
-    mask_quoted's quote rules, plus the one it lacks: a comment runs to the end of its
-    line and a quote character inside it opens nothing.
-    """
-    inside, quote, index = set(), None, 0
-    while index < len(text):
-        char = text[index]
-        if powershell and quote == "'" and char == "'" and text[index + 1:index + 2] == "'":
-            index += 2
-            continue
-        if (
-            (powershell and quote == '"' and char == "`")
-            or (not powershell and quote != "'" and char == BACKSLASH)
-        ) and index + 1 < len(text):
-            index += 2
-            continue
-        if quote is None and char == "#" and (index == 0 or text[index - 1] in " \t\n"):
-            end = text.find("\n", index)
-            end = len(text) if end == -1 else end
-            inside.update(range(index, end))
-            index = end
-            continue
-        if quote is None and char in "'\"":
-            quote = char
-        elif quote == char:
-            quote = None
-        index += 1
-    return inside
-
-
-def without_agreed_comments(text):
-    """`text` with every character BOTH shells read as comment text blanked.
-
-    A feeder body keeps its `#` lines, because one can close a string opened above it.
-    But the quote scanners do not know a comment from code, so a quote inside a real
-    comment (`# "`) opened a string that swallowed the commands on later lines, and a
-    script they run went untiered (CodeRabbit, PR #479). Blanking what both shells agree
-    is a comment removes those quotes; text only one shell reads as a comment stays, since
-    it may be code under the shell that runs the body.
-    """
-    agreed = _comment_indexes(text, False) & _comment_indexes(text, True)
-    return "".join(" " if index in agreed else char for index, char in enumerate(text))
-
-
-def body_readings(body):
-    """The readings of one run body that gate_script_paths must check, as lists of lines.
-
-    Always the body with its agreed comments blanked. When the body holds a command
-    substitution that reading is not enough: the substitution's nested quotes can make a
-    quoted `#` and the command after it look like a comment, which blanking then deletes
-    (see _holds_substitution). So the body as written is read as well, and gate_script_paths
-    takes every script reference and every directory change EITHER reading finds. Two
-    readings can only add detections, which is the direction an uncertain parse must err.
-    """
-    raw = "\n".join(body)
-    blanked = without_agreed_comments(raw)
-    yield blanked.split("\n")
-    if _holds_substitution(raw) and blanked != raw:
-        yield list(body)
-
-
-def _interpreter_tokens(segment):
-    """The words of one interpreter command, quotes stripped, redirections dropped.
-
-    Non-POSIX shlex, because POSIX mode treats a backslash as an escape and turns
-    `.\\ci\\gate.py` into `.cigate.py` (CodeRabbit, PR #426). Quotes are stripped per
-    token, which also cleans a token cut from inside `bash -c "python3 gate.py"`.
-    """
-    try:
-        raw = shlex.split(segment, posix=False)
-    except ValueError:
-        raw = segment.split()
-    # A word ending in one backslash escaped the space after it (`gate\ script.py` in bash). Not
-    # before an option: `tests\ -q` is a Windows trailing separator, not an escape (Gitar, PR #426).
-    words = []
-    for word in raw:
-        if words and words[-1].endswith("\\") and not words[-1].endswith("\\\\") and not word.startswith("-"):
-            words[-1] = words[-1][:-1] + " " + word
+        if REDIRECTION.fullmatch(token):
+            if current and current[-1].isdigit():
+                current.pop()  # the fd of `2>&1`
+            index += 1  # and its target
+        elif SHELL_OPERATOR.fullmatch(token):
+            commands.append(current)
+            current = []
         else:
-            words.append(word)
-    tokens, skip = [], False
-    for token in (word.strip("\"'") for word in words):
-        if skip:
-            skip = False
-            continue
-        # A redirection attached to an argument (`gate.py>out.txt`) is split off it.
-        attached = re.search(r"[<>]", token)
-        if attached and attached.start() > 0 and not token[:attached.start()].isdigit() and token[attached.start() - 1] != "&":
-            token, redirect = token[:attached.start()], token[attached.start():]
-            skip = bool(REDIRECT_OPEN.fullmatch(redirect))
-        elif REDIRECT_COMPLETE.fullmatch(token):
-            continue
-        elif REDIRECT_OPEN.fullmatch(token):
-            skip = True
-            continue
-        if token:
-            tokens.append(token)
-    return tokens
-
-
-def _refusal(message):
-    return "", {"!unsupported " + message}
-
-
-def _unittest_references(root, bases, args):
-    if args and args[0] == "discover":
-        start, pattern, positional, index = ".", "test*.py", [], 1
-        while index < len(args):
-            arg = args[index]
-            if arg in UNITTEST_VALUE_OPTIONS:
-                index += 2
-                continue
-            if arg in ("-s", "--start-directory", "-p", "--pattern", "-t", "--top-level-directory") and index + 1 < len(args):
-                if arg in ("-s", "--start-directory"):
-                    start = args[index + 1]
-                elif arg in ("-p", "--pattern"):
-                    pattern = args[index + 1]
-                index += 2
-                continue
-            if not arg.startswith("-"):
-                positional.append(arg)
-            index += 1
-        if positional:
-            start = positional[0]
-        if len(positional) > 1:
-            pattern = positional[1]
-        resolved, files = _files_matching(root, bases, start.replace("\\", "/"), [pattern])
-        if not resolved:
-            yield _refusal(f"cannot resolve the unittest discover start directory '{start}'; run the gate's tests from a directory in the checkout")
-        for relative in sorted(files):
-            yield relative, set()
-        return
-    names, index = [], 0
-    while index < len(args):
-        if args[index] in UNITTEST_VALUE_OPTIONS:
-            index += 2
-            continue
-        if not args[index].startswith("-"):
-            names.append(args[index])
+            current.append(token)
         index += 1
-    if not names:
-        yield from _unittest_references(root, bases, ["discover"])
-        return
-    for name in names:
-        relative = name.replace("\\", "/") if name.endswith(".py") or "/" in name else name.replace(".", "/") + ".py"
-        found = _resolve_under_bases(root, bases, relative)
-        if not found:
-            # A dotted name may stop at a class or method: try each shorter prefix as a module.
-            parts = name.split(".")
-            for cut in range(len(parts) - 1, 0, -1):
-                found = _resolve_under_bases(root, bases, "/".join(parts[:cut]) + ".py")
-                if found:
-                    break
-        if not found:
-            yield _refusal(f"cannot resolve the unittest target '{name}' to a file in the checkout")
-        for relative in found:
-            yield relative, set()
+    return [command for command in commands + [current] if command]
 
 
-def _pytest_references(root, bases, args):
-    paths, index = [], 0
-    while index < len(args):
-        arg = args[index]
-        if arg.startswith("-"):
-            index += 2 if arg in PYTEST_VALUE_OPTIONS else 1
-            continue
-        paths.append(arg.split("::", 1)[0].replace("\\", "/"))
-        index += 1
-    for path in paths or ["."]:
-        if path.endswith(".py"):
-            found = _resolve_under_bases(root, bases, path)
-            if not found:
-                yield _refusal(f"cannot resolve the pytest target '{path}' to a file in the checkout")
+def pytest_invocations(commands):
+    """The argument list of each command that runs pytest (by basename, at command position, after
+    assignments or a wrapper, or after `-m`)."""
+    for command in commands:
+        for index, token in enumerate(command):
+            if posixpath.basename(token) not in ("pytest", "py.test"):
+                continue
+            leading = command[:index]
+            if all(re.match(r"[A-Za-z_]\w*=", word) or word in COMMAND_WRAPPERS for word in leading) or (leading and leading[-1] == "-m"):
+                yield command[index + 1:]
+
+
+def runs_pytest_from_root(commands):
+    """True when a command is pytest with no target."""
+    return any(not pytest_targets(arguments) and not {"--version", "-V"} & set(arguments) for arguments in pytest_invocations(commands))
+
+
+def pytest_option_values(commands):
+    """The values pytest options take (`--ignore-glob '*slow*'`, `-k=x`): never discovery patterns."""
+    values = set()
+    for arguments in pytest_invocations(commands):
+        for index, argument in enumerate(arguments):
+            option, equals, value = argument.partition("=")
+            if equals and option in PYTEST_VALUE_OPTIONS:
+                values.add(value)
+            elif argument in PYTEST_VALUE_OPTIONS and index + 1 < len(arguments):
+                values.add(arguments[index + 1])
+    return values
+PACKAGE_MANAGERS = {"npm", "npx", "pnpm", "yarn"}
+NPM_LIFECYCLE = {"test": "test", "t": "test", "tst": "test", "start": "start", "stop": "stop", "restart": "restart"}
+NPM_INSTALL = {"ci", "install", "i"}
+NPM_ELSEWHERE = {"-w", "--workspace", "--workspaces", "-ws", "--ws", "--prefix", "-C"}
+# A directory command at COMMAND position: line start; after ; & | ( { or a backtick; opening
+# a `-c`/`-Command` string; then optional shell keywords, `command`/`builtin` and assignment
+# prefixes. Not quote- or comment-aware, so `echo "a; cd b"` and `# ; cd b` count. The word
+# ends at whitespace, a separator, a redirection or `$` (`cd$X` runs cd when X is empty).
+# An assignment value is a run of disjoint pieces, each told apart by its first character: a quoted
+# string (escapes honoured inside double quotes), a backslash escape (`X=\" cd sub`), or one plain
+# character. An unquoted branch that could also eat quotes backtracked exponentially (CodeQL
+# py/redos, observatory PR #468; escapes, PR #505 review).
+DIRECTORY_CHANGE = re.compile(
+    r"(?:^|[;&|({`]|(?<![\w-])-c(?:ommand)?[ \t]+[\"'])[ \t]*"
+    r"(?:(?:then|do|else|if|elif|while|until|!)[ \t]+)*"
+    r"(?:(?:command|builtin)[ \t]+|[A-Za-z_][A-Za-z0-9_]*=(?:\"(?:[^\"\\\n]|\\.)*\"|'[^'\n]*'|\\.|[^\s;&|\"'\\])*[ \t]+)*"
+    r"(?:cd|chdir|pushd|sl|set-location|push-location)(?=[\s;&|()`<>$]|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+WORKSPACE_PREFIX = re.compile(r"^(?:\$\{?GITHUB_WORKSPACE\}?|\$env:GITHUB_WORKSPACE)/", re.IGNORECASE)
+
+
+def is_script(path):
+    lowered = path.lower()
+    if lowered.endswith(".ts"):
+        return any(part in SCRIPT_ROOTS for part in lowered.split("/")[:-1])
+    return lowered.endswith(SCRIPT_EXTENSIONS)
+
+
+def repository_files(root):
+    """Repository-relative files: git's tracked and not-ignored files in a work tree, else a walk.
+
+    Untracked files count: the rollout runs this on assets it has just copied in, before any
+    commit. Ignored files do not: a local build output is not reviewable content.
+    """
+    if (root / ".git").exists():
+        try:
+            listed = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                                    capture_output=True, check=True).stdout
+            return {path for path in listed.decode("utf-8", "replace").split("\0") if path}
+        except (OSError, subprocess.CalledProcessError):
+            pass  # not readable as a repository here (no git, unsafe ownership): walk instead
+    files = set()
+    for directory, subdirectories, names in os.walk(root):
+        subdirectories[:] = [name for name in subdirectories if name not in (".git", "node_modules")]
+        base = Path(directory).relative_to(root).as_posix()
+        files.update(name if base == "." else f"{base}/{name}" for name in names)
+    return files
+
+
+def changes_directory(text):
+    """True when `text` runs a directory command at command position (see DIRECTORY_CHANGE)."""
+    return DIRECTORY_CHANGE.search(text) is not None
+
+
+def npm_flag_value(args, names):
+    """npm's effective value for a Boolean option spelled as any of `names`: the last of `--x`,
+    `--x true|false` (WORD splits `--x=false` the same way) or `--no-x` wins. An unknown value
+    reads False, so the hooks are followed."""
+    value = False
+    for index, arg in enumerate(args):
+        if arg in names:
+            following = args[index + 1] if index + 1 < len(args) else ""
+            value = following.lower() != "false"
+        elif arg.startswith("--no-") and "--" + arg[5:] in names:
+            value = False
+    return value
+
+
+class ScriptWords:
+    """The repository scripts that the words of run bodies and package scripts name."""
+
+    def __init__(self, root):
+        self.root = root
+        self.files = repository_files(root)
+        self.directories = {path.lower().rsplit("/", 1)[0] for path in self.files if "/" in path}
+        for directory in list(self.directories):
+            while "/" in directory:
+                directory = directory.rsplit("/", 1)[0]
+                self.directories.add(directory)
+
+    def committed(self, relative, allow_outside):
+        # Only repository files: an untracked build output on the host is not reviewable.
+        return [path for path in resolve_committed_paths(self.root, relative, allow_outside) if is_script(path) and path in self.files]
+
+    def beneath(self, directory, wanted):
+        prefix = "" if directory == "." else directory.lower() + "/"
+        return {path for path in self.files if path.lower().startswith(prefix) and wanted(path)}
+
+    def attempt(self, text, bases, testing, patterns, speculative):
+        found = set()
+        for base in bases:
+            joined = posixpath.join(base, text) if base else text
+            path = posixpath.normpath(joined)
+            absolute = path.startswith("/") or re.match(r"[A-Za-z]:", path) is not None
+            # Only the bare relative spelling with no working directory is the sole evidence
+            # there is, so only it keeps resolve_committed_paths' outside-repository exit.
+            allow_outside = speculative or absolute or bool(base) or len(bases) > 1
+            if absolute or path == ".." or path.startswith("../"):
+                if text.lower().endswith(SCRIPT_EXTENSIONS + (".ts",)):
+                    found.update(self.committed(joined, allow_outside))
+                continue
+            if any(char in text for char in "*?[") and "/" in text:
+                # `*` and `?` stay inside one path segment, as the shell reads them. A brace
+                # list is split at its comma into separate words, so `{...` widens to `*`.
+                segments = re.sub(r"\{[^/]*", "*", path).split("/")
+                found.update(
+                    script for script in self.files
+                    if len(script.split("/")) == len(segments)
+                    and all(fnmatch.fnmatchcase(part, pattern) for part, pattern in zip(script.split("/"), segments))
+                    and is_script(script)
+                )
+                if testing:
+                    # `pytest checks/*` also runs each directory the glob names (CodeRabbit, PR #503).
+                    for directory in self.directories:
+                        if len(directory.split("/")) == len(segments) and all(
+                                fnmatch.fnmatchcase(part, pattern.lower()) for part, pattern in zip(directory.split("/"), segments)):
+                            found |= self.beneath(directory, lambda script: script.endswith(".py") and (
+                                not patterns or any(fnmatch.fnmatchcase(posixpath.basename(script), p) for p in patterns)))
+            elif path.lower() in self.directories or path == ".":
+                if testing:
+                    found |= self.beneath(path, lambda script: script.endswith(".py") and (
+                        not patterns or any(fnmatch.fnmatchcase(posixpath.basename(script), p) for p in patterns)))
+                elif "/" in text and any(part in SCRIPT_ROOTS for part in path.lower().split("/")):
+                    found |= self.beneath(path, is_script)
+            elif text.lower().endswith(SCRIPT_EXTENSIONS + (".ts",)):
+                found.update(self.committed(joined, allow_outside))
+        return {committed for path in found for committed in resolve_committed_paths(self.root, path, True) if committed in self.files}
+
+    def named(self, word, bases, testing=False, patterns=()):
+        """Repository scripts one word names, read from each base directory."""
+        word = word.replace("\\", "/")
+        rooted, count = WORKSPACE_PREFIX.subn("", word)
+        if count:
+            word, bases = rooted, [""]
+        hits = self.attempt(word, bases, testing, patterns, False)
+        # A prefixed spelling (`$PWD/ci/gate.sh`, `sub/scripts/x.py`) names its longest suffix
+        # of two or more segments. A prefix that climbs above its own start names a file
+        # outside the checkout, so its suffixes are not tried.
+        parts, depth = word.split("/"), 0
+        for index in range(1, len(parts) - 1):
+            depth += -1 if parts[index - 1] == ".." else 0 if parts[index - 1] in ("", ".") else 1
+            if hits or depth < 0:
+                break
+            if ".." in parts[index:]:
+                continue  # a climb in the suffix is resolved by the full spelling, not guessed
+            hits = self.attempt("/".join(parts[index:]), bases, testing, patterns, True)
+        return hits
+
+    def scan(self, text, bases, found, job_id, seen):
+        """Record every script `text` names, following the package scripts it runs.
+
+        Returns True when the text names, or may run, a script: a resolved script, a
+        script-shaped word, a path glob, or a package-manager word. A directory change in such a text
+        exits, because the paths after it resolve from a directory nothing here knows.
+        """
+        refers = False
+        for line in re.sub(r"\\\r?\n[ \t]*", "", text).splitlines():
+            spans = list(WORD.finditer(line))
+            words = [span.group() for span in spans]
+            # Each shell command on the line, quotes honoured and split at `; | & ( )`, so a later
+            # command's words are not the runner's arguments (PR #505 review).
+            commands = shell_commands(line) or [words]
+            # A quoted path with a space (`python3 "scripts/quality checks.py"`) is a word too: WORD
+            # splits it (CodeRabbit, observatory PR #468).
+            words = words + [token for command in commands for token in command if re.search(r"\s", token)]
+            # A runner by its basename too (`.venv/bin/pytest tests`), and a pytest run with no target
+            # collects from the root (`pytest`, `python3 -m pytest -q`; observatory review, C1-F9).
+            root_run = runs_pytest_from_root(commands)
+            if root_run:
+                words = words + ["."]
+            pytest_line = root_run or any(posixpath.basename(token) in ("pytest", "py.test") for command in commands for token in command)
+            testing = pytest_line or bool(TEST_RUNNERS & set(words))
+            # A discovery pattern (`-p 'test_*.py'`) narrows which files of a named directory run.
+            # A pytest option's value (`--ignore-glob '*slow*'`) is not one (PR #505 second review).
+            option_values = pytest_option_values(commands)
+            patterns = [word for word in words if testing and "/" not in word and "*" in word and word not in option_values]
+            for index, word in enumerate(words):
+                hits = self.named(word, bases, testing and not word.startswith("-"), patterns)
+                if word == "-m" and index + 1 < len(words):
+                    module = words[index + 1].replace(".", "/")
+                    hits |= self.named(module + ".py", bases) | self.named(module + "/__main__.py", bases)
+                    package = module.split("/")
+                    for depth in range(1, len(package) + 1):
+                        hits |= self.attempt("/".join(package[:depth]) + "/__init__.py", bases, False, (), True)
+                if pytest_line:
+                    # pytest also imports every conftest.py above a target, up to the root, and
+                    # pytest 9.1.1 did so for a target directory holding no test module at all.
+                    targets = [posixpath.join(hit, "_") for hit in (posixpath.normpath(posixpath.join(base, word) if base else word) for base in bases)
+                               if hit.lower() in self.directories]
+                    for hit in list(hits) + targets:
+                        directory = posixpath.dirname(hit)
+                        while True:
+                            conftest = posixpath.join(directory, "conftest.py") if directory else "conftest.py"
+                            if conftest in self.files:
+                                hits.add(conftest)
+                            if not directory:
+                                break
+                            directory = posixpath.dirname(directory)
+                for hit in hits:
+                    found.setdefault(hit, job_id)
+                # A path glob may expand to a script from a directory a `cd` moved to (`cd ci && node --test checks/*`).
+                glob = "/" in word and any(char in word for char in "*?[")
+                refers = refers or bool(hits) or glob or word in PACKAGE_MANAGERS or word.lower().endswith(SCRIPT_EXTENSIONS + (".ts",))
+                if word in PACKAGE_MANAGERS:
+                    # The command's own flags end at a separator or a comment: neither `npm ci #
+                    # --ignore-scripts` nor `npm ci; echo --ignore-scripts` passes the flag to npm.
+                    own = line[spans[index].start():]
+                    end = re.search(r"[;&|]|(?:^|\s)#", own)
+                    own = own[:end.start()] if end else own
+                    # A quote before the boundary may hide a separator (`--cache './c;l'`): the end is
+                    # unknown, so no flag is trusted and the hooks are followed. npm also stops reading
+                    # options at `--` (npm 11.18.0 ran the hooks for `npm ci -- --ignore-scripts`).
+                    flags = [] if re.search(r"[\"'`]", own) else WORD.findall(own)
+                    flags = flags[:flags.index("--")] if "--" in flags else flags
+                    self.package_scripts(words[index:], bases, found, job_id, seen, flags)
+        return refers
+
+    def package_scripts(self, words, bases, found, job_id, seen, flags=()):
+        elsewhere = any(word in NPM_ELSEWHERE for word in words)
+        if elsewhere:
+            packages = {path for path in self.files if posixpath.basename(path) == "package.json"}
         else:
-            resolved, files = _files_matching(root, bases, path, ["test_*.py", "*_test.py", "conftest.py"])
-            if not resolved:
-                yield _refusal(f"cannot resolve the pytest target '{path}' in the checkout")
-            found = sorted(files)
-        for relative in found:
-            yield relative, set()
-            # pytest also imports every conftest.py from its rootdir down to a collected file, and one
-            # can skip the gate's tests (ide review, RV-14; observed with pytest 9.1). Every ancestor up
-            # to the repository root is named, whatever --rootdir/--confcutdir say: a superset.
-            parts = relative.split("/")
-            for depth in range(len(parts)):
-                for conftest in resolve_committed_paths(root, "/".join(parts[:depth] + ["conftest.py"]), allow_outside_repository=True):
-                    yield conftest, set()
-
-
-def _module_references(root, bases, module):
-    parts = module.split(".")
-    stem = "/".join(parts)
-    for relative in (stem + ".py", stem + "/__main__.py"):
-        found = _resolve_under_bases(root, bases, relative)
-        if found:
-            for item in found:
-                yield item, set()
-            return
-    head = parts[0]
-
-    def holds_python(directory):
-        # A directory with no Python in it is not an importable package: an installed
-        # regular package of the same name wins over it (PEP 420), so `python -m build`
-        # beside a `build/` of artefacts runs the installed tool (C1-F10). Observed
-        # 2026-11-19: `python -m json.tool` beside an empty `json/` ran the stdlib module.
-        return directory.is_dir() and any(directory.rglob("*.py"))
-
-    if _resolve_under_bases(root, bases, head + ".py") or any(
-        holds_python(root / base / head if base else root / head) for base in bases
-    ):
-        yield _refusal(f"cannot resolve `python -m {module}` to a file in the checkout, though '{head}' is repository content")
+            packages = {posixpath.join(base, "package.json") if base else "package.json" for base in bases} & self.files
+            # npm runs from the nearest ancestor holding a package.json: `npm test` in web/src reads
+            # web/package.json (CodeRabbit, observatory PR #468).
+            for base in bases:
+                directory = base
+                while directory and posixpath.join(directory, "package.json") not in self.files:
+                    directory = posixpath.dirname(directory)
+                    manifest = posixpath.join(directory, "package.json") if directory else "package.json"
+                    if manifest in self.files:
+                        packages.add(manifest)
+                        break
+        command = words[1] if len(words) > 1 else ""
+        if words[0] != "npm" or elsewhere:
+            names = None  # any other spelling: every script of the package is in play
+        elif command in ("run", "run-script"):
+            # Every later bare word may be the name: `npm run --loglevel warn lint`.
+            names = [word for word in words[2:] if not word.startswith("-")]
+        elif command in NPM_LIFECYCLE:
+            names = [NPM_LIFECYCLE[command]]
+        elif command in NPM_INSTALL:
+            # An install runs these hooks in the root package and in every workspace package. npm
+            # 11.18.0 also ran pre/post/`dependencies` on `npm ci`, and ran every hook for
+            # `--ignore-scripts false`: only an effective true value skips them. It ran `prepublish` too.
+            names = [] if npm_flag_value(list(flags), ("--ignore-scripts",)) else ["preinstall", "install", "postinstall", "prepublish", "prepare", "dependencies"]
+            packages = {path for path in self.files if posixpath.basename(path) == "package.json"}
+        else:
+            names = None
+        for package in sorted(packages):
+            try:
+                scripts = json.loads((self.root / package).read_text(encoding="utf-8-sig")).get("scripts")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if not isinstance(scripts, dict):
+                continue
+            chosen = list(scripts) if names is None else list(names)
+            if chosen == ["restart"] and not isinstance(scripts.get("restart"), str):
+                chosen = ["stop", "start"]  # npm restart with no restart script runs stop then start
+            for name in (chosen if names is None else [hook for name in chosen for hook in ("pre" + name, name, "post" + name)]):
+                if isinstance(scripts.get(name), str) and (package, name) not in seen:
+                    seen.add((package, name))
+                    directory = posixpath.dirname(package)
+                    if self.scan(scripts[name], [directory], found, job_id, seen) and changes_directory(scripts[name]):
+                        sys.exit(f"{self.root}: cannot verify gate script paths after a directory change in job '{job_id}'; use working-directory:")
 
 
 def gate_script_paths(lines, jobs, needs, gate_job, root):
     """Repo-local scripts a merge-blocking job runs from the checkout, path -> job id.
 
-    Only paths that EXIST under `root` are returned. Nothing is asserted about a
-    candidate that does not resolve to a file: the repository does not have it, so it
-    cannot be edited to neuter anything.
+    Discovery is the word rule (see ScriptWords). Only paths that EXIST under `root` are
+    returned: a name that resolves to no file cannot be edited to neuter anything.
+    resolve_committed_paths is the final resolver for every candidate, so the committed
+    spelling is returned and a target outside the repository exits.
 
-    A Windows-spelled candidate is normalised to `/` here, once, before either use.
-    Both downstream consumers need it: `Path("a\\b")` is a single filename on Linux, so
-    the existence test would miss the file, and the review policy's globs are written
-    with `/`, so a backslashed key would never match a tier and would report the script
-    as untiered even where the policy covers it. Case is settled separately, against the
-    disk, by resolve_committed_paths.
+    THE BOUNDARY: a script reached only through a variable, a dynamic launch, or code a
+    gate script itself imports is not derived. Review of the workflow change is the
+    control there.
     """
     found = {}
+    words = ScriptWords(root)
     seen_bodies = set()
-    readings = []
+    seen_scripts = set()
     for job_id, _, body, body_directories in gated_run_bodies(lines, jobs, needs, gate_job, root):
         body_key = (job_id, tuple(body), tuple(sorted(body_directories)))
         if body_key in seen_bodies:
             continue
         seen_bodies.add(body_key)
-        body_list = list(body_readings(body))
-        # One verdict per BODY, across its readings: a `cd` one reading sees applies to a
-        # script only the other reading sees (CodeRabbit, PR #483).
-        moved = any(changes_directory(reading) for reading in body_list)
-        readings.extend((job_id, reading, body_directories, moved) for reading in body_list)
-    for job_id, body, body_directories, moved in readings:
-        # `cd frontend && npm run gate` resolves the script in frontend/package.json, which
-        # no declared working directory names: nothing resolves, so the per-reference
-        # refusal below never ran and the script npm executes went untiered (C1-F7).
-        folded = re.sub(r"\\\n[ \t]*", "", "\n".join(body))
-        if moved and any(
-            not printed_only(folded, offset) for offset, _, _, _ in npm_invocations(folded, root)
-        ):
+        text = "\n".join(body)
+        bases = [""] + sorted(directory for directory in body_directories if directory and not directory.startswith("!"))
+        if not words.scan(text, bases, found, job_id, seen_scripts):
+            continue
+        unsupported = next((directory for directory in body_directories if directory.startswith("!unsupported ")), None)
+        if unsupported:
+            sys.exit(f"{root}: {unsupported[1:]}")
+        if changes_directory(text):
             sys.exit(f"{root}: cannot verify gate script paths after a directory change in job '{job_id}'; use working-directory:")
-        for relative, directories in script_references(body, body_directories, root):
-            unsupported = next((directory for directory in directories if directory.startswith("!unsupported ")), None)
-            if unsupported:
-                sys.exit(f"{root}: {unsupported[1:]}")
-            if moved:
-                sys.exit(f"{root}: cannot verify gate script paths after a directory change in job '{job_id}'; use working-directory:")
-            full_references = {relative} | {
-                directory + "/" + relative
-                for directory in directories
-                if directory and not directory.startswith("!unsupported ")
-            }
-            direct = any(
-                resolve_committed_paths(root, candidate, allow_outside_repository=True)
-                for candidate in full_references
-            )
-            # Recover prefixed spellings only if the complete reference is absent.
-            # Otherwise a nested script also captures an unrelated root suffix.
-            relatives = {relative}
-            if not direct:
-                relatives.update(_recognised_suffixes(relative))
-            # Every plausible spelling is kept -- the repository root, and each directory
-            # that applies to this run body (workflow and job defaults, the body's own
-            # step, a composite action's own directory). More scripts required HIGH,
-            # never fewer.
-            qualified = {
-                directory + "/" + suffix
-                for directory in directories
-                if directory and not directory.startswith("!unsupported ")
-                for suffix in relatives
-            }
-            # A BARE candidate is the same reference read from the repository root. When
-            # a working directory anchors the reference the qualified candidates are the
-            # real resolution and the bare one is speculative -- a `..` in it can then
-            # resolve outside the checkout with nothing being wrong (`working-directory:
-            # sub` plus `run: python3 ../scripts/gate.py`), so the outside-repository
-            # exit is suspended for it. With NO working directory the bare spelling is
-            # the only evidence there is and the exit still fires -- fail-closed exactly
-            # where it matters.
-            allow_outside = bool(qualified)
-            for candidate in qualified:
-                for committed in resolve_committed_paths(root, candidate):
-                    found.setdefault(committed, job_id)
-            for candidate in relatives:
-                for committed in resolve_committed_paths(
-                    root, candidate, allow_outside_repository=allow_outside
-                ):
-                    found.setdefault(committed, job_id)
     # Local actions and reusable workflows execute from the PR checkout too. Their
     # own files therefore need HIGH coverage even when their run bodies contain no
     # directly named script.
-    job_indent = len(lines[jobs[gate_job]]) - len(lines[jobs[gate_job]].lstrip(" "))
-    pending = list(set(needs) | {gate_job})
-    seen = set()
-    while pending:
-        job_id = pending.pop()
-        if job_id in seen or job_id not in jobs:
-            continue
-        seen.add(job_id)
+    for job_id in gated_jobs_in_order(lines, jobs, needs, gate_job):
         block = job_block(lines, jobs, job_id)
         payload_indexes = run_payload_indexes(block)
         for index, line in enumerate(block):
@@ -4361,7 +3550,6 @@ def gate_script_paths(lines, jobs, needs, gate_job, root):
             if match and index not in payload_indexes and match.group(1).startswith(("./", "$/")):
                 for relative in local_action_paths(root, match.group(1)):
                     found.setdefault(relative, job_id)
-        pending.extend(job_needs(lines, jobs, job_id, job_indent) - seen)
     return found
 
 
@@ -4550,13 +3738,30 @@ def assert_composite_steps(workflow_path, root, ref, feeder, step_exempt, used_e
                 assert_composite_steps(workflow_path, root, nested, feeder, step_exempt, used_exempt, visited)
 
 
-def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_exempt, label="", root=None):
+def step_runs_unconditionally(condition):
+    """True when a step `if:` cannot skip the step on a healthy run: what is left once the
+    conjuncts that fold to true are dropped is only `!cancelled()` or `success()`, the
+    condition every step already has."""
+    value = normalise_condition(condition)
+    rest = [part for part in split_top_level(strip_outer_parentheses(value), "&&") if static_truth(part, True) is not True]
+    return all(strip_outer_parentheses(part) in ("!cancelled()", "success()") for part in rest)
+
+
+def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_exempt, label="", root=None, step_if_exempt=frozenset()):
     """Refuse a feeder step that can never fail its job or never runs.
 
     `continue-on-error: true` on a step is the step-level spelling of a tolerated job:
     the step's failure is swallowed and the feeder reports green. An `if:` that is
     statically false never runs the step at all. Either leaves a check the gate believes
     in doing nothing.
+
+    A runtime `if:` (`github.event_name == 'push'`) is refused too, unless the step's
+    `<job>/<step id>` is named in GATE_STEP_IF_EXEMPT: it skips the step on some runs while
+    the job, and so the gate, still reports success (owner decision, observatory review
+    C1-D-G2). Only a condition that folds to unconditional -- `always()`, `!cancelled()`,
+    `success()`, a conjunction of those -- passes unlisted. A step with no `id:` cannot be
+    listed, so the refusal asks for one. A local composite action's own steps are not held
+    to this rule.
 
     Keys are matched at the step's OWN column, the guard step_can_fail already applies:
     an action INPUT named `if` or `continue-on-error` under `with:` is a value, not a step
@@ -4570,12 +3775,17 @@ def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_e
     reusable workflow, in messages and in exemption entries alike.
     """
     executable = re.compile(r"""^(\s*(?:-\s+)?)(?:'run'|"run"|run|'uses'|"uses"|uses)\s*:""")
+    document, _, _ = parsed_document(lines, workflow_path)
     for feeder in sorted(feeders):
         block = job_block(lines, jobs, feeder)
         payloads = run_payload_indexes(block)
+        # Only an item of the job's own `steps:` is a step: a `run:` under strategy.matrix.include is
+        # data, and its sibling `if:` was refused as a step condition (CodeRabbit, PR #503; cf. C1-F7).
+        steps = mapping_get(job_node(document, feeder), "steps")
+        step_lines = range(steps.start_mark.line, steps.end_mark.line + 1) if isinstance(steps, yaml.SequenceNode) else range(0)
         seen = set()
         for index, line in enumerate(block):
-            match = executable.match(line) if index not in payloads else None
+            match = executable.match(line) if index not in payloads and getattr(block, "offset", 0) + index in step_lines else None
             if not match:
                 continue
             indent = len(match.group(1))
@@ -4620,6 +3830,22 @@ def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_e
                     "comparison. Its two precedence readings disagree, so the checker cannot say whether "
                     "the step runs. Write the intended comparison with explicit parentheses."
                 )
+            if condition is not None and not step_runs_unconditionally(condition):
+                step_id = own_key("id")
+                entry = f"{label}{feeder}/{decode_yaml_scalar(step_id)}" if step_id else None
+                if entry in step_if_exempt:
+                    used_exempt.add(("if", entry))
+                else:
+                    sys.exit(
+                        f"{workflow_path}: feeder '{label}{feeder}' has a {kind}"
+                        + (f" (id '{decode_yaml_scalar(step_id)}', entry '{entry}')" if step_id
+                           else f" (name '{decode_yaml_scalar(own_key('name'))}')" if own_key("name") else "")
+                        + f" whose `if: {condition}` can skip it on a healthy run. A skipped step "
+                        "checks nothing, and its job still reports success to the gate. Remove the "
+                        "condition, or "
+                        + ("name" if step_id else "give the step an `id:` and name")
+                        + " `<job>/<step id>` in GATE_STEP_IF_EXEMPT with a written rationale."
+                    )
             used_ref = own_key("uses")
             if used_ref is not None and root is not None:
                 composite = decode_yaml_scalar(used_ref)
@@ -4665,7 +3891,7 @@ def reusable_workflow_feeder(lines, jobs, job_id, job_indent, root, workflow_pat
     return None
 
 
-def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty="fail", step_exempt=frozenset(), step_usage=None):
+def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty="fail", step_exempt=frozenset(), step_usage=None, step_if_exempt=frozenset()):
     """Assert one file's full gate contract. Returns True when the file contains the
     gate job (and every assertion ran), False when it has no gate job at all.
 
@@ -4842,7 +4068,8 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
             f"{workflow_path}: job-level 'if:' on job(s) feeding '{gate_job}': "
             f"{', '.join(unconditioned)}.\n"
             "A skipped job passes the gate, so a conditional quality job can report "
-            "green while checking nothing. Remove the condition, or name the job in "
+            "green while checking nothing. Remove the condition (or write "
+            "`${{ !cancelled() }}`), or name the job in "
             "GATE_CONDITIONAL_EXEMPT with a written rationale in the workflow."
         )
 
@@ -4856,7 +4083,7 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
 
     used_step_exempt, step_feeders = step_usage if step_usage is not None else (set(), set())
     step_feeders |= set(needs) - {gate_job}
-    assert_feeder_steps(workflow_path, lines, jobs, set(needs) - {gate_job}, step_exempt, used_step_exempt, root=root)
+    assert_feeder_steps(workflow_path, lines, jobs, set(needs) - {gate_job}, step_exempt, used_step_exempt, root=root, step_if_exempt=step_if_exempt)
 
     # A feeder that is a LOCAL REUSABLE WORKFLOW runs that file's jobs, and the caller
     # reports success when every callee job succeeds OR SKIPS. A conditional, tolerated or
@@ -4890,7 +4117,7 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
                 f"{', '.join(tolerated)} carry 'continue-on-error'. A tolerated callee job cannot fail "
                 "the feeder."
             )
-        assert_feeder_steps(callee_path, callee_lines, callee_jobs, set(callee_jobs), step_exempt, used_step_exempt, label=f"{label}{feeder}/", root=root)
+        assert_feeder_steps(callee_path, callee_lines, callee_jobs, set(callee_jobs), step_exempt, used_step_exempt, label=f"{label}{feeder}/", root=root, step_if_exempt=step_if_exempt)
         for nested in sorted(callee_jobs):
             check_callee(callee_path, callee_lines, callee_jobs, callee_indent, nested, f"{label}{feeder}/", exempt, visited)
 
@@ -4899,6 +4126,7 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
 
     if step_usage is None:
         assert_step_exempt_used(workflow_path, step_exempt, used_step_exempt, step_feeders)
+        assert_step_if_exempt_used(workflow_path, step_if_exempt, used_step_exempt)
 
     assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs)
     assert_gate_scripts(workflow_path, lines, jobs, needs, gate_job)
@@ -4924,6 +4152,21 @@ def assert_step_exempt_used(where, step_exempt, used, feeders):
         )
 
 
+def assert_step_if_exempt_used(where, step_if_exempt, used):
+    """Refuse a GATE_STEP_IF_EXEMPT entry that exempted no runtime feeder step `if:`.
+
+    Any job, not only a feeder: an entry naming the gate job's own failure step, or a job outside
+    the gate, exempts nothing and was accepted in silence (CodeRabbit Verify, PR #503).
+    """
+    stale = sorted(entry for entry in step_if_exempt if ("if", entry) not in used)
+    if stale:
+        sys.exit(
+            f"{where}: GATE_STEP_IF_EXEMPT names step(s) that do not exist or carry no runtime "
+            f"`if:`: {', '.join(stale)}. Each entry is `<job>/<step id>` for a feeder step whose "
+            "`if:` can skip it."
+        )
+
+
 def split_env(name):
     return set(os.environ.get(name, "").replace(",", " ").split())
 
@@ -4942,7 +4185,11 @@ def main(argv):
     malformed = sorted(entry for entry in step_exempt if not all(entry.split("/")) or "/" not in entry)
     if malformed:
         sys.exit(f"GATE_STEP_EXEMPT entries are `<job>/<step id>`; malformed: {', '.join(malformed)}")
-    step_jobs = {entry.split("/", 1)[0] for entry in step_exempt}
+    step_if_exempt = split_env("GATE_STEP_IF_EXEMPT")
+    malformed = sorted(entry for entry in step_if_exempt if not all(entry.split("/")) or "/" not in entry)
+    if malformed:
+        sys.exit(f"GATE_STEP_IF_EXEMPT entries are `<job>/<step id>`; malformed: {', '.join(malformed)}")
+    step_jobs = {entry.split("/", 1)[0] for entry in step_exempt | step_if_exempt}
 
     if not Path(target).is_dir():
         if not Path(target).is_file():
@@ -4950,8 +4197,8 @@ def main(argv):
         unknown = sorted((exempt | conditional_exempt | step_jobs) - parse_jobs(target))
         if unknown:
             sys.exit(
-                f"{target}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT/GATE_STEP_EXEMPT name jobs that do "
-                f"not exist: {', '.join(unknown)}"
+                f"{target}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT/GATE_STEP_EXEMPT/GATE_STEP_IF_EXEMPT name jobs that do"
+                f" not exist: {', '.join(unknown)}"
             )
         # The return value is the WHOLE assertion when the gate job is absent:
         # check_file reports every other breach by exiting, but answers "no gate job
@@ -4966,7 +4213,7 @@ def main(argv):
         # traceback reads as a broken checker, and a broken checker is what gets a
         # working control deleted to make CI green.
         try:
-            no_gate = check_file(target, gate_job, exempt, conditional_exempt, step_exempt=step_exempt) is False
+            no_gate = check_file(target, gate_job, exempt, conditional_exempt, step_exempt=step_exempt, step_if_exempt=step_if_exempt) is False
         except ValueError as error:
             sys.exit(str(error))
         if no_gate:
@@ -5001,8 +4248,8 @@ def main(argv):
     unknown = sorted((exempt | conditional_exempt | step_jobs) - all_jobs)
     if unknown:
         sys.exit(
-            f"{target}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT/GATE_STEP_EXEMPT name jobs that do "
-            f"not exist in any workflow: {', '.join(unknown)}"
+            f"{target}: GATE_EXEMPT/GATE_CONDITIONAL_EXEMPT/GATE_STEP_EXEMPT/GATE_STEP_IF_EXEMPT name jobs that do"
+            f" not exist in any workflow: {', '.join(unknown)}"
         )
 
     gated = 0
@@ -5013,7 +4260,7 @@ def main(argv):
         try:
             result = check_file(
                 workflow_path, gate_job, exempt, conditional_exempt,
-                on_empty="skip", step_exempt=step_exempt, step_usage=step_usage,
+                on_empty="skip", step_exempt=step_exempt, step_usage=step_usage, step_if_exempt=step_if_exempt,
             )
         except ValueError as error:
             sys.exit(str(error))
@@ -5035,6 +4282,7 @@ def main(argv):
     if not gated:
         sys.exit(f"{target}: no file contains a '{gate_job}' job -- refusing to report coverage over nothing.")
     assert_step_exempt_used(target, step_exempt, *step_usage)
+    assert_step_if_exempt_used(target, step_if_exempt, step_usage[0])
 
 
 if __name__ == "__main__":

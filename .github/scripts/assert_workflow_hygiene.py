@@ -252,7 +252,8 @@ def container_images(job):
                 # Shorthand: `services: { db: postgres }` names the image
                 # directly, with no mapping and no `image:` key.
                 images.append(service)
-            elif isinstance(service, dict) and isinstance(service.get("image"), str):
+            elif isinstance(service, dict) and isinstance(service.get("image"), str) and service["image"] != "":
+                # An empty `image` is GitHub's documented way to not start the service: no container runs.
                 images.append(service["image"])
     return images
 
@@ -415,7 +416,8 @@ def dockerfile_base_images(dockerfile):
     """
     # shortcut: an ARG-built image name is not resolved, so it fails the pin check. Upgrade if one appears.
     stages, images = set(), []
-    for line in dockerfile_instructions(dockerfile.read_text(encoding="utf-8", errors="replace")):
+    # utf-8-sig: Docker drops a leading BOM, which would otherwise hide a first-line FROM.
+    for line in dockerfile_instructions(dockerfile.read_text(encoding="utf-8-sig", errors="replace")):
         match = re.match(r"\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", line, re.IGNORECASE)
         if not match:
             continue
@@ -431,7 +433,34 @@ def dockerfile_base_images(dockerfile):
 # `<` (so `<<<EOF` is a here-string), optionally quoted. Docker 29.9.3 read `<<123`, `<<A-B.c` and
 # `3<<'EOF'` as heredocs, and `<<<EOF` and `"<<EOF"` as none.
 HEREDOC = re.compile(r"\d*<<(-?)([^<]+)")
-WORD = re.compile(r"""(?:[^\s"']+|"[^"]*"?|'[^']*'?)+""")
+# A backslash escapes the next character, outside quotes and inside double quotes, as BuildKit's
+# shell lexer reads it (`<<E"O\"F"` is one word; PR #505 review).
+WORD = re.compile(r"""(?:[^\s"'\\]|\\.|"(?:[^"\\]|\\.)*"?|'[^']*'?)+""")
+
+
+def unquote_word(word):
+    """A shell word as BuildKit reads it: quotes removed from any part, a backslash escape outside
+    quotes kept as its character, and inside double quotes only for `"`, `\\` and `$` (Docker 29.9.3
+    closed `<<"E\\`OF"` at `E\\`OF`)."""
+    out, quote, index = [], None, 0
+    while index < len(word):
+        char = word[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            else:
+                out.append(char)
+        elif char == "\\" and index + 1 < len(word) and (quote is None or word[index + 1] in "\"\\$"):
+            out.append(word[index + 1])
+            index += 1
+        elif char == '"':
+            quote = None if quote == '"' else '"'
+        elif char == "'" and quote is None:
+            quote = "'"
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
 HEREDOC_INSTRUCTION = re.compile(r"\s*(?:ONBUILD\s+)?(?:RUN|COPY|ADD)\s+(.*)", re.IGNORECASE | re.DOTALL)
 DIRECTIVES = ("syntax", "escape", "check")
 
@@ -455,9 +484,9 @@ def heredoc_delimiters(instruction):
     for word in WORD.findall(match.group(1)):
         heredoc = HEREDOC.fullmatch(word)
         if heredoc:
-            name = heredoc.group(2)
-            if len(name) > 1 and name[0] == name[-1] and name[0] in "\"'":
-                name = name[1:-1]
+            # Quote removal over the whole word: Docker 29.9.3 closed `<<E"OF"`, `<<EO"F"` and `<<'E'OF` at
+            # `EOF`, and `E"O\"F"` at `EO"F` (PR #505 review).
+            name = unquote_word(heredoc.group(2))
             found.append((bool(heredoc.group(1)), name))
     return found
 
@@ -468,15 +497,20 @@ def dockerfile_instructions(text):
     blank lines are dropped, and a RUN/COPY/ADD heredoc body is data, not instructions.
     Docker 29.9.3 resolves `FROM \\` + `  base` to the stage `base` and reads a heredoc line
     `FROM scratch AS x` as no stage at all."""
-    lines = text.splitlines()
+    # Only LF (with an optional CR) ends a line: splitlines() also split at U+2028, VT and \x1c, which
+    # Docker 29.9.3 kept inside a LABEL value. Docker also read an indented `# escape=` as a directive.
+    lines = re.split(r"\r?\n", text)
     escape = "\\"
     for line in lines:
-        directive = re.match(r"#\s*(\w+)\s*=\s*(\S*)\s*$", line)
+        # A directive with no value is a comment that ends them (PR #505 review); a value may hold
+        # whitespace (Docker 29.9.3 read `# check=skip=all # explanation` as a directive).
+        directive = re.match(r"\s*#\s*(\w+)\s*=(.*)", line)
+        value = directive.group(2).strip() if directive else ""
         # An unknown key is a comment and ends the directives (Docker kept `\` after `# owner=team`).
-        if not directive or directive.group(1).lower() not in DIRECTIVES:
+        if not value or directive.group(1).lower() not in DIRECTIVES:
             break
-        if directive.group(1).lower() == "escape" and directive.group(2) in ("\\", "`"):
-            escape = directive.group(2)
+        if directive.group(1).lower() == "escape" and value in ("\\", "`"):
+            escape = value
     instructions, current, heredocs = [], None, []
     for line in lines:
         if heredocs:
@@ -486,7 +520,8 @@ def dockerfile_instructions(text):
             continue
         if re.match(r"\s*(#|$)", line):
             continue
-        stripped = line.rstrip()
+        # Only spaces and tabs may follow the escape: Docker 29.9.3 did not continue a line ending `\` + U+00A0.
+        stripped = line.rstrip(" \t")
         # An escaped escape does not continue: Docker ran `FROM` after both `\\` and `\\\`.
         continued = stripped.endswith(escape) and not stripped[:-1].endswith(escape)
         current = (current or "") + (stripped[:-1] if continued else line)

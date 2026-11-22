@@ -69,6 +69,12 @@ def ps_comment_count(lines):
                 continue
             if c.isspace():
                 i += 1
+            elif c == "`":
+                # pwsh 7 reads `` `" `` and `` It`'s `` as literal text: an escaped quote opens no string.
+                code, i = True, i + 2
+            elif line.startswith("<#", i) and not ps_hash_comments(line, i):
+                # Inside an argument word (`foo<#bar`) pwsh 7 reads `<#` as text, not a block opener.
+                code, i = True, i + 2
             elif line.startswith("<#", i):
                 state, i, comment = "block", i + 2, True
             elif c == "#" and ps_hash_comments(line, i):
@@ -80,6 +86,8 @@ def ps_comment_count(lines):
             elif line.startswith(("@'", '@"'), i) and not line[i + 2:].strip():
                 state, code = line[i:i + 2], True
                 break
+            elif c == "`":
+                code, i = True, i + 2  # an unquoted backtick escapes the next character (`` `" `` is a literal quote)
             else:
                 code = True
                 if c in "'\"":

@@ -154,7 +154,8 @@ function Get-ScanFiles {
     elseif (-not (Test-Path -LiteralPath (Join-Path $TreePath '.git'))) {
         # Not a git tree (contract-test fixtures): enumerate the filesystem instead.
         $rootFull = (Resolve-Path -LiteralPath $TreePath).Path
-        $files = @(Get-ChildItem -LiteralPath $rootFull -Recurse -File | ForEach-Object { [IO.Path]::GetRelativePath($rootFull, $_.FullName).Replace('\', '/') })
+        # -Force: PowerShell on Linux reads a dot-directory as hidden and skips .github without it.
+        $files = @(Get-ChildItem -LiteralPath $rootFull -Recurse -File -Force | ForEach-Object { [IO.Path]::GetRelativePath($rootFull, $_.FullName).Replace('\', '/') })
     }
     else { throw "git ls-files failed in $TreePath" }
     return @($files | Where-Object {
@@ -473,7 +474,8 @@ function Invoke-SmellDetectors {
         # npm's Windows command shim cannot carry an estate-sized ignore list.
         $configPath = Join-Path $OutDir 'jscpd-options.json'
         [IO.File]::WriteAllText($configPath, (@{ ignore = $ignore } | ConvertTo-Json -Depth 3), [Text.UTF8Encoding]::new($false))
-        $formats = ($script:LanguageByExtension.Values | Sort-Object -Unique) -join ','
+        # jscpd's own format names: .tsx and .jsx are `tsx` and `jsx` there, not semgrep's typescript/javascript.
+        $formats = (@($script:LanguageByExtension.Values) + @('tsx', 'jsx') | Sort-Object -Unique) -join ','
         # Resolve the prefix executable before changing location; remaining file
         # arguments must already be absolute. --absolute keeps report names absolute.
         $jscpdFailure = ''
@@ -506,7 +508,9 @@ function Invoke-SmellDetectors {
         }
         try {
             $normalizedClones = [Collections.Generic.List[object]]::new()
-            $parsed = Get-Content -LiteralPath $jsonPath -Raw | ConvertFrom-Json -ErrorAction Stop
+            # -AsHashtable: the report's statistics key every source by path, and Widget.ts beside widget.ts
+            # (two files on Linux) made a plain ConvertFrom-Json refuse the whole report (CodeRabbit, PR #503).
+            $parsed = Get-Content -LiteralPath $jsonPath -Raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop
             if ($null -eq $parsed -or $parsed.duplicates -isnot [array]) { throw 'missing duplicates array' }
             $repairedEnds = 0
             foreach ($d in $parsed.duplicates) {
@@ -539,7 +543,8 @@ function Invoke-SmellDetectors {
         $tools['jscpd'] = $JscpdCommand[-1]
         foreach ($clone in $normalizedClones) {
             $d = $clone.Duplicate
-            if ($d.firstFile.name -eq $d.secondFile.name) { continue } # S14 is cross-file duplication.
+            # S14 is cross-file duplication. Case-sensitive: Widget.ts and widget.ts are two files on Linux.
+            if ($d.firstFile.name -ceq $d.secondFile.name) { continue }
             $first = $clone.First
             $second = $clone.Second
             if ((Test-GeneratedSourceFile $TreePath $first $generatedCache) -or (Test-GeneratedSourceFile $TreePath $second $generatedCache)) { continue }
