@@ -19,10 +19,19 @@ $ErrorActionPreference = 'Stop'
 
 $result = Get-Content -LiteralPath $HitsPath -Raw | ConvertFrom-Json
 $owner, $name = $Repo.Split('/')
-$query = 'query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{isResolved isOutdated comments(first:1){nodes{body}}}}}}}'
-$raw = @(gh api graphql --paginate -f query=$query -F owner=$owner -F name=$name -F number=$Pr --jq '.data.repository.pullRequest.reviewThreads.nodes[] | {isResolved, isOutdated, body: .comments.nodes[0].body} | tojson')
+# The identity the active credential posts as. A marker in a thread another identity opened is not
+# ours (any author can paste one), and the overflow notice below is matched on it too. A personal
+# access token or a local sign-in answers /user, while the Actions GITHUB_TOKEN is refused there
+# and posts as github-actions[bot].
+$author = [string](gh api user --jq .login 2>$null)
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($author)) {
+    $author = if ($env:GITHUB_ACTIONS) { 'github-actions[bot]' } else { '' }
+}
+$query = 'query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{isResolved isOutdated comments(first:1){nodes{body author{login}}}}}}}}'
+$raw = @(gh api graphql --paginate -f query=$query -F owner=$owner -F name=$name -F number=$Pr --jq '.data.repository.pullRequest.reviewThreads.nodes[] | {isResolved, isOutdated, author: .comments.nodes[0].author.login, body: .comments.nodes[0].body} | tojson')
 if ($LASTEXITCODE -ne 0) { throw "could not list review threads on $Repo#$Pr" }
-$pick = Select-NewSmellHits -Hits @($result.hits) -Existing (Get-LiveMarkers @($raw | ConvertFrom-Json)) -Cap $Cap
+if (-not $author) { Write-Warning 'could not tell who posts here; accepting smell markers from any thread author' }
+$pick = Select-NewSmellHits -Hits @($result.hits) -Existing (Get-LiveMarkers @($raw | ConvertFrom-Json) -Author $author) -Cap $Cap
 
 $failed = 0
 foreach ($h in $pick.Post) {
@@ -35,13 +44,7 @@ if ($pick.Overflow.Count) {
     $notice = "ai-smells: $($pick.Overflow.Count) further hit(s) beyond the $Cap-thread cap. They are listed in this run's job summary and will be posted on the next push.`n`n$marker"
     # Match the author as well as the marker: anyone can paste the marker into a comment, and a
     # repository writer may edit comments they did not write, so the marker alone could pick (and
-    # overwrite) someone else's comment. The author is whoever the active credential posts as: a
-    # personal access token or a local sign-in answers /user, while the Actions GITHUB_TOKEN is
-    # refused there and posts as github-actions[bot].
-    $author = [string](gh api user --jq .login 2>$null)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($author)) {
-        $author = if ($env:GITHUB_ACTIONS) { 'github-actions[bot]' } else { '' }
-    }
+    # overwrite) someone else's comment. $author is resolved at the top.
     $existingId = @()
     $skipNotice = $false
     if ($author) {

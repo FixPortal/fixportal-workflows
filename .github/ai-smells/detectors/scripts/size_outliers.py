@@ -38,10 +38,25 @@ NAMED_TYPED = re.compile(r"^\s*(?:[\w$<>\[\],.?]+\s+)+[\w$.<>]+\s*\(|\)\s*:\s*\S
 # Strings, char literals, template literals and comments, blanked before braces are counted.
 # shortcut: a regex literal holding a quote or `//` can desynchronise this; upgrade to a tokenizer.
 LITERAL = re.compile(r'//[^\n]*|/\*.*?\*/|@"(?:""|[^"])*"|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|`(?:\\.|[^`\\])*`', re.S)
-KEEP = re.compile(r"[^\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
+KEEP = re.compile(r"[^\r\n]")
+# A type declaration line: the scope a function sits in. Keyword-named functions (`function record(`)
+# have no whitespace-then-name after the keyword, so they do not match.
+TYPE_DECL = re.compile(r"^\s*(?:[\w$]+\s+)*?(?:class|record|struct|interface|enum)\s+([A-Za-z_$][\w$]*)")
 WRAP_LIMIT = 30  # a parameter list longer than this many lines is not a signature
 SOURCE = (".cs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py")
 UNSUPPORTED = (".ps1", ".psm1", ".go", ".java", ".rs", ".rb", ".kt", ".swift", ".cpp", ".c")
+
+def split_lines(text):
+    """Lines as git counts them: only \\n ends one (a CR before it is dropped). str.splitlines()
+    also breaks on \\v, \\f, \\x1c-\\x1e, NEL, U+2028/9 and a lone CR, which would shift every
+    later line number away from the PR diff's."""
+    lines = [l[:-1] if l.endswith("\r") else l for l in text.split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+def scope_label(names):
+    return f" in {'.'.join(names)}" if names else ""
 
 def python_hits(rel, source):
     """(hits, parsed). parsed is False when the source does not parse: the caller records the
@@ -50,15 +65,47 @@ def python_hits(rel, source):
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return [], False
-    lines = source.splitlines()
+    # The parser also ends a line at a lone CR, so its line numbers index these lines, and
+    # git_line maps one to the line git and the PR diff count (only \n ends one).
+    lines = re.split(r"\r\n|\r|\n", source)
+    starts = [0] + [m.end() for m in re.finditer(r"\r\n|\r|\n", source)]
+    def git_line(n):
+        return source.count("\n", 0, starts[n - 1]) + 1
     hits = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            span = node.end_lineno - node.lineno + 1
-            if span > FUNC_MAX:
-                signature = " ".join(lines[node.lineno - 1:node.body[0].lineno - 1]).strip() or lines[node.lineno - 1].strip()
-                hits.append({"file": rel, "line": node.lineno, "endLine": node.end_lineno, "text": f"function spans {span} lines: {signature}"})
+    def visit(node, scope):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                first, last = git_line(child.lineno), git_line(child.end_lineno)
+                span = last - first + 1
+                if span > FUNC_MAX:
+                    signature = " ".join(lines[child.lineno - 1:child.body[0].lineno - 1]).strip() or lines[child.lineno - 1].strip()
+                    hits.append({"file": rel, "line": first, "endLine": last, "text": f"function spans {span} lines{scope_label(scope)}: {signature}"})
+                visit(child, scope + [child.name])
+            else:
+                visit(child, scope + [child.name] if isinstance(child, ast.ClassDef) else scope)
+    visit(tree, [])
     return hits, True
+
+def enclosing_types(code, i):
+    """Names of the type declarations whose braces enclose line i, outermost first. The PR
+    filter keys an oversized function by its text, so two same-signature methods in one file
+    need the type to read differently."""
+    names = []
+    for k in range(i):
+        m = TYPE_DECL.match(code[k])
+        if not m:
+            continue
+        depth, opened = 0, False
+        for j in range(k, len(code)):
+            depth += code[j].count("{") - code[j].count("}")
+            opened = opened or "{" in code[j]
+            if opened and depth <= 0:
+                if j >= i:
+                    names.append(m.group(1))
+                break
+            if not opened and ";" in code[j]:
+                break  # `record R(int A);` has no body
+    return names
 
 def blank_literals(source):
     return LITERAL.sub(lambda m: KEEP.sub(" ", m.group()), source)
@@ -162,7 +209,7 @@ def main():
         except OSError:
             unread.append(rel)
             continue
-        lines = source.splitlines()
+        lines = split_lines(source)
         if len(lines) > FILE_MAX:
             hits.append({"file": rel, "line": 1, "endLine": len(lines), "text": f"file is {len(lines)} lines"})
         if rel.lower().endswith(".py"):
@@ -171,7 +218,7 @@ def main():
             if not parsed:
                 unparsed.append(rel)
             continue
-        code = blank_literals(source).splitlines()
+        code = split_lines(blank_literals(source))
         i = 0
         while i < len(lines):
             head = signature_end(code, i)
@@ -179,7 +226,7 @@ def main():
                 j = block_end(code, i, head)
                 if j is not None and j - i + 1 > FUNC_MAX:
                     signature = " ".join(line.strip() for line in lines[i:head + 1])
-                    hits.append({"file": rel, "line": i + 1, "endLine": j + 1, "text": f"function spans {j - i + 1} lines: {signature}"})
+                    hits.append({"file": rel, "line": i + 1, "endLine": j + 1, "text": f"function spans {j - i + 1} lines{scope_label(enclosing_types(code, i))}: {signature}"})
                     i = j
             i += 1
     notes = [f"{label}: " + ", ".join(paths) for label, paths in (("could not read", unread), ("could not parse, function sizes not measured", unparsed), ("unsupported source", skipped)) if paths]
