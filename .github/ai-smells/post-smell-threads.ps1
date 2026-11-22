@@ -25,6 +25,7 @@ $owner, $name = $Repo.Split('/')
 # and posts as github-actions[bot].
 $author = [string](gh api user --jq .login 2>$null)
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($author)) {
+    # Only the Actions github.token is supported in Actions; a personal access token is not (a failed /user would misname it).
     $author = if ($env:GITHUB_ACTIONS) { 'github-actions[bot]' } else { '' }
 }
 $query = 'query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{isResolved isOutdated comments(first:1){nodes{body author{login}}}}}}}}'

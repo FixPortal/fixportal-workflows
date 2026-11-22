@@ -2,15 +2,15 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "ce1419348ec3562f3b567ac8a47ab85fadfc8f6d",
+    "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
     "syncedAt": "2026-11-22"
   },
   "assets": [
     {
       "path": ".github/ai-smells/detect.ps1",
-      "sha256": "d1cdbf0d21b077c1a90cf5b1769ad31c8ac2a0f296c1c0d088ae070a91ab3c33",
+      "sha256": "7d09cacd1ee5b6db7e661fe1d2e26bdf920576ea5c6456ca1f372af068a6a02b",
       "verbatim": true,
-      "commit": "ce1419348ec3562f3b567ac8a47ab85fadfc8f6d",
+      "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
       "syncedAt": "2026-11-22"
     },
     {
@@ -85,9 +85,9 @@
     },
     {
       "path": ".github/ai-smells/detectors/scripts/comment_density.py",
-      "sha256": "eab98d19b9291db0cf8019f85ed5abe0c9ea52efba5fed381c7c9fb21369786a",
+      "sha256": "9e47de5c578a2908ae8bd8cae097ee076147a31f66caf590d6f7911ddabea453",
       "verbatim": true,
-      "commit": "ce1419348ec3562f3b567ac8a47ab85fadfc8f6d",
+      "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
       "syncedAt": "2026-11-22"
     },
     {
@@ -99,23 +99,23 @@
     },
     {
       "path": ".github/ai-smells/detectors/scripts/registry_check.py",
-      "sha256": "0445c25b3b3af355914f2479ff156d512bca9e87d829a32d6a8f253f5e025216",
+      "sha256": "d317d13e90c7722db7913230938e321c05134186d1d0adf22efc1496a1f360df",
       "verbatim": true,
-      "commit": "ce1419348ec3562f3b567ac8a47ab85fadfc8f6d",
+      "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
       "syncedAt": "2026-11-22"
     },
     {
       "path": ".github/ai-smells/detectors/scripts/size_outliers.py",
-      "sha256": "49475966daf06d40731bcd877e09cad30115c912647efdf289bd75031d104223",
+      "sha256": "ce24f4d402302d138b2b7ba473f2e2015236de33949a6e3fa080b50f4fce0cb5",
       "verbatim": true,
-      "commit": "ce1419348ec3562f3b567ac8a47ab85fadfc8f6d",
+      "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
       "syncedAt": "2026-11-22"
     },
     {
       "path": ".github/ai-smells/post-smell-threads.ps1",
-      "sha256": "869b42212d0ed66b0745c42784a91a559fc41f089d7192b8f74832db34fa765b",
+      "sha256": "6d29e490b82e9b857bd8d8aa4554174d6cd25701b261a9dc6a9ff17e03992411",
       "verbatim": true,
-      "commit": "ce1419348ec3562f3b567ac8a47ab85fadfc8f6d",
+      "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
       "syncedAt": "2026-11-22"
     },
     {
@@ -148,16 +148,16 @@
     },
     {
       "path": ".github/scripts/assert_gate_coverage.py",
-      "sha256": "a89469c79dc6365e1b955714a746c77ed8df43d99efd46fd3043811f8994f1db",
+      "sha256": "72530e10004e449bd763a1fac048e7f2a6ca8cfc8a1aad8050e5edc45bdcb5ca",
       "verbatim": true,
-      "commit": "ce1419348ec3562f3b567ac8a47ab85fadfc8f6d",
+      "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
       "syncedAt": "2026-11-22"
     },
     {
       "path": ".github/scripts/assert_workflow_hygiene.py",
-      "sha256": "58828b7f85f29881a8d1e733cebfc04413e15f2d3fe6e54406a5b9dc22ee3612",
+      "sha256": "ccfe0642f15ac123ee1a9ca77fff01d2cbf69f1ca38c8193708c079e73699ed4",
       "verbatim": true,
-      "commit": "ce1419348ec3562f3b567ac8a47ab85fadfc8f6d",
+      "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
       "syncedAt": "2026-11-22"
     },
     {

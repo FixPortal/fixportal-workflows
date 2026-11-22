@@ -41,9 +41,10 @@ LITERAL = re.compile(r'//[^\n]*|/\*.*?\*/|@"(?:""|[^"])*"|"(?:\\.|[^"\\\n])*"|\'
 KEEP = re.compile(r"[^\r\n]")
 # A type declaration line: the scope a function sits in. Keyword-named functions (`function record(`)
 # have no whitespace-then-name after the keyword, so they do not match.
-TYPE_DECL = re.compile(r"^\s*(?:[\w$]+\s+)*?(?:class|record|struct|interface|enum)\s+([A-Za-z_$][\w$]*)")
+# `record class A` and `record struct A` name A, not the second keyword.
+TYPE_DECL = re.compile(r"^\s*(?:[\w$]+\s+)*?(?:record\s+(?:class|struct)|class|record|struct|interface|enum)\s+([A-Za-z_$][\w$]*)")
 WRAP_LIMIT = 30  # a parameter list longer than this many lines is not a signature
-SOURCE = (".cs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py")
+SOURCE = (".cs", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".py")
 UNSUPPORTED = (".ps1", ".psm1", ".go", ".java", ".rs", ".rb", ".kt", ".swift", ".cpp", ".c")
 
 def split_lines(text):
@@ -63,27 +64,32 @@ def python_hits(rel, source):
     file as not assessed, and the file-size check in main() still applies."""
     try:
         tree = ast.parse(source)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        # CPython raises RecursionError for an expression nested too deep to build its tree.
         return [], False
     # The parser also ends a line at a lone CR, so its line numbers index these lines, and
-    # git_line maps one to the line git and the PR diff count (only \n ends one).
+    # git_lines maps one to the line git and the PR diff count (only \n ends one).
     lines = re.split(r"\r\n|\r|\n", source)
-    starts = [0] + [m.end() for m in re.finditer(r"\r\n|\r|\n", source)]
-    def git_line(n):
-        return source.count("\n", 0, starts[n - 1]) + 1
+    breaks = list(re.finditer(r"\r\n|\r|\n", source))
+    git_lines = [1]
+    for m in breaks:
+        git_lines.append(git_lines[-1] + ("\n" in m.group()))
     hits = []
-    def visit(node, scope):
+    # An explicit stack, not recursion: a 1,500-term sum parses on CPython 3.12 but is deeper than
+    # its default recursion limit.
+    stack = [(tree, [])]
+    while stack:
+        node, scope = stack.pop()
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                first, last = git_line(child.lineno), git_line(child.end_lineno)
+                first, last = git_lines[child.lineno - 1], git_lines[child.end_lineno - 1]
                 span = last - first + 1
                 if span > FUNC_MAX:
                     signature = " ".join(lines[child.lineno - 1:child.body[0].lineno - 1]).strip() or lines[child.lineno - 1].strip()
                     hits.append({"file": rel, "line": first, "endLine": last, "text": f"function spans {span} lines{scope_label(scope)}: {signature}"})
-                visit(child, scope + [child.name])
+                stack.append((child, scope + [child.name]))
             else:
-                visit(child, scope + [child.name] if isinstance(child, ast.ClassDef) else scope)
-    visit(tree, [])
+                stack.append((child, scope + [child.name] if isinstance(child, ast.ClassDef) else scope))
     return hits, True
 
 def enclosing_types(code, i):
