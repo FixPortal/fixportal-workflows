@@ -176,10 +176,10 @@
     },
     {
       "path": ".github/workflows/review-tier.yml",
-      "sha256": "c54b26304367f8b811d79ab23864995240145e8d5aa3c6c3e9339675eddda472",
+      "sha256": "d77268ac2a14b8f53edb064954586828a465392b7ad32d0e61e3bd2dd9078df2",
       "verbatim": false,
-      "commit": "a2ddae4b9c194ac31e54f857dedcbe1b9614823e",
-      "syncedAt": "2026-10-12"
+      "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
+      "syncedAt": "2026-11-22"
     }
   ]
 }

@@ -92,10 +92,34 @@ jobs:
           # on the PR (a HIGH path touched earlier, or the label applied before the author
           # was recognised) -- exiting first left that label in place forever, because every
           # later run skips too. review-high-manual is never touched.
+          #
+          # The skip holds only while EVERY commit is the bot's. A maintainer commit on a bot
+          # branch (a pinned toolchain bump that needs a HIGH-tier script edit, say) is not a
+          # dependency bump, and skipping on the author alone let it merge untiered, with no
+          # red check. A commit with no linked login counts as not the bot's. A commit list this
+          # job cannot read cannot be shown to be bot-only either, so it is classified too, but
+          # tracked apart: on a HIGH path its failure asks for a re-run, not a maintainer PR.
+          # The commits endpoint stops at 250 even under --paginate, so the list counts as
+          # complete only when it matches the PR's own commit count. A shorter list is
+          # classified as mixed, not unreadable: a re-run would return the same 250.
+          bot_author_mixed=false
+          commits_unreadable=false
           if [ "$PR_AUTHOR" = "dependabot[bot]" ] || [ "$PR_AUTHOR" = "renovate[bot]" ]; then
-            echo "::notice::Dependency PRs are out of AI review by policy; skipping review tier classification."
-            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label review-high >/dev/null 2>&1 || true
-            exit 0
+            if ! commit_authors=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/commits" --paginate --jq '.[] | (.author.login // "<unknown>")') \
+               || [ -z "$commit_authors" ] \
+               || ! total_commits=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.commits'); then
+              commits_unreadable=true
+              echo "::warning::Could not read this $PR_AUTHOR pull request's commits; classifying it rather than assuming they are all the bot's."
+            elif listed=$(grep -c . <<< "$commit_authors"); [ "$listed" != "$total_commits" ]; then
+              echo "::notice::The commits API listed $listed of this $PR_AUTHOR pull request's $total_commits commits; classifying it rather than assuming the rest are the bot's."
+            elif ! grep -vqxF -e "$PR_AUTHOR" <<< "$commit_authors"; then
+              echo "::notice::Dependency PRs are out of AI review by policy; skipping review tier classification."
+              gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label review-high >/dev/null 2>&1 || true
+              exit 0
+            else
+              echo "::notice::This $PR_AUTHOR pull request carries a commit that is not the bot's; classifying it."
+            fi
+            bot_author_mixed=true
           fi
 
           tier_high_on_failure() {
@@ -267,6 +291,16 @@ jobs:
           fi
 
           if $high; then
+            # CodeRabbit refuses bot-authored pull requests, so a review-high label here would
+            # promise a review that can never run. Fail instead, naming the remedy.
+            if $commits_unreadable; then
+              echo "::error::Could not read this $PR_AUTHOR pull request's commits, and it changes a HIGH path, so it cannot be shown to be a bot-only dependency bump. Re-run this job; if a maintainer commit is on the branch, move it to a pull request a maintainer opens."
+              exit 1
+            fi
+            if $bot_author_mixed; then
+              echo "::error::This $PR_AUTHOR pull request carries a commit that is not the bot's and changes a HIGH path. CodeRabbit refuses bot-authored pull requests, so it cannot get the review HIGH requires. Move the change to a pull request a maintainer opens."
+              exit 1
+            fi
             echo "HIGH tier: at least one changed path matches the policy's high list."
             gh label create review-high --repo "$GITHUB_REPOSITORY" --force --description "HIGH review tier: CodeRabbit review required" >/dev/null
             gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label review-high
