@@ -935,11 +935,12 @@ def literal_value(value):
 
 
 _DECIMAL_STRING = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
-# The runner tests a lowercase `x` only; `0X10` is NaN there, so it falls through to _UNMODELLED_NUMBER (UNKNOWN).
+# The runner's ParseNumber knows only lowercase `0x` and `0o`. `0X10`, `0b11` and signed hex are NaN there, so the
+# comparison is False (issue #506 A13; ExpressionUtility.cs).
 _HEX_STRING = re.compile(r"0x[0-9a-fA-F]+")
-# Spellings the runner converts that this checker does not model (octal, binary, signed hex, Infinity, NaN): the
-# comparison is UNKNOWN rather than folded on a conversion that may be wrong (issue #506 A13).
-_UNMODELLED_NUMBER = re.compile(r"[+-]?(?:0[xXoObB][0-9a-zA-Z]*|inf[a-z]*|nan)", re.IGNORECASE)
+_OCTAL_STRING = re.compile(r"0o[0-7]+")
+# Only what .NET's Double.TryParse itself accepts and this checker does not model stays UNKNOWN (Infinity, NaN).
+_UNMODELLED_NUMBER = re.compile(r"[+-]?(?:inf(?:inity)?|nan)", re.IGNORECASE)
 
 
 def github_equal(left, right):
@@ -968,6 +969,12 @@ def github_equal(left, right):
             if _HEX_STRING.fullmatch(value):
                 # Int32.TryParse(AllowHexSpecifier): eight digits read as two's complement, more is out of range (NaN).
                 number = int(value, 16)
+                if number > 0xFFFFFFFF:
+                    return math.nan
+                return float(number - 0x100000000 if number >= 0x80000000 else number)
+            if _OCTAL_STRING.fullmatch(value):
+                # Convert.ToInt32(s, 8): the same 32-bit two's-complement range, and out of range is NaN.
+                number = int(value[2:], 8)
                 if number > 0xFFFFFFFF:
                     return math.nan
                 return float(number - 0x100000000 if number >= 0x80000000 else number)
@@ -3247,7 +3254,7 @@ def pytest_invocations(commands):
                 yield command[index + 1:]
 
 
-UNITTEST_VALUE_OPTIONS = {"-s", "--start-directory", "-p", "--pattern", "-t", "--top-level-directory"}
+UNITTEST_VALUE_OPTIONS = {"-s", "--start-directory", "-p", "--pattern", "-t", "--top-level-directory", "-k"}
 
 
 def unittest_discover_without_start(command):
@@ -3486,8 +3493,30 @@ class ScriptWords:
             for command in commands:
                 if not (any(posixpath.basename(token) in ("pytest", "py.test") for token in command) or TEST_RUNNERS & set(command)):
                     continue
-                # An option token (`--ignore-glob=*slow*`) is never a pattern, whatever it contains.
-                own_patterns = [token for token in command if "/" not in token and "*" in token and token not in option_values and not token.startswith("-")]
+                # A discovery pattern is the value of unittest's `-p`/`--pattern`. A glob among pytest's targets
+                # (`pytest checks*`) is a TARGET, never a filename filter for another one, and an option token
+                # (`--ignore-glob=*slow*`) is never a pattern.
+                own_patterns = []
+                if "unittest" in command:
+                    for position, token in enumerate(command):
+                        if token in ("-p", "--pattern") and position + 1 < len(command):
+                            own_patterns.append(command[position + 1])
+                        elif token.startswith("--pattern="):
+                            own_patterns.append(token.split("=", 1)[1])
+                    # `unittest discover START PATTERN`: the second positional argument is the pattern.
+                    after = command[command.index("unittest") + 1:]
+                    if after[:1] == ["discover"]:
+                        positionals, skip = [], False
+                        for argument in after[1:]:
+                            if skip:
+                                skip = False
+                            elif argument in UNITTEST_VALUE_OPTIONS:
+                                skip = True
+                            elif not argument.startswith("-"):
+                                positionals.append(argument)
+                        if len(positionals) >= 2:
+                            own_patterns.append(positionals[1])
+                own_patterns = [pattern for pattern in own_patterns if "*" in pattern and "/" not in pattern and pattern not in option_values]
                 runner_patterns.append(own_patterns)
                 for token in command:
                     # A word two runner commands both name (`-s checks` twice) keeps the union of their patterns, and an
@@ -3540,7 +3569,8 @@ class ScriptWords:
                 if word in PACKAGE_MANAGERS:
                     # The command's own flags end at a separator or a comment: neither `npm ci #
                     # --ignore-scripts` nor `npm ci; echo --ignore-scripts` passes the flag to npm.
-                    own = line[spans[index].start():]
+                    # A word added from the shell tokens (`\npm` parses to `npm`) has no span of its own: find it in the line.
+                    own = line[spans[index].start():] if index < len(spans) else line[max(line.find(word), 0):]
                     end = re.search(r"[;&|]|(?:^|\s)#", own)
                     own = own[:end.start()] if end else own
                     # A quote before the boundary may hide a separator (`--cache './c;l'`): the end is
