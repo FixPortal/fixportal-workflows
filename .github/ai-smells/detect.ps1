@@ -549,9 +549,12 @@ function Invoke-SmellDetectors {
             $second = $clone.Second
             if ((Test-GeneratedSourceFile $TreePath $first $generatedCache) -or (Test-GeneratedSourceFile $TreePath $second $generatedCache)) { continue }
             $firstEnd = if ($d.firstFile.end) { [int]$d.firstFile.end } else { [int]$d.firstFile.start + [int]$d.lines - 1 }
-            $raw.Add([pscustomobject]@{ smell = $s.id; file = $first; line = [int]$d.firstFile.start; endLine = $firstEnd; scopeStart = [int]$d.firstFile.start; text ="duplicates ${second}:$($d.secondFile.start) ($($d.lines) lines)"; detector = "jscpd@$($tools['jscpd'])" })
+            # The second partner's own end, only when jscpd wrote a usable one (the repair above nulls an unusable end).
+            # Its span often differs from `lines`, so pr-scope uses it instead of the first partner's line count.
+            $otherEnd = if ($d.secondFile.end) { [int]$d.secondFile.end } else { $null }
+            $raw.Add([pscustomobject]@{ smell = $s.id; file = $first; line = [int]$d.firstFile.start; endLine = $firstEnd; otherEndLine = $otherEnd; scopeStart = [int]$d.firstFile.start; text ="duplicates ${second}:$($d.secondFile.start) ($($d.lines) lines)"; detector = "jscpd@$($tools['jscpd'])" })
         }
-        $cloneNote = if ($repairedEnds) { "jscpd reported an unusable end line for $repairedEnds clone partner(s); end lines are advisory, so spans come from start and line count, and a second location is scoped by the first one's line count for every clone" } else { '' }
+        $cloneNote = if ($repairedEnds) { "jscpd reported an unusable end line for $repairedEnds clone partner(s); end lines are advisory, so spans come from start and line count, and a second location whose own end is unusable is scoped by the first one's line count" } else { '' }
         $coverage.Add([pscustomobject]@{ smell = $s.id; status = 'assessed'; reason = $cloneNote })
     }
 
@@ -599,7 +602,13 @@ function Invoke-SmellDetectors {
 
     $sorted = @($raw | Sort-Object smell, file, line, text)
     $i = 0
-    $hits = @(foreach ($h in $sorted) { $i++; [pscustomobject][ordered]@{ id = ('h{0:D4}' -f $i); smell = $h.smell; file = $h.file; line = $h.line; endLine = $h.endLine; scopeStart = $h.scopeStart; text = $h.text; detector = $h.detector } })
+    $hits = @(foreach ($h in $sorted) {
+        $i++
+        $row = [ordered]@{ id = ('h{0:D4}' -f $i); smell = $h.smell; file = $h.file; line = $h.line; endLine = $h.endLine; scopeStart = $h.scopeStart; text = $h.text; detector = $h.detector }
+        # Only a clone whose second location has a usable end carries one; every other hit keeps the old shape.
+        if ($h.PSObject.Properties['otherEndLine'] -and $null -ne $h.otherEndLine) { $row['otherEndLine'] = [int]$h.otherEndLine }
+        [pscustomobject]$row
+    })
     $lines = @($hits | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 3 })
     [IO.File]::WriteAllText((Join-Path $OutDir 'hits.jsonl'), (($lines -join "`n") + $(if ($lines) { "`n" } else { '' })))
     $coverage | ConvertTo-Json -Depth 3 -AsArray | Set-Content -LiteralPath (Join-Path $OutDir 'coverage.json') -Encoding utf8NoBOM
