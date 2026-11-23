@@ -939,8 +939,10 @@ _DECIMAL_STRING = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9
 # comparison is False (issue #506 A13; ExpressionUtility.cs).
 _HEX_STRING = re.compile(r"0x[0-9a-fA-F]+")
 _OCTAL_STRING = re.compile(r"0o[0-7]+")
-# Only what .NET's Double.TryParse itself accepts and this checker does not model stays UNKNOWN (Infinity, NaN).
-_UNMODELLED_NUMBER = re.compile(r"[+-]?(?:inf(?:inity)?|nan)", re.IGNORECASE)
+# .NET's Double.TryParse (observed, InvariantCulture) accepts `NaN` and `Infinity` in any case with an optional sign, and
+# rejects `Inf`, `-inf` and the infinity glyph. All of them are determinate: NaN compares false, never unknown.
+_NAN_STRING = re.compile(r"[+-]?nan", re.IGNORECASE)
+_INFINITY_STRING = re.compile(r"[+-]?infinity", re.IGNORECASE)
 
 
 def github_equal(left, right):
@@ -978,8 +980,10 @@ def github_equal(left, right):
                 if number > 0xFFFFFFFF:
                     return math.nan
                 return float(number - 0x100000000 if number >= 0x80000000 else number)
-            if _UNMODELLED_NUMBER.fullmatch(value):
-                return _UNKNOWN
+            if _NAN_STRING.fullmatch(value):
+                return math.nan
+            if _INFINITY_STRING.fullmatch(value):
+                return -math.inf if value.startswith("-") else math.inf
             return math.nan
         return math.nan
 
@@ -3254,7 +3258,7 @@ def pytest_invocations(commands):
                 yield command[index + 1:]
 
 
-UNITTEST_VALUE_OPTIONS = {"-s", "--start-directory", "-p", "--pattern", "-t", "--top-level-directory", "-k"}
+UNITTEST_VALUE_OPTIONS = {"-s", "--start-directory", "-p", "--pattern", "-t", "--top-level-directory", "-k", "--durations"}
 
 
 def unittest_discover_without_start(command):
@@ -3367,6 +3371,11 @@ def npm_flag_value(args, names):
     return value
 
 
+# The interpreter in a `python -m <module>` launch (`python`, `python3.12`, `py`, `pypy3`, with an optional .exe).
+# POSIX shell parsing eats the backslashes of an unquoted Windows path (`.venv\Scripts\python` arrives as
+# `.venvScriptspython`), so a token that merely ENDS in the interpreter name counts, as does a bare `py`/`pypy`.
+PYTHON_EXECUTABLE = re.compile(r"(?:.*python[0-9.]*|(?:.*[/\\])?(?:py|pypy[0-9.]*))(?:\.exe)?", re.IGNORECASE)
+
 # Modules `python -m <module>` runs that are tools, not a repository script (issue #506 A5).
 NON_REPOSITORY_MODULES = {
     "pip", "venv", "ensurepip", "build", "twine", "setuptools", "wheel", "pipx", "virtualenv", "black", "ruff",
@@ -3470,7 +3479,8 @@ class ScriptWords:
             words = [span.group() for span in spans]
             # Each shell command on the line, quotes honoured and split at `; | & ( )`, so a later
             # command's words are not the runner's arguments (PR #505 review).
-            commands = shell_commands(line) or [words]
+            parsed_commands = shell_commands(line)
+            commands = parsed_commands or [words]
             # A shell token WORD splits (`python3 "scripts/quality checks.py"`, `python 'scripts/check,fast.py'`,
             # `"scripts/check(quick).py"`) is a word too (CodeRabbit, observatory PR #468; issue #506 A8).
             words = words + [token for command in commands for token in command if token not in words and token.strip()]
@@ -3535,12 +3545,7 @@ class ScriptWords:
                 hits = self.named(target, bases, testing and not word.startswith("-"), patterns_by_word.get(word, []))
                 if word == "-m" and index + 1 < len(words):
                     module = words[index + 1].replace(".", "/")
-                    # A literal `python -m <module>` may run a repository module even when it does not resolve from
-                    # here (`cd qa && python3 -m quality`), so it is script-bearing (issue #506 A5). Well-known
-                    # tool modules are not, or `cd x && python -m pip install` would be refused.
-                    if not words[index + 1].startswith("-") and words[index + 1].split(".")[0] not in NON_REPOSITORY_MODULES:
-                        refers = True
-                    hits |= self.named(module + ".py", bases) | self.named(module + "/__main__.py", bases)
+                    hits |=self.named(module + ".py", bases) | self.named(module + "/__main__.py", bases)
                     package = module.split("/")
                     for depth in range(1, len(package) + 1):
                         hits |= self.attempt("/".join(package[:depth]) + "/__init__.py", bases, False, (), True)
@@ -3566,27 +3571,37 @@ class ScriptWords:
                 # here (`cd app` then `pytest tests`): the paths after a `cd` are unknown (issue #506 A4).
                 runner_word = word == "unittest" or posixpath.basename(word) in ("pytest", "py.test")
                 refers = refers or bool(hits) or glob or runner_word or word in PACKAGE_MANAGERS or word.lower().endswith(SCRIPT_EXTENSIONS + (".ts",))
-                if word in PACKAGE_MANAGERS:
-                    # The command's own flags end at a separator or a comment: neither `npm ci #
-                    # --ignore-scripts` nor `npm ci; echo --ignore-scripts` passes the flag to npm.
-                    # A word added from the shell tokens (`\npm` parses to `npm`) has no span of its own: find it in the line.
-                    own = line[spans[index].start():] if index < len(spans) else line[max(line.find(word), 0):]
-                    end = re.search(r"[;&|]|(?:^|\s)#", own)
-                    own = own[:end.start()] if end else own
-                    # A quote before the boundary may hide a separator (`--cache './c;l'`): the end is
-                    # unknown, so no flag is trusted and the hooks are followed. npm also stops reading
-                    # options at `--` (npm 11.18.0 ran the hooks for `npm ci -- --ignore-scripts`).
-                    # The flags are the command's own arguments: a redirection target (`npm ci > --ignore-scripts`,
-                    # `2>--ignore-scripts`) is a file name, not a flag, and shell_commands has already dropped it.
-                    # The n-th occurrence of the word on the line belongs to the n-th command naming it, so a later
-                    # `npm ci` does not inherit an earlier command's `--ignore-scripts`.
-                    occurrence = sum(1 for earlier in words[:index] if earlier == word)
-                    owners = [command for command in commands if word in command]
-                    owner = owners[occurrence] if occurrence < len(owners) else None
-                    # `--x=false` reads as `--x false`, the way npm_flag_value expects it.
-                    flags = [] if re.search(r"[\"'`]", own) or owner is None else [part for token in owner[owner.index(word) + 1:] for part in token.split("=", 1)]
-                    flags = flags[:flags.index("--")] if "--" in flags else flags
-                    self.package_scripts(words[index:], bases, found, job_id, seen, flags)
+                # (package-manager and `python -m` handling follows the word loop, per parsed command.) A package-manager
+                # word the parsed commands do not account for (one inside a trailing comment) is still followed, with no
+                # trusted flag: the word rule counts a script named in a comment (over-approximation by design).
+                if word in PACKAGE_MANAGERS and sum(1 for earlier in words[:index] if earlier == word) >= sum(command.count(word) for command in commands):
+                    self.package_scripts(words[index:], bases, found, job_id, seen, [])
+            # Package-manager invocations and `python -m` launches are read from each PARSED command, with that
+            # command's own arguments. Ownership is never rebuilt from raw-word occurrence counts: `n\pm ci
+            # --ignore-scripts; npm ci` has one literal `npm` word but two npm commands (CodeRabbit, PR 285).
+            for command in commands:
+                for position, token in enumerate(command):
+                    if token == "-m" and position + 1 < len(command):
+                        # A literal `python -m <module>` may run a repository module even when it does not resolve from
+                        # here (`cd qa && python3 -m quality`), so it is script-bearing (issue #506 A5). Well-known tool
+                        # modules are not, and `-m` outside a Python command (`git commit -m`) is not a module at all.
+                        module = command[position + 1]
+                        if (any(PYTHON_EXECUTABLE.fullmatch(earlier) for earlier in command[:position])
+                                and not module.startswith("-") and module.split(".")[0] not in NON_REPOSITORY_MODULES):
+                            refers = True
+                    if token in PACKAGE_MANAGERS:
+                        refers = True
+                        # The command's own arguments are its flags: a redirection target (`npm ci > --ignore-scripts`,
+                        # `2>--ignore-scripts`) is a file name and shell_commands has already dropped it. npm stops
+                        # reading options at `--` (npm 11.18.0 ran the hooks for `npm ci -- --ignore-scripts`), and
+                        # `--x=false` reads as `--x false`, the way npm_flag_value expects it. Quotes that could not
+                        # be parsed leave no trusted flag, so the hooks are followed.
+                        flags = [part for argument in command[position + 1:] for part in argument.split("=", 1)] if parsed_commands else []
+                        flags = flags[:flags.index("--")] if "--" in flags else flags
+                        # WORD split `--workspace=@x/app` into the option and its value; the options npm_scripts
+                        # looks for (`--workspace`, `--prefix`) must still be found as whole words.
+                        invocation = [part for argument in command[position:] for part in argument.split("=", 1)]
+                        self.package_scripts(invocation, bases, found, job_id, seen, flags)
         return refers
 
     def package_scripts(self, words, bases, found, job_id, seen, flags=()):
