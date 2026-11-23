@@ -2,16 +2,16 @@
   "schema": 1,
   "canonical": {
     "repository": "FixPortal/fixportal-agents-skills",
-    "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
-    "syncedAt": "2026-11-22"
+    "commit": "f36f76b808cff85f30d4fe90804b3cbf7848f9e5",
+    "syncedAt": "2026-11-23"
   },
   "assets": [
     {
       "path": ".github/ai-smells/detect.ps1",
-      "sha256": "7d09cacd1ee5b6db7e661fe1d2e26bdf920576ea5c6456ca1f372af068a6a02b",
+      "sha256": "7b3959f81e7f4a3b5b59675f8d2b3fe37aa297f3bb6116b7fc752d47a02f946a",
       "verbatim": true,
-      "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
-      "syncedAt": "2026-11-22"
+      "commit": "f36f76b808cff85f30d4fe90804b3cbf7848f9e5",
+      "syncedAt": "2026-11-23"
     },
     {
       "path": ".github/ai-smells/detectors/rules/S10.yml",
@@ -113,10 +113,10 @@
     },
     {
       "path": ".github/ai-smells/post-smell-threads.ps1",
-      "sha256": "6d29e490b82e9b857bd8d8aa4554174d6cd25701b261a9dc6a9ff17e03992411",
+      "sha256": "30ea74f4cb85c145f4c78dbe9158b3197e1bd4faa716549400243429af3e72dc",
       "verbatim": true,
-      "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
-      "syncedAt": "2026-11-22"
+      "commit": "f36f76b808cff85f30d4fe90804b3cbf7848f9e5",
+      "syncedAt": "2026-11-23"
     },
     {
       "path": ".github/ai-smells/pr-detect.ps1",
@@ -127,10 +127,10 @@
     },
     {
       "path": ".github/ai-smells/pr-scope.ps1",
-      "sha256": "4f70cb8b2cbccdbb5dda6c453e7df9b7d0e039666a6c46b982f26ac247569a9d",
+      "sha256": "d7bfc599781a9731d402924c5f25b30f02286379c0b3033afccd766ec7c1aa21",
       "verbatim": true,
-      "commit": "ce1419348ec3562f3b567ac8a47ab85fadfc8f6d",
-      "syncedAt": "2026-11-22"
+      "commit": "f36f76b808cff85f30d4fe90804b3cbf7848f9e5",
+      "syncedAt": "2026-11-23"
     },
     {
       "path": ".github/ai-smells/smells.json",
@@ -148,10 +148,10 @@
     },
     {
       "path": ".github/scripts/assert_gate_coverage.py",
-      "sha256": "72530e10004e449bd763a1fac048e7f2a6ca8cfc8a1aad8050e5edc45bdcb5ca",
+      "sha256": "16f8eb8a9482322fed230e1876e124014748041eb853b0d2a2c282c79bc4c8c4",
       "verbatim": true,
-      "commit": "a5599589ee609c516fa8832f1b9e89e984309388",
-      "syncedAt": "2026-11-22"
+      "commit": "f36f76b808cff85f30d4fe90804b3cbf7848f9e5",
+      "syncedAt": "2026-11-23"
     },
     {
       "path": ".github/scripts/assert_workflow_hygiene.py",

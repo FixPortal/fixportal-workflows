@@ -77,8 +77,8 @@ if ($gaps) {
 
 if ($env:GITHUB_STEP_SUMMARY) {
     $summary = @("## ai-smells", "", "$(@($result.hits).Count) hit(s) on added lines; $($pick.Post.Count) new thread(s) posted.")
-    if ($gaps) { $summary += @('', '**Not assessed** (a detector could not run; not the same as clean):') + @($gaps | ForEach-Object { "- $($_.smell): $(Format-SafeLogText $_.reason)" }) }
-    if ($pick.Overflow.Count) { $summary += @('', '**Over the cap:**') + @($pick.Overflow | ForEach-Object { "- $($_.smell) $($_.file):$($_.line) $($_.lineText)" }) }
+    if ($gaps) { $summary += @('', '**Not assessed** (a detector could not run; not the same as clean):') + @($gaps | ForEach-Object { "- $($_.smell): $(Format-SafeSummaryText $_.reason)" }) }
+    if ($pick.Overflow.Count) { $summary += @('', '**Over the cap:**') + @($pick.Overflow | ForEach-Object { "- $($_.smell) $(Format-SafeSummaryText $_.file):$($_.line) $(Format-SafeSummaryText $_.lineText)" }) }
     Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $summary
 }
 if ($pick.Post.Count -gt 0 -and $failed -eq $pick.Post.Count) { exit 1 }

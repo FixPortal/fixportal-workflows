@@ -934,7 +934,16 @@ def literal_value(value):
         return _UNKNOWN
 
 
+_DECIMAL_STRING = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+# The runner tests a lowercase `x` only; `0X10` is NaN there, so it falls through to _UNMODELLED_NUMBER (UNKNOWN).
+_HEX_STRING = re.compile(r"0x[0-9a-fA-F]+")
+# Spellings the runner converts that this checker does not model (octal, binary, signed hex, Infinity, NaN): the
+# comparison is UNKNOWN rather than folded on a conversion that may be wrong (issue #506 A13).
+_UNMODELLED_NUMBER = re.compile(r"[+-]?(?:0[xXoObB][0-9a-zA-Z]*|inf[a-z]*|nan)", re.IGNORECASE)
+
+
 def github_equal(left, right):
+    """True/False for a comparison the runner's coercion makes certain, `_UNKNOWN` for one it does not."""
     if type(left) is type(right):
         return left.casefold() == right.casefold() if isinstance(left, str) else left == right
 
@@ -950,15 +959,27 @@ def github_equal(left, right):
             value = value.strip()
             if not value:
                 return 0.0
-            try:
-                parsed = json.loads(value)
-                return float(parsed) if isinstance(parsed, (int, float)) and not isinstance(parsed, bool) else math.nan
-            except (json.JSONDecodeError, ValueError, OverflowError):
-                return math.nan
+            # A leading sign is accepted (`'+0'` is 0) and so is a `0x` hex prefix (ExpressionUtility.ParseNumber).
+            if _DECIMAL_STRING.fullmatch(value):
+                try:
+                    return float(value)
+                except (ValueError, OverflowError):
+                    return math.nan
+            if _HEX_STRING.fullmatch(value):
+                # Int32.TryParse(AllowHexSpecifier): eight digits read as two's complement, more is out of range (NaN).
+                number = int(value, 16)
+                if number > 0xFFFFFFFF:
+                    return math.nan
+                return float(number - 0x100000000 if number >= 0x80000000 else number)
+            if _UNMODELLED_NUMBER.fullmatch(value):
+                return _UNKNOWN
+            return math.nan
         return math.nan
 
     left_number = to_number(left)
     right_number = to_number(right)
+    if left_number is _UNKNOWN or right_number is _UNKNOWN:
+        return _UNKNOWN
     return not (math.isnan(left_number) or math.isnan(right_number)) and left_number == right_number
 
 
@@ -1084,7 +1105,8 @@ def static_truth(condition, _nested=False):
             return _UNKNOWN
         operation = match.group(2)
         if operation in ("==", "!="):
-            return github_equal(left, right) == (operation == "==")
+            equal = github_equal(left, right)
+            return _UNKNOWN if equal is _UNKNOWN else equal == (operation == "==")
         if not isinstance(left, float) or not isinstance(right, float):
             return _UNKNOWN
         return {
@@ -3225,6 +3247,34 @@ def pytest_invocations(commands):
                 yield command[index + 1:]
 
 
+UNITTEST_VALUE_OPTIONS = {"-s", "--start-directory", "-p", "--pattern", "-t", "--top-level-directory"}
+
+
+def unittest_discover_without_start(command):
+    """True for `unittest discover` with no start directory: unittest then starts at `.` (issue #506 A3).
+    A start directory is `-s DIR`, `--start-directory DIR` (or `=DIR`) or the first positional argument."""
+    if "unittest" not in command:
+        return False
+    rest = command[command.index("unittest") + 1:]
+    if not rest or rest[0] != "discover":
+        return False
+    skip = False
+    for argument in rest[1:]:
+        if skip:
+            skip = False
+        elif argument in UNITTEST_VALUE_OPTIONS:
+            if argument in ("-s", "--start-directory"):
+                return False
+            skip = True
+        elif argument.startswith(("-s=", "--start-directory=")) or (argument.startswith("-s") and len(argument) > 2 and not argument.startswith("--")):
+            return False
+        elif argument.startswith("-"):
+            continue
+        else:
+            return False  # the first positional argument is the start directory
+    return True
+
+
 def runs_pytest_from_root(commands):
     """True when a command is pytest with no target."""
     return any(not pytest_targets(arguments) and not {"--version", "-V"} & set(arguments) for arguments in pytest_invocations(commands))
@@ -3310,6 +3360,15 @@ def npm_flag_value(args, names):
     return value
 
 
+# Modules `python -m <module>` runs that are tools, not a repository script (issue #506 A5).
+NON_REPOSITORY_MODULES = {
+    "pip", "venv", "ensurepip", "build", "twine", "setuptools", "wheel", "pipx", "virtualenv", "black", "ruff",
+    "mypy", "flake8", "isort", "pylint", "coverage", "tox", "nox", "http", "json", "zipfile", "tarfile",
+    "compileall", "py_compile", "site", "sysconfig", "platform", "timeit", "trace", "cProfile", "pdb",
+    "unittest", "pytest",
+}
+
+
 class ScriptWords:
     """The repository scripts that the words of run bodies and package scripts name."""
 
@@ -3343,7 +3402,8 @@ class ScriptWords:
                 if text.lower().endswith(SCRIPT_EXTENSIONS + (".ts",)):
                     found.update(self.committed(joined, allow_outside))
                 continue
-            if any(char in text for char in "*?[") and "/" in text:
+            # A single-segment glob (`pytest test_*.py`) expands too, for a test runner's targets (issue #506 A9).
+            if any(char in text for char in "*?[") and ("/" in text or (testing and not text.startswith("-"))):
                 # `*` and `?` stay inside one path segment, as the shell reads them. A brace
                 # list is split at its comma into separate words, so `{...` widens to `*`.
                 segments = re.sub(r"\{[^/]*", "*", path).split("/")
@@ -3404,24 +3464,53 @@ class ScriptWords:
             # Each shell command on the line, quotes honoured and split at `; | & ( )`, so a later
             # command's words are not the runner's arguments (PR #505 review).
             commands = shell_commands(line) or [words]
-            # A quoted path with a space (`python3 "scripts/quality checks.py"`) is a word too: WORD
-            # splits it (CodeRabbit, observatory PR #468).
-            words = words + [token for command in commands for token in command if re.search(r"\s", token)]
+            # A shell token WORD splits (`python3 "scripts/quality checks.py"`, `python 'scripts/check,fast.py'`,
+            # `"scripts/check(quick).py"`) is a word too (CodeRabbit, observatory PR #468; issue #506 A8).
+            words = words + [token for command in commands for token in command if token not in words and token.strip()]
             # A runner by its basename too (`.venv/bin/pytest tests`), and a pytest run with no target
-            # collects from the root (`pytest`, `python3 -m pytest -q`; observatory review, C1-F9).
+            # collects from the root (`pytest`, `python3 -m pytest -q`; observatory review, C1-F9). So does
+            # `python -m unittest discover` with no start directory (issue #506 A3).
             root_run = runs_pytest_from_root(commands)
-            if root_run:
+            discover_run = any(unittest_discover_without_start(command) for command in commands)
+            if root_run or discover_run:
                 words = words + ["."]
             pytest_line = root_run or any(posixpath.basename(token) in ("pytest", "py.test") for command in commands for token in command)
             testing = pytest_line or bool(TEST_RUNNERS & set(words))
-            # A discovery pattern (`-p 'test_*.py'`) narrows which files of a named directory run.
-            # A pytest option's value (`--ignore-glob '*slow*'`) is not one (PR #505 second review).
+            # A discovery pattern (`-p 'test_*.py'`) narrows which files of a named directory run, and only
+            # the targets of the command that supplies it: `pytest tests && echo 'release-*'` hands pytest
+            # no pattern (issue #506 A1). A pytest option's value (`--ignore-glob '*slow*'`) is not one
+            # (PR #505 second review). A word no runner command owns is unfiltered: that only widens.
             option_values = pytest_option_values(commands)
-            patterns = [word for word in words if testing and "/" not in word and "*" in word and word not in option_values]
+            patterns_by_word = {}
+            runner_patterns = []
+            for command in commands:
+                if not (any(posixpath.basename(token) in ("pytest", "py.test") for token in command) or TEST_RUNNERS & set(command)):
+                    continue
+                # An option token (`--ignore-glob=*slow*`) is never a pattern, whatever it contains.
+                own_patterns = [token for token in command if "/" not in token and "*" in token and token not in option_values and not token.startswith("-")]
+                runner_patterns.append(own_patterns)
+                for token in command:
+                    # A word two runner commands both name (`-s checks` twice) keeps the union of their patterns, and an
+                    # unfiltered occurrence leaves it unfiltered: a later command must not inherit an earlier one's filter.
+                    if token not in patterns_by_word:
+                        patterns_by_word[token] = own_patterns
+                    elif not patterns_by_word[token] or not own_patterns:
+                        patterns_by_word[token] = []
+                    else:
+                        patterns_by_word[token] = sorted(set(patterns_by_word[token]) | set(own_patterns))
+            # The implicit `.` belongs to every runner that supplied it; one without a pattern leaves it unfiltered.
+            patterns_by_word["."] = [] if not runner_patterns or any(not own for own in runner_patterns) else sorted({p for own in runner_patterns for p in own})
             for index, word in enumerate(words):
-                hits = self.named(word, bases, testing and not word.startswith("-"), patterns)
+                # A pytest node id names its module before the `::` (issue #506 A2).
+                target = word.split("::")[0] if pytest_line and "::" in word and not word.startswith("-") else word
+                hits = self.named(target, bases, testing and not word.startswith("-"), patterns_by_word.get(word, []))
                 if word == "-m" and index + 1 < len(words):
                     module = words[index + 1].replace(".", "/")
+                    # A literal `python -m <module>` may run a repository module even when it does not resolve from
+                    # here (`cd qa && python3 -m quality`), so it is script-bearing (issue #506 A5). Well-known
+                    # tool modules are not, or `cd x && python -m pip install` would be refused.
+                    if not words[index + 1].startswith("-") and words[index + 1].split(".")[0] not in NON_REPOSITORY_MODULES:
+                        refers = True
                     hits |= self.named(module + ".py", bases) | self.named(module + "/__main__.py", bases)
                     package = module.split("/")
                     for depth in range(1, len(package) + 1):
@@ -3444,7 +3533,10 @@ class ScriptWords:
                     found.setdefault(hit, job_id)
                 # A path glob may expand to a script from a directory a `cd` moved to (`cd ci && node --test checks/*`).
                 glob = "/" in word and any(char in word for char in "*?[")
-                refers = refers or bool(hits) or glob or word in PACKAGE_MANAGERS or word.lower().endswith(SCRIPT_EXTENSIONS + (".ts",))
+                # A recognised pytest or unittest invocation counts even when its target resolves to nothing from
+                # here (`cd app` then `pytest tests`): the paths after a `cd` are unknown (issue #506 A4).
+                runner_word = word == "unittest" or posixpath.basename(word) in ("pytest", "py.test")
+                refers = refers or bool(hits) or glob or runner_word or word in PACKAGE_MANAGERS or word.lower().endswith(SCRIPT_EXTENSIONS + (".ts",))
                 if word in PACKAGE_MANAGERS:
                     # The command's own flags end at a separator or a comment: neither `npm ci #
                     # --ignore-scripts` nor `npm ci; echo --ignore-scripts` passes the flag to npm.
@@ -3454,12 +3546,22 @@ class ScriptWords:
                     # A quote before the boundary may hide a separator (`--cache './c;l'`): the end is
                     # unknown, so no flag is trusted and the hooks are followed. npm also stops reading
                     # options at `--` (npm 11.18.0 ran the hooks for `npm ci -- --ignore-scripts`).
-                    flags = [] if re.search(r"[\"'`]", own) else WORD.findall(own)
+                    # The flags are the command's own arguments: a redirection target (`npm ci > --ignore-scripts`,
+                    # `2>--ignore-scripts`) is a file name, not a flag, and shell_commands has already dropped it.
+                    # The n-th occurrence of the word on the line belongs to the n-th command naming it, so a later
+                    # `npm ci` does not inherit an earlier command's `--ignore-scripts`.
+                    occurrence = sum(1 for earlier in words[:index] if earlier == word)
+                    owners = [command for command in commands if word in command]
+                    owner = owners[occurrence] if occurrence < len(owners) else None
+                    # `--x=false` reads as `--x false`, the way npm_flag_value expects it.
+                    flags = [] if re.search(r"[\"'`]", own) or owner is None else [part for token in owner[owner.index(word) + 1:] for part in token.split("=", 1)]
                     flags = flags[:flags.index("--")] if "--" in flags else flags
                     self.package_scripts(words[index:], bases, found, job_id, seen, flags)
         return refers
 
     def package_scripts(self, words, bases, found, job_id, seen, flags=()):
+        # `working-directory: ./web` is the package at `web` (issue #506 A6).
+        bases = ["" if posixpath.normpath(base) == "." else posixpath.normpath(base) if base else "" for base in bases]
         elsewhere = any(word in NPM_ELSEWHERE for word in words)
         if elsewhere:
             packages = {path for path in self.files if posixpath.basename(path) == "package.json"}
@@ -3500,7 +3602,8 @@ class ScriptWords:
                 continue
             chosen = list(scripts) if names is None else list(names)
             if chosen == ["restart"] and not isinstance(scripts.get("restart"), str):
-                chosen = ["stop", "start"]  # npm restart with no restart script runs stop then start
+                # npm restart with no restart script runs stop then start, still inside prerestart/postrestart (issue #506 A11).
+                chosen = ["restart", "stop", "start"]
             for name in (chosen if names is None else [hook for name in chosen for hook in ("pre" + name, name, "post" + name)]):
                 if isinstance(scripts.get(name), str) and (package, name) not in seen:
                     seen.add((package, name))
@@ -3747,6 +3850,11 @@ def step_runs_unconditionally(condition):
     return all(strip_outer_parentheses(part) in ("!cancelled()", "success()") for part in rest)
 
 
+# GATE_STEP_IF_EXEMPT entry -> the workflows in which it exempted a runtime `if:`. An entry is `<job>/<step id>`
+# with no workflow, so directory mode refuses one that is doing that in more than one file (issue #506 A14).
+IF_EXEMPT_WORKFLOWS = {}
+
+
 def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_exempt, label="", root=None, step_if_exempt=frozenset()):
     """Refuse a feeder step that can never fail its job or never runs.
 
@@ -3774,26 +3882,34 @@ def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_e
     20261101T004730Z, S12). `label` prefixes the job id when the jobs belong to a called
     reusable workflow, in messages and in exemption entries alike.
     """
-    executable = re.compile(r"""^(\s*(?:-\s+)?)(?:'run'|"run"|run|'uses'|"uses"|uses)\s*:""")
     document, _, _ = parsed_document(lines, workflow_path)
     for feeder in sorted(feeders):
         block = job_block(lines, jobs, feeder)
         payloads = run_payload_indexes(block)
         # Only an item of the job's own `steps:` is a step: a `run:` under strategy.matrix.include is
         # data, and its sibling `if:` was refused as a step condition (CodeRabbit, PR #503; cf. C1-F7).
+        # Its `run` and `uses` keys are read from the step MAPPING, never by a line match: an action
+        # input named `run` under `with:` placed before `uses:` was taken for the step's own key, and the
+        # step's real `if:` was never read (issue #506 A12).
         steps = mapping_get(job_node(document, feeder), "steps")
-        step_lines = range(steps.start_mark.line, steps.end_mark.line + 1) if isinstance(steps, yaml.SequenceNode) else range(0)
+        executable_keys = {}
+        if isinstance(steps, yaml.SequenceNode):
+            for item in steps.value:
+                if isinstance(item, yaml.MappingNode):
+                    for key_node, _value in item.value:
+                        if isinstance(key_node, yaml.ScalarNode) and key_node.value in ("run", "uses"):
+                            executable_keys[key_node.start_mark.line - getattr(block, "offset", 0)] = (key_node.start_mark.column, key_node.value)
         seen = set()
         for index, line in enumerate(block):
-            match = executable.match(line) if index not in payloads and getattr(block, "offset", 0) + index in step_lines else None
-            if not match:
+            key = executable_keys.get(index) if index not in payloads else None
+            if key is None:
                 continue
-            indent = len(match.group(1))
+            indent = key[0]
             span = step_span(block, index, indent)
             if span is None or span in seen:
                 continue
             seen.add(span)
-            kind = "run step" if "run" in line[indent:].split(":", 1)[0] else "step"
+            kind = "run step" if key[1] == "run" else "step"
 
             def own_key(key):
                 pattern = step_key_pattern(indent, key)
@@ -3835,6 +3951,7 @@ def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_e
                 entry = f"{label}{feeder}/{decode_yaml_scalar(step_id)}" if step_id else None
                 if entry in step_if_exempt:
                     used_exempt.add(("if", entry))
+                    IF_EXEMPT_WORKFLOWS.setdefault(entry, set()).add(str(workflow_path))
                 else:
                     sys.exit(
                         f"{workflow_path}: feeder '{label}{feeder}' has a {kind}"
@@ -4283,6 +4400,14 @@ def main(argv):
         sys.exit(f"{target}: no file contains a '{gate_job}' job -- refusing to report coverage over nothing.")
     assert_step_exempt_used(target, step_exempt, *step_usage)
     assert_step_if_exempt_used(target, step_if_exempt, step_usage[0])
+    shared = sorted((entry, sorted(paths)) for entry, paths in IF_EXEMPT_WORKFLOWS.items() if len(paths) > 1)
+    if shared:
+        entry, paths = shared[0]
+        sys.exit(
+            f"{target}: GATE_STEP_IF_EXEMPT entry '{entry}' exempts a runtime `if:` in {len(paths)} workflows "
+            f"({', '.join(paths)}). An entry names a job and a step id, not a workflow, so one rationale would "
+            "cover steps nobody reviewed. Give the steps distinct ids, or remove the condition from all but one."
+        )
 
 
 if __name__ == "__main__":

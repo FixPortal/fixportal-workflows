@@ -15,6 +15,20 @@ function Format-SafeLogText {
     return (($Text -replace '[\x00-\x1f\x7f]+', ' ') -replace '::', ': :') -replace '##\[', '## ['
 }
 
+function Format-SafeSummaryText {
+    # The job summary is Markdown, so a file name or added line from the PR would render as a link,
+    # image or heading there. Render it as one inline code span: first the log-safe form (one line, no
+    # runner commands), then a fence one backtick longer than the longest backtick run inside, so
+    # nothing in the text can end the span early.
+    [CmdletBinding()]
+    param([AllowNull()] [AllowEmptyString()] [string] $Text)
+    $safe = Format-SafeLogText $Text
+    $longest = 0
+    foreach ($run in [regex]::Matches($safe, '`+')) { if ($run.Length -gt $longest) { $longest = $run.Length } }
+    $fence = '`' * ($longest + 1)
+    return "$fence $safe $fence"
+}
+
 function Get-DiffLineInfo {
     # One merge-base diff yields three things the PR filter needs:
     #   Added    file -> set of added new-file line numbers
@@ -116,12 +130,22 @@ function Get-DeletionPoint([hashtable] $Deleted, [string] $File, [int] $Start, [
     return $null
 }
 
+function Get-CloneOtherSpan {
+    # Line count of a clone's SECOND location: its own end when the hit carries a usable one, else the
+    # first location's count (jscpd's `lines` describes the first partner only).
+    param($Hit, [int] $OtherLine, [int] $Count)
+    $end = $Hit.PSObject.Properties['otherEndLine']
+    if ($end -and $null -ne $end.Value -and [int]$end.Value -ge $OtherLine) { return [int]$end.Value - $OtherLine + 1 }
+    return $Count
+}
+
 function Test-HitOnAddedLines {
     [CmdletBinding()]
     param([Parameter(Mandatory)] $Hit, [Parameter(Mandatory)] [hashtable] $Added, [hashtable] $Deleted)
     if ($Hit.smell -eq 'S14' -and [string]$Hit.text -match '^duplicates (.+):(\d+) \((\d+) lines\)$') {
         $n = [int]$Matches[3]
-        return (Test-RangeAdded $Added $Hit.file ([int]$Hit.line) $n) -or (Test-RangeAdded $Added $Matches[1] ([int]$Matches[2]) $n)
+        $otherN = Get-CloneOtherSpan $Hit ([int]$Matches[2]) $n
+        return (Test-RangeAdded $Added $Hit.file ([int]$Hit.line) $n) -or (Test-RangeAdded $Added $Matches[1] ([int]$Matches[2]) $otherN)
     }
     $span = Get-HitSpan $Hit
     if (Test-RangeAdded $Added $Hit.file $span.Start ($span.End - $span.Start + 1)) { return $true }
@@ -145,17 +169,21 @@ function Get-AnchoredHit {
         return $moved
     }
     $other = $Matches[1]; $otherLine = [int]$Matches[2]; $n = [int]$Matches[3]
+    $otherN = Get-CloneOtherSpan $Hit $otherLine $n
     $own = if (Test-PathExcluded $Hit.file $Exclude) { $null } else { Get-FirstAddedLine $Added $Hit.file ([int]$Hit.line) $n }
     if ($null -ne $own) {
         $kept = $Hit.PSObject.Copy()
         $kept.line = $own
         return $kept
     }
-    $theirs = if (Test-PathExcluded $other $Exclude) { $null } else { Get-FirstAddedLine $Added $other $otherLine $n }
+    $theirs = if (Test-PathExcluded $other $Exclude) { $null } else { Get-FirstAddedLine $Added $other $otherLine $otherN }
     if ($null -eq $theirs) { return $null }
     $swapped = $Hit.PSObject.Copy()
     $swapped.file = $other
     $swapped.line = $theirs
+    # The swapped hit's "other" side is the original first location, whose span is its own line count.
+    $swapped | Add-Member -NotePropertyName otherEndLine -NotePropertyValue ([int]$Hit.line + $n - 1) -Force
+    if ($swapped.PSObject.Properties['endLine']) { $swapped.endLine = $otherLine + $otherN - 1 }
     $swapped.text = "duplicates $($Hit.file):$($Hit.line) ($n lines)"
     return $swapped
 }
