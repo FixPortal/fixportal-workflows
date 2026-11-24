@@ -3269,7 +3269,7 @@ def is_unittest_command(command):
     position = command.index("unittest")
     if position == 0:
         return True
-    return command[position - 1] == "-m" and any(PYTHON_EXECUTABLE.fullmatch(earlier) for earlier in command[:position - 1])
+    return command[position - 1] == "-m" and has_python_interpreter(command, position - 1)
 
 
 def unittest_discover_without_start(command):
@@ -3386,6 +3386,19 @@ def npm_flag_value(args, names):
 # POSIX shell parsing eats the backslashes of an unquoted Windows path (`.venv\Scripts\python` arrives as
 # `.venvScriptspython`), so a token that merely ENDS in the interpreter name counts, as does a bare `py`/`pypy`.
 PYTHON_EXECUTABLE = re.compile(r"(?:.*python[0-9.]*(?:td?|d|w)?|(?:.*[/\\])?(?:py|pypy[0-9.]*))(?:\.exe)?", re.IGNORECASE)
+
+# Commands that print or search their arguments and run none of them (`echo python3 -m unittest`).
+NON_LAUNCHING_COMMANDS = {"echo", "printf", "cat", "grep", "egrep", "fgrep", "rg", "git", "test", "which", "type", "ls"}
+
+
+def has_python_interpreter(command, end):
+    """True when a word before `end` is a Python interpreter, so `-m` there names a module. Any such word counts,
+    so a wrapper this checker does not know (`poetry run python -m x`, `xvfb-run python -m x`) still launches it;
+    only a command that merely prints or searches its arguments does not, whether or not an assignment or a known
+    wrapper (`FOO=1 echo ...`, `env echo ...`) comes first."""
+    head = next((word for word in command if not re.match(r"[A-Za-z_]\w*=", word) and word not in COMMAND_WRAPPERS), command[0])
+    return posixpath.basename(head) not in NON_LAUNCHING_COMMANDS and any(PYTHON_EXECUTABLE.fullmatch(earlier) for earlier in command[:end])
+
 
 # Modules `python -m <module>` runs that are tools, not a repository script (issue #506 A5).
 NON_REPOSITORY_MODULES = {
@@ -3597,7 +3610,7 @@ class ScriptWords:
                         # here (`cd qa && python3 -m quality`), so it is script-bearing (issue #506 A5). Well-known tool
                         # modules are not, and `-m` outside a Python command (`git commit -m`) is not a module at all.
                         module = command[position + 1]
-                        if (any(PYTHON_EXECUTABLE.fullmatch(earlier) for earlier in command[:position])
+                        if (has_python_interpreter(command, position)
                                 and not module.startswith("-") and module.split(".")[0] not in NON_REPOSITORY_MODULES):
                             refers = True
                     if token in PACKAGE_MANAGERS:
