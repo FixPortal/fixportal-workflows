@@ -3385,7 +3385,7 @@ def npm_flag_value(args, names):
 # The interpreter in a `python -m <module>` launch (`python`, `python3.12`, `py`, `pypy3`, with an optional .exe).
 # POSIX shell parsing eats the backslashes of an unquoted Windows path (`.venv\Scripts\python` arrives as
 # `.venvScriptspython`), so a token that merely ENDS in the interpreter name counts, as does a bare `py`/`pypy`.
-PYTHON_EXECUTABLE = re.compile(r"(?:.*python[0-9.]*|(?:.*[/\\])?(?:py|pypy[0-9.]*))(?:\.exe)?", re.IGNORECASE)
+PYTHON_EXECUTABLE = re.compile(r"(?:.*python[0-9.]*(?:td?|d|w)?|(?:.*[/\\])?(?:py|pypy[0-9.]*))(?:\.exe)?", re.IGNORECASE)
 
 # Modules `python -m <module>` runs that are tools, not a repository script (issue #506 A5).
 NON_REPOSITORY_MODULES = {
