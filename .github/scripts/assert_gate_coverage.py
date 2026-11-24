@@ -942,7 +942,7 @@ _OCTAL_STRING = re.compile(r"0o[0-7]+")
 # .NET's Double.TryParse (observed, InvariantCulture) accepts `NaN` and `Infinity` in any case with an optional sign, and
 # rejects `Inf`, `-inf` and the infinity glyph. All of them are determinate: NaN compares false, never unknown.
 _NAN_STRING = re.compile(r"[+-]?nan", re.IGNORECASE)
-_INFINITY_STRING = re.compile(r"[+-]?infinity", re.IGNORECASE)
+_INFINITY_STRING = re.compile(r"[+-]?infinity", re.ASCII | re.IGNORECASE)  # ASCII: IGNORECASE alone folds U+0130/U+0131 onto i
 
 
 def github_equal(left, right):
@@ -3261,10 +3261,21 @@ def pytest_invocations(commands):
 UNITTEST_VALUE_OPTIONS = {"-s", "--start-directory", "-p", "--pattern", "-t", "--top-level-directory", "-k", "--durations"}
 
 
+def is_unittest_command(command):
+    """True when `unittest` is the command word or the module of `<python> -m unittest`, not just an argument
+    (`echo unittest discover`, `git log --grep unittest`)."""
+    if "unittest" not in command:
+        return False
+    position = command.index("unittest")
+    if position == 0:
+        return True
+    return command[position - 1] == "-m" and any(PYTHON_EXECUTABLE.fullmatch(earlier) for earlier in command[:position - 1])
+
+
 def unittest_discover_without_start(command):
     """True for `unittest discover` with no start directory: unittest then starts at `.` (issue #506 A3).
     A start directory is `-s DIR`, `--start-directory DIR` (or `=DIR`) or the first positional argument."""
-    if "unittest" not in command:
+    if not is_unittest_command(command):
         return False
     rest = command[command.index("unittest") + 1:]
     if not rest or rest[0] != "discover":
@@ -3507,7 +3518,7 @@ class ScriptWords:
                 # (`pytest checks*`) is a TARGET, never a filename filter for another one, and an option token
                 # (`--ignore-glob=*slow*`) is never a pattern.
                 own_patterns = []
-                if "unittest" in command:
+                if is_unittest_command(command):
                     for position, token in enumerate(command):
                         if token in ("-p", "--pattern") and position + 1 < len(command):
                             own_patterns.append(command[position + 1])
@@ -3545,7 +3556,7 @@ class ScriptWords:
                 hits = self.named(target, bases, testing and not word.startswith("-"), patterns_by_word.get(word, []))
                 if word == "-m" and index + 1 < len(words):
                     module = words[index + 1].replace(".", "/")
-                    hits |=self.named(module + ".py", bases) | self.named(module + "/__main__.py", bases)
+                    hits |= self.named(module + ".py", bases) | self.named(module + "/__main__.py", bases)
                     package = module.split("/")
                     for depth in range(1, len(package) + 1):
                         hits |= self.attempt("/".join(package[:depth]) + "/__init__.py", bases, False, (), True)
@@ -3596,7 +3607,11 @@ class ScriptWords:
                         # reading options at `--` (npm 11.18.0 ran the hooks for `npm ci -- --ignore-scripts`), and
                         # `--x=false` reads as `--x false`, the way npm_flag_value expects it. Quotes that could not
                         # be parsed leave no trusted flag, so the hooks are followed.
-                        flags = [part for argument in command[position + 1:] for part in argument.split("=", 1)] if parsed_commands else []
+                        # shlex discards whether a token was quoted or escaped, so a quoted `'>'` argument reads as a
+                        # redirection and swallows a later `--ignore-scripts=false`. Any quote or escape on the line makes
+                        # the flags untrusted and the hooks are followed (CodeRabbit, PR 430).
+                        quoted = re.search(r"[\"'`\\]", line) is not None
+                        flags = [part for argument in command[position + 1:] for part in argument.split("=", 1)] if parsed_commands and not quoted else []
                         flags = flags[:flags.index("--")] if "--" in flags else flags
                         # WORD split `--workspace=@x/app` into the option and its value; the options npm_scripts
                         # looks for (`--workspace`, `--prefix`) must still be found as whole words.
