@@ -592,7 +592,7 @@ def read_gate_contract(lines, gate_job):
 
 def runs_unconditionally(condition):
     # `always() && !cancelled()` runs exactly when `!cancelled()` does: judge what is left once
-    # the conjuncts that fold to true are dropped (observatory review, C1-F4).
+    # the conjuncts that fold to true are dropped (consumer review, C1-F4).
     rest = [part for part in split_top_level(strip_outer_parentheses(condition), "&&") if static_truth(part, True) is not True]
     if [strip_outer_parentheses(part) for part in rest] == ["!cancelled()"]:
         return True
@@ -958,7 +958,7 @@ def github_equal(left, right):
         if isinstance(value, float):
             return value
         if isinstance(value, str):
-            # The runner trims before converting, so ' ' is 0, not NaN (CodeRabbit, observatory PR #468).
+            # The runner trims before converting, so ' ' is 0, not NaN (code review).
             value = value.strip()
             if not value:
                 return 0.0
@@ -1589,12 +1589,12 @@ def powershell_ends_non_zero(body, *, throw=True, echo=True):
 
     `echo=False` drops `echo` for the same unknown-shell body: unlike the cmdlets it RUNS
     under bash, with bash's quoting, so a body pwsh reads as messages then `exit 1` can
-    hide an `exit 0` from bash (CodeRabbit, mirror PR #140). Such a body falls through to the
+    hide an `exit 0` from bash (code review). Such a body falls through to the
     both-disciplines check in step_can_fail instead.
     """
     string = r"(?:'(?:[^'\n]|'')*'|\"(?:[^`\"\n]|`.)*\")"
     # `echo` is pwsh's alias for Write-Output and the spelling the house one-liner uses,
-    # so refusing it reddened a `shell: pwsh` gate that does fail (tax portal review
+    # so refusing it reddened a `shell: pwsh` gate that does fail (consumer review
     # 20261101T004738Z, c02-C5). Admitted with a QUOTED argument or none, like the
     # cmdlets: an expression argument stays refused.
     words = "Write-Host|Write-Output|Write-Information" + ("|echo" if echo else "")
@@ -2008,7 +2008,7 @@ def assert_gate_semantics(workflow_path, lines, jobs, gate_job, needs):
     referenced = {}
     failing = []
     # Only an item of the job's own `steps:` is a step: a `- if:`/`run:` pair under
-    # strategy.matrix.include is data, and was credited as the failing step (observatory review, C1-F7).
+    # strategy.matrix.include is data, and was credited as the failing step (consumer review, C1-F7).
     steps = mapping_get(job_node(document, gate_job), "steps")
     step_lines = range(steps.start_mark.line, steps.end_mark.line + 1) if isinstance(steps, yaml.SequenceNode) else range(0)
     for condition, index in step_conditions(block, step_indent):
@@ -2423,7 +2423,7 @@ def compose_yaml(lines, name=None):
     used to recognise YAML by line shape, and every valid spelling the shape missed was a
     hole: block-scalar text read as keys, a `defaults:` whose flow mapping sat on the next
     line, an anchored or aliased `env:`, an escaped key (adversarial review
-    20261031T213036Z, T1/H3; simulator-frontend 20261101T004730Z, S1/S2). The composer
+    20261031T213036Z, T1/H3; a consumer 20261101T004730Z, S1/S2). The composer
     resolves aliases to the nodes they name and marks every node with the lines it
     occupies, which is exactly what those scans need.
 
@@ -2502,11 +2502,11 @@ def assert_readable_shapes(root, text, name=None):
 
       * a merge key (`<<: *base`) splices in keys no scan sees;
       * a double-quoted key with an escape (`"sh\\x65ll"`) is `shell` to GitHub and nothing
-        to key_pattern (tax portal review 20261101T004738Z, M13);
+        to key_pattern (consumer review 20261101T004738Z, M13);
       * a flow-style `steps:` or a flow-mapping step item carries `run:` text no RUN_KEY
         line ever matches (adversarial review 20261031T213036Z, M5);
       * a flow collection on the line AFTER its key reads as an empty value, so `needs:`
-        loses its list (XM1; simulator-frontend 20261101T004730Z, S2).
+        loses its list (XM1; a consumer 20261101T004730Z, S2).
 
     Also refused:
 
@@ -2540,7 +2540,7 @@ def assert_readable_shapes(root, text, name=None):
     step_nodes_seen = set()
     # The mappings under `with:` and `env:` hold caller data: a key named `uses` there is an input
     # or a variable, not an action reference. The `jobs:` mapping is skipped, because its keys are
-    # job ids and a job may be named `with` or `env` (CodeRabbit, PR #495).
+    # job ids and a job may be named `with` or `env` (code review).
     data_mappings = {
         id(value)
         for node in iter_nodes(root) if isinstance(node, yaml.MappingNode) and node is not jobs_node
@@ -2549,7 +2549,7 @@ def assert_readable_shapes(root, text, name=None):
         # it hid that step's off-line `uses` and the action it calls.
         and value.start_mark.index > key.end_mark.index
     }
-    # Everything under a `matrix:` is data too: a `uses` there names no action (CodeRabbit, observatory PR #468).
+    # Everything under a `matrix:` is data too: a `uses` there names no action (code review).
     data_mappings |= {id(inner) for node in iter_nodes(root) if isinstance(node, yaml.MappingNode) and node is not jobs_node
                       for key, value in node.value if isinstance(key, yaml.ScalarNode) and key.value == "matrix"
                       for inner in iter_nodes(value) if isinstance(inner, yaml.MappingNode)}
@@ -2580,7 +2580,7 @@ def assert_readable_shapes(root, text, name=None):
                 )
             # `uses:` then the path on the next line is a valid scalar GitHub runs (actionlint
             # accepts it, observed 2026-11-21), but every reader takes `uses` from the key's own
-            # line, so the called workflow or action was never walked (ide review, RV-41).
+            # line, so the called workflow or action was never walked (consumer review, RV-41).
             if (
                 isinstance(key, yaml.ScalarNode)
                 and key.value == "uses"
@@ -2665,7 +2665,7 @@ def run_payload_indexes(lines):
     `BASH_ENV:` or `working-directory:` line inside ANY OTHER block scalar -- an `env:`
     value, a `with:` input, a `run-name:` -- was read as a real key: fail-OPEN when it
     spelled a shell the checker then trusted, false RED when it spelled a key the checker
-    refuses (adversarial review 20261031T213036Z, H3; tax portal 20261101T004738Z, M35).
+    refuses (adversarial review 20261031T213036Z, H3; a consumer 20261101T004738Z, M35).
     The parser now decides what is text: the body of every multi-line scalar and the
     inside of every multi-line flow collection, anywhere in the document. `lines` may be
     a whole file or a Slice of one; the answer is relative to `lines`.
@@ -2696,8 +2696,8 @@ def working_directories(node, exclude=(), rewrite=None):
     only `defaults.run.working-directory` reaches a step, so only it is read: scanning
     every other subtree read `on.workflow_call.inputs.working-directory` (an input
     declaration), `strategy.matrix` keys and `with:` inputs as directories, and the input
-    mapping's not-a-string sentinel reddened a valid reusable workflow (CodeRabbit, PR
-    #425). `node` itself is scanned whole when `exclude` is empty. `rewrite` is applied
+    mapping's not-a-string sentinel reddened a valid reusable workflow (code review).
+    `node` itself is scanned whole when `exclude` is empty. `rewrite` is applied
     to each value before classification (a composite action rewrites its action-path
     expression to its own directory).
 
@@ -2791,7 +2791,7 @@ def default_run_shell(node):
     (adversarial review 20261031T213036Z, XL2), and text shaped like one inside an `env:`
     block scalar is a string (H3). The flow, block, anchored, aliased, next-line-flow and
     quoted spellings all resolve the same way because the parser reads them, not a regex
-    (M4, XM1; simulator-frontend 20261101T004730Z, S2, S13). `run:` also appears as a
+    (M4, XM1; a consumer 20261101T004730Z, S2, S13). `run:` also appears as a
     STEP key; the scoped descent is why a step's own `run:` is never read here
     (adversarial review 20260929T030431Z, X1).
 
@@ -3221,11 +3221,37 @@ def pytest_targets(arguments):
     return targets
 
 
+def strip_comment(line):
+    """The line without its shell comment: a `#` starts one only at the start of a word, outside quotes
+    (`--user-agent=ci#build` keeps its `#`)."""
+    quote, index, word_start = None, 0, True
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == "\\" and quote == '"':
+                index += 1
+            elif char == quote:
+                quote = None
+        elif char == "#" and word_start:
+            return line[:index]
+        elif char == "\\":
+            index += 1  # an escaped character, even a space, belongs to the current word
+            word_start = False
+        elif char in "'\"":
+            quote = char
+            word_start = False
+        else:
+            word_start = char.isspace() or char in ";&|()"
+        index += 1
+    return line
+
+
 def shell_commands(line):
     """A line's commands as token lists, split at unquoted `; | & && || ( )` as the shell splits them.
     A redirection and its target (`> out.txt`, `2>&1`) are dropped. None when the quoting is unbalanced."""
-    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer = shlex.shlex(strip_comment(line), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
+    lexer.commenters = ""  # shlex would end a token at an in-word `#`; strip_comment applies the shell's rule
     try:
         tokens = list(lexer)
     except ValueError:
@@ -3324,7 +3350,7 @@ NPM_ELSEWHERE = {"-w", "--workspace", "--workspaces", "-ws", "--ws", "--prefix",
 # An assignment value is a run of disjoint pieces, each told apart by its first character: a quoted
 # string (escapes honoured inside double quotes), a backslash escape (`X=\" cd sub`), or one plain
 # character. An unquoted branch that could also eat quotes backtracked exponentially (CodeQL
-# py/redos, observatory PR #468; escapes, PR #505 review).
+# py/redos, consumer review; escapes, code review).
 DIRECTORY_CHANGE = re.compile(
     r"(?:^|[;&|({`]|(?<![\w-])-c(?:ommand)?[ \t]+[\"'])[ \t]*"
     r"(?:(?:then|do|else|if|elif|while|until|!)[ \t]+)*"
@@ -3388,16 +3414,53 @@ def npm_flag_value(args, names):
 PYTHON_EXECUTABLE = re.compile(r"(?:.*python[0-9.]*(?:td?|d|w)?|(?:.*[/\\])?(?:py|pypy[0-9.]*))(?:\.exe)?", re.IGNORECASE)
 
 # Commands that print or search their arguments and run none of them (`echo python3 -m unittest`).
-NON_LAUNCHING_COMMANDS = {"echo", "printf", "cat", "grep", "egrep", "fgrep", "rg", "git", "test", "which", "type", "ls"}
+NON_LAUNCHING_COMMANDS = {"echo", "printf", "cat", "grep", "egrep", "fgrep", "rg", "test", "which", "type", "ls"}
+# `git <subcommand>` that prints or searches. Any other subcommand may run its arguments (`git bisect run <cmd>`).
+NON_LAUNCHING_GIT_SUBCOMMANDS = {"log", "grep", "show", "diff", "blame", "describe", "status", "shortlog"}
+# `git` and `env` options that take a separate value.
+GIT_VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
+ENV_VALUE_OPTIONS = {"-u", "--unset", "-C", "--chdir", "-a", "--argv0"}
+
+
+def command_word_index(command):
+    """Where the command word is: after assignments and known wrappers (by basename, so `/usr/bin/env` counts) and
+    after the options of `env`, which would otherwise be read as the command (`env -i echo ...`)."""
+    index = 0
+    while index < len(command):
+        word = command[index]
+        if re.match(r"[A-Za-z_]\w*=", word):
+            index += 1
+        elif posixpath.basename(word) in COMMAND_WRAPPERS:
+            is_env = posixpath.basename(word) == "env"
+            index += 1
+            while is_env and index < len(command) and command[index].startswith("-"):
+                index += 2 if command[index] in ENV_VALUE_OPTIONS else 1
+        else:
+            return index
+    return 0
+
+
+def prints_instead_of_launching(command):
+    """True when the command word only prints or searches its arguments (`echo python3 ...`, `git log --grep python3`)."""
+    index = command_word_index(command)
+    # `env -S '<command line>'` splits its operand into the command and its arguments, so what follows is unknown.
+    if any(word.startswith(("-S", "--split-string")) for word in command[:index]):
+        return False
+    name = posixpath.basename(command[index])
+    if name != "git":
+        return name in NON_LAUNCHING_COMMANDS
+    index += 1
+    while index < len(command) and command[index].startswith("-"):
+        index += 2 if command[index] in GIT_VALUE_OPTIONS else 1
+    return index < len(command) and command[index] in NON_LAUNCHING_GIT_SUBCOMMANDS
 
 
 def has_python_interpreter(command, end):
     """True when a word before `end` is a Python interpreter, so `-m` there names a module. Any such word counts,
     so a wrapper this checker does not know (`poetry run python -m x`, `xvfb-run python -m x`) still launches it;
     only a command that merely prints or searches its arguments does not, whether or not an assignment or a known
-    wrapper (`FOO=1 echo ...`, `env echo ...`) comes first."""
-    head = next((word for word in command if not re.match(r"[A-Za-z_]\w*=", word) and word not in COMMAND_WRAPPERS), command[0])
-    return posixpath.basename(head) not in NON_LAUNCHING_COMMANDS and any(PYTHON_EXECUTABLE.fullmatch(earlier) for earlier in command[:end])
+    wrapper (`FOO=1 echo ...`, `env -i echo ...`) comes first."""
+    return not prints_instead_of_launching(command) and any(PYTHON_EXECUTABLE.fullmatch(earlier) for earlier in command[:end])
 
 
 # Modules `python -m <module>` runs that are tools, not a repository script (issue #506 A5).
@@ -3454,7 +3517,7 @@ class ScriptWords:
                     and is_script(script)
                 )
                 if testing:
-                    # `pytest checks/*` also runs each directory the glob names (CodeRabbit, PR #503).
+                    # `pytest checks/*` also runs each directory the glob names (code review).
                     for directory in self.directories:
                         if len(directory.split("/")) == len(segments) and all(
                                 fnmatch.fnmatchcase(part, pattern.lower()) for part, pattern in zip(directory.split("/"), segments)):
@@ -3502,14 +3565,14 @@ class ScriptWords:
             spans = list(WORD.finditer(line))
             words = [span.group() for span in spans]
             # Each shell command on the line, quotes honoured and split at `; | & ( )`, so a later
-            # command's words are not the runner's arguments (PR #505 review).
+            # command's words are not the runner's arguments (code review).
             parsed_commands = shell_commands(line)
             commands = parsed_commands or [words]
             # A shell token WORD splits (`python3 "scripts/quality checks.py"`, `python 'scripts/check,fast.py'`,
-            # `"scripts/check(quick).py"`) is a word too (CodeRabbit, observatory PR #468; issue #506 A8).
+            # `"scripts/check(quick).py"`) is a word too (code review; issue #506 A8).
             words = words + [token for command in commands for token in command if token not in words and token.strip()]
             # A runner by its basename too (`.venv/bin/pytest tests`), and a pytest run with no target
-            # collects from the root (`pytest`, `python3 -m pytest -q`; observatory review, C1-F9). So does
+            # collects from the root (`pytest`, `python3 -m pytest -q`; consumer review, C1-F9). So does
             # `python -m unittest discover` with no start directory (issue #506 A3).
             root_run = runs_pytest_from_root(commands)
             discover_run = any(unittest_discover_without_start(command) for command in commands)
@@ -3520,7 +3583,7 @@ class ScriptWords:
             # A discovery pattern (`-p 'test_*.py'`) narrows which files of a named directory run, and only
             # the targets of the command that supplies it: `pytest tests && echo 'release-*'` hands pytest
             # no pattern (issue #506 A1). A pytest option's value (`--ignore-glob '*slow*'`) is not one
-            # (PR #505 second review). A word no runner command owns is unfiltered: that only widens.
+            # (code review). A word no runner command owns is unfiltered: that only widens.
             option_values = pytest_option_values(commands)
             patterns_by_word = {}
             runner_patterns = []
@@ -3602,7 +3665,7 @@ class ScriptWords:
                     self.package_scripts(words[index:], bases, found, job_id, seen, [])
             # Package-manager invocations and `python -m` launches are read from each PARSED command, with that
             # command's own arguments. Ownership is never rebuilt from raw-word occurrence counts: `n\pm ci
-            # --ignore-scripts; npm ci` has one literal `npm` word but two npm commands (CodeRabbit, PR 285).
+            # --ignore-scripts; npm ci` has one literal `npm` word but two npm commands (code review).
             for command in commands:
                 for position, token in enumerate(command):
                     if token == "-m" and position + 1 < len(command):
@@ -3622,7 +3685,7 @@ class ScriptWords:
                         # be parsed leave no trusted flag, so the hooks are followed.
                         # shlex discards whether a token was quoted or escaped, so a quoted `'>'` argument reads as a
                         # redirection and swallows a later `--ignore-scripts=false`. Any quote or escape on the line makes
-                        # the flags untrusted and the hooks are followed (CodeRabbit, PR 430).
+                        # the flags untrusted and the hooks are followed (code review).
                         quoted = re.search(r"[\"'`\\]", line) is not None
                         flags = [part for argument in command[position + 1:] for part in argument.split("=", 1)] if parsed_commands and not quoted else []
                         flags = flags[:flags.index("--")] if "--" in flags else flags
@@ -3641,7 +3704,7 @@ class ScriptWords:
         else:
             packages = {posixpath.join(base, "package.json") if base else "package.json" for base in bases} & self.files
             # npm runs from the nearest ancestor holding a package.json: `npm test` in web/src reads
-            # web/package.json (CodeRabbit, observatory PR #468).
+            # web/package.json (code review).
             for base in bases:
                 directory = base
                 while directory and posixpath.join(directory, "package.json") not in self.files:
@@ -3829,14 +3892,14 @@ def assert_gate_scripts(workflow_path, lines, jobs, needs, gate_job):
 # BASH_ENV names a start-up file bash sources, SHELLOPTS and BASHOPTS set shell
 # options such as noexec at start-up, and BASH_FUNC_name%% imports a function over a
 # builtin. Refusing BASH_ENV alone left every other route open (adversarial review
-# 20261031T213036Z, M2; tax portal 20261101T004738Z, M16).
+# 20261031T213036Z, M2; a consumer 20261101T004738Z, M16).
 #
 # `ENV` is NOT one of them. Bash reads it only when interactive in POSIX mode; a step runs
 # a script file non-interactively. Observed 2026-11-19 with bash 5.3 under the runner's
 # own flags (`ENV=file bash --noprofile --norc -eo pipefail body.sh`): the file is not
 # sourced, while the same command with BASH_ENV sources it. Refusing the name made an
-# ordinary `env: ENV: prod` a permanent false red (ci-frontend review 20261119T121117Z,
-# C1-F9). Every accepted gate shell is bash or pwsh, so `sh` never runs a gate step.
+# ordinary `env: ENV: prod` a permanent false red (C1-F9). Every accepted gate shell is bash
+# or pwsh, so `sh` never runs a gate step.
 STARTUP_ENV_KEYS = ("BASH_ENV", "SHELLOPTS", "BASHOPTS")
 # The same routes spelled inside a GATE JOB run body -- a GITHUB_ENV write, or a write to
 # pwsh's `$PROFILE`, which the runner loads because its pwsh template omits -NoProfile.
@@ -3938,7 +4001,7 @@ def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_e
 
     A runtime `if:` (`github.event_name == 'push'`) is refused too, unless the step's
     `<job>/<step id>` is named in GATE_STEP_IF_EXEMPT: it skips the step on some runs while
-    the job, and so the gate, still reports success (owner decision, observatory review
+    the job, and so the gate, still reports success (owner decision, consumer review
     C1-D-G2). Only a condition that folds to unconditional -- `always()`, `!cancelled()`,
     `success()`, a conjunction of those -- passes unlisted. A step with no `id:` cannot be
     listed, so the refusal asks for one. A local composite action's own steps are not held
@@ -3947,11 +4010,11 @@ def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_e
     Keys are matched at the step's OWN column, the guard step_can_fail already applies:
     an action INPUT named `if` or `continue-on-error` under `with:` is a value, not a step
     control, and reading it as one reddened a correct workflow (adversarial review
-    20261031T213036Z, L3; tax portal 20261101T004738Z, M20).
+    20261031T213036Z, L3; a consumer 20261101T004738Z, M20).
 
     A best-effort step is exempted by naming `<job>/<step id>` in GATE_STEP_EXEMPT -- an
     explicit, reviewable list, as GATE_EXEMPT is for jobs. Fail-closed with no exemption
-    reddened the first consumer with a best-effort step (simulator-frontend review
+    reddened the first consumer with a best-effort step (consumer review
     20261101T004730Z, S12). `label` prefixes the job id when the jobs belong to a called
     reusable workflow, in messages and in exemption entries alike.
     """
@@ -3960,7 +4023,7 @@ def assert_feeder_steps(workflow_path, lines, jobs, feeders, step_exempt, used_e
         block = job_block(lines, jobs, feeder)
         payloads = run_payload_indexes(block)
         # Only an item of the job's own `steps:` is a step: a `run:` under strategy.matrix.include is
-        # data, and its sibling `if:` was refused as a step condition (CodeRabbit, PR #503; cf. C1-F7).
+        # data, and its sibling `if:` was refused as a step condition (code review; cf. C1-F7).
         # Its `run` and `uses` keys are read from the step MAPPING, never by a line match: an action
         # input named `run` under `with:` placed before `uses:` was taken for the step's own key, and the
         # step's real `if:` was never read (issue #506 A12).
@@ -4093,7 +4156,7 @@ def check_file(workflow_path, gate_job, exempt, conditional_exempt, *, on_empty=
     The same holds for a stale GATE_STEP_EXEMPT entry. `step_usage` is directory mode's
     (used entries, feeder job ids) pair, shared by every file and judged once after the
     loop: judged per file, `build/lint` used by ci.yml's `build` read as stale in a
-    release.yml whose own `build` has no tolerated step (CodeRabbit, mirror PR #140; issue #429). Without it
+    release.yml whose own `build` has no tolerated step (code review; issue #429). Without it
     (file mode) the file is judged on its own.
 
     READ AS utf-8-sig. A plain utf-8 read leaves a leading BOM in the first character,
@@ -4346,7 +4409,7 @@ def assert_step_if_exempt_used(where, step_if_exempt, used):
     """Refuse a GATE_STEP_IF_EXEMPT entry that exempted no runtime feeder step `if:`.
 
     Any job, not only a feeder: an entry naming the gate job's own failure step, or a job outside
-    the gate, exempts nothing and was accepted in silence (CodeRabbit Verify, PR #503).
+    the gate, exempts nothing and was accepted in silence (code review).
     """
     stale = sorted(entry for entry in step_if_exempt if ("if", entry) not in used)
     if stale:
