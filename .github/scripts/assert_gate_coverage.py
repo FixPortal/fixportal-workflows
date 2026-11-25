@@ -3221,9 +3221,9 @@ def pytest_targets(arguments):
     return targets
 
 
-def strip_comment(line):
+def strip_shell_comment(line):
     """The line without its shell comment: a `#` starts one only at the start of a word, outside quotes
-    (`--user-agent=ci#build` keeps its `#`)."""
+    (`--user-agent=ci#build` keeps its `#`). Not `strip_comment`, which is the YAML job/needs grammar's own cut."""
     quote, index, word_start = None, 0, True
     while index < len(line):
         char = line[index]
@@ -3249,9 +3249,9 @@ def strip_comment(line):
 def shell_commands(line):
     """A line's commands as token lists, split at unquoted `; | & && || ( )` as the shell splits them.
     A redirection and its target (`> out.txt`, `2>&1`) are dropped. None when the quoting is unbalanced."""
-    lexer = shlex.shlex(strip_comment(line), posix=True, punctuation_chars=True)
+    lexer = shlex.shlex(strip_shell_comment(line), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
-    lexer.commenters = ""  # shlex would end a token at an in-word `#`; strip_comment applies the shell's rule
+    lexer.commenters = ""  # shlex would end a token at an in-word `#`; strip_shell_comment applies the shell's rule
     try:
         tokens = list(lexer)
     except ValueError:
